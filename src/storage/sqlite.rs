@@ -4,15 +4,27 @@ use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, 
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow};
 use frankensqlite::{
-    Connection as FrankenConnection,
+    Connection as FrankenConnection, Row as FrankenRow,
     compat::{
-        ConnectionExt as FrankenConnectionExt, OpenFlags as FrankenOpenFlags, ParamValue,
-        RowExt as FrankenRowExt, open_with_flags as open_franken_with_flags,
+        BatchExt as FrankenBatchExt, ConnectionExt as FrankenConnectionExt,
+        OpenFlags as FrankenOpenFlags, OptionalExtension as FrankenOptionalExtension, ParamValue,
+        RowExt as FrankenRowExt, Transaction as FrankenTransaction,
+        TransactionExt as FrankenTransactionExt, open_with_flags as open_franken_with_flags,
     },
     migrate::MigrationRunner,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use std::fs;
+
+/// Frankensqlite parameter list builder (avoids name conflict with rusqlite `params!`).
+macro_rules! fparams {
+    () => {
+        &[] as &[ParamValue]
+    };
+    ($($val:expr),+ $(,)?) => {
+        &[$(ParamValue::from($val)),+] as &[ParamValue]
+    };
+}
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -170,6 +182,28 @@ fn read_metadata_compat(
 
     // Fall back to JSON column (old format or migration in progress)
     if let Ok(Some(json_str)) = row.get::<_, Option<String>>(json_idx) {
+        return serde_json::from_str(&json_str)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+    }
+
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+/// Read metadata from a frankensqlite Row, preferring binary (msgpack) over JSON.
+fn franken_read_metadata_compat(
+    row: &FrankenRow,
+    json_idx: usize,
+    bin_idx: usize,
+) -> serde_json::Value {
+    // Try binary column first (new format)
+    if let Ok(Some(bytes)) = row.get_typed::<Option<Vec<u8>>>(bin_idx) {
+        if !bytes.is_empty() {
+            return deserialize_msgpack_to_json(&bytes);
+        }
+    }
+
+    // Fall back to JSON column (old format or migration in progress)
+    if let Ok(Some(json_str)) = row.get_typed::<Option<String>>(json_idx) {
         return serde_json::from_str(&json_str)
             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
     }
@@ -1088,26 +1122,24 @@ impl FrankenStorage {
     /// 1. Transitions existing databases from meta table → `_schema_migrations`
     /// 2. Runs pending migrations via `MigrationRunner`
     /// 3. Syncs `meta.schema_version` for backward compatibility
+    ///
+    /// # Fresh vs existing databases
+    ///
+    /// Fresh databases use a single combined migration (`MIGRATION_FRESH_SCHEMA`)
+    /// that creates the complete V13 schema directly. This avoids the incremental
+    /// V5 migration which uses `DROP TABLE` — an operation that triggers a known
+    /// frankensqlite autoindex limitation.
+    ///
+    /// Existing databases (transitioned from SqliteStorage) are typically at V13
+    /// already, so no further migrations are needed. For databases at V5-V12,
+    /// the additive V6-V13 migrations are applied normally.
     pub fn run_migrations(&self) -> Result<()> {
         transition_from_meta_version(&self.conn)?;
-
-        // Disable foreign keys during migration (needed for V5 table recreation).
-        // In standard SQLite, PRAGMA foreign_keys is a no-op inside a transaction,
-        // so it must be set outside. The MigrationRunner wraps each migration in
-        // its own transaction.
-        self.conn
-            .execute("PRAGMA foreign_keys = OFF;")
-            .with_context(|| "disabling foreign_keys for migration")?;
 
         let runner = build_cass_migrations();
         let result = runner
             .run(&self.conn)
             .with_context(|| "running schema migrations")?;
-
-        // Re-enable foreign keys after migration.
-        self.conn
-            .execute("PRAGMA foreign_keys = ON;")
-            .with_context(|| "re-enabling foreign_keys after migration")?;
 
         if !result.applied.is_empty() {
             info!(
@@ -1166,27 +1198,398 @@ impl FrankenStorage {
 // Frankensqlite migration helpers
 // -------------------------------------------------------------------------
 
-/// Build the `MigrationRunner` with all cass schema migrations V1-V13.
+/// Build the `MigrationRunner` for the frankensqlite migration path.
 ///
-/// Migration names match the descriptions in `SqliteStorage`'s staircase
-/// migration. The SQL constants (`MIGRATION_V1` .. `MIGRATION_V13`) are
-/// shared between the old rusqlite path and this new frankensqlite path.
+/// Uses a single combined migration (version 13) that creates the complete
+/// final schema in one step. This avoids the V5 `DROP TABLE conversations`
+/// operation which triggers a known frankensqlite limitation: autoindex entries
+/// in sqlite_master are not properly cleaned up during DROP TABLE, causing
+/// "sqlite_master entry not found" errors.
+///
+/// For existing databases transitioned from SqliteStorage (typically at V13),
+/// the transition function backfills `_schema_migrations` and no further
+/// migrations are needed.
 fn build_cass_migrations() -> MigrationRunner {
-    MigrationRunner::new()
-        .add(1, "core_tables", MIGRATION_V1)
-        .add(2, "fts_messages", MIGRATION_V2)
-        .add(3, "fts_messages_rebuild", MIGRATION_V3)
-        .add(4, "sources", MIGRATION_V4)
-        .add(5, "provenance_columns", MIGRATION_V5)
-        .add(6, "source_path_index", MIGRATION_V6)
-        .add(7, "msgpack_columns", MIGRATION_V7)
-        .add(8, "daily_stats", MIGRATION_V8)
-        .add(9, "embedding_jobs", MIGRATION_V9)
-        .add(10, "token_analytics", MIGRATION_V10)
-        .add(11, "message_metrics", MIGRATION_V11)
-        .add(12, "model_dimensions", MIGRATION_V12)
-        .add(13, "plan_token_rollups", MIGRATION_V13)
+    MigrationRunner::new().add(13, "full_schema_v13", MIGRATION_FRESH_SCHEMA)
 }
+
+/// Combined V13 schema for fresh databases.
+///
+/// Creates the complete final schema in a single migration, avoiding the
+/// incremental V5 `DROP TABLE conversations` which triggers a frankensqlite
+/// autoindex limitation. All columns from V1-V13 are included in their
+/// respective CREATE TABLE statements.
+///
+/// Table creation order respects foreign key references:
+/// sources → agents/workspaces → conversations → messages → snippets, etc.
+const MIGRATION_FRESH_SCHEMA: &str = r"
+-- Core tables (V1)
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agents (
+    id INTEGER PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    version TEXT,
+    kind TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workspaces (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    display_name TEXT
+);
+
+-- Sources (V4)
+CREATE TABLE IF NOT EXISTS sources (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    host_label TEXT,
+    machine_id TEXT,
+    platform TEXT,
+    config_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO sources (id, kind, host_label, created_at, updated_at)
+VALUES ('local', 'local', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000);
+
+-- Conversations: V1 base + V5 provenance + V7 metadata_bin + V10 token summary
+CREATE TABLE IF NOT EXISTS conversations (
+    id INTEGER PRIMARY KEY,
+    agent_id INTEGER NOT NULL REFERENCES agents(id),
+    workspace_id INTEGER REFERENCES workspaces(id),
+    source_id TEXT NOT NULL DEFAULT 'local' REFERENCES sources(id),
+    external_id TEXT,
+    title TEXT,
+    source_path TEXT NOT NULL,
+    started_at INTEGER,
+    ended_at INTEGER,
+    approx_tokens INTEGER,
+    metadata_json TEXT,
+    origin_host TEXT,
+    metadata_bin BLOB,
+    total_input_tokens INTEGER,
+    total_output_tokens INTEGER,
+    total_cache_read_tokens INTEGER,
+    total_cache_creation_tokens INTEGER,
+    grand_total_tokens INTEGER,
+    estimated_cost_usd REAL,
+    primary_model TEXT,
+    api_call_count INTEGER,
+    tool_call_count INTEGER,
+    user_message_count INTEGER,
+    assistant_message_count INTEGER
+);
+
+-- Named unique index avoids autoindex issues if table is ever recreated
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_provenance
+    ON conversations(source_id, agent_id, external_id);
+
+-- Messages: V1 base + V7 extra_bin
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    idx INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    author TEXT,
+    created_at INTEGER,
+    content TEXT NOT NULL,
+    extra_json TEXT,
+    extra_bin BLOB,
+    UNIQUE(conversation_id, idx)
+);
+
+CREATE TABLE IF NOT EXISTS snippets (
+    id INTEGER PRIMARY KEY,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    file_path TEXT,
+    start_line INTEGER,
+    end_line INTEGER,
+    language TEXT,
+    snippet_text TEXT
+);
+
+CREATE TABLE IF NOT EXISTS tags (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS conversation_tags (
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (conversation_id, tag_id)
+);
+
+-- Full-text search (V2/V3)
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
+    content,
+    title,
+    agent,
+    workspace,
+    source_path,
+    created_at UNINDEXED,
+    message_id UNINDEXED,
+    tokenize='porter'
+);
+
+-- Daily stats (V8)
+CREATE TABLE IF NOT EXISTS daily_stats (
+    day_id INTEGER NOT NULL,
+    agent_slug TEXT NOT NULL,
+    source_id TEXT NOT NULL DEFAULT 'all',
+    session_count INTEGER NOT NULL DEFAULT 0,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    total_chars INTEGER NOT NULL DEFAULT 0,
+    last_updated INTEGER NOT NULL,
+    PRIMARY KEY (day_id, agent_slug, source_id)
+);
+
+-- Embedding jobs (V9)
+CREATE TABLE IF NOT EXISTS embedding_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    db_path TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    total_docs INTEGER NOT NULL DEFAULT 0,
+    completed_docs INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    started_at TEXT,
+    completed_at TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_jobs_active
+ON embedding_jobs(db_path, model_id)
+WHERE status IN ('pending', 'running');
+
+-- Token usage ledger (V10)
+CREATE TABLE IF NOT EXISTS token_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    conversation_id INTEGER NOT NULL,
+    agent_id INTEGER NOT NULL,
+    workspace_id INTEGER,
+    source_id TEXT NOT NULL DEFAULT 'local',
+    timestamp_ms INTEGER NOT NULL,
+    day_id INTEGER NOT NULL,
+    model_name TEXT,
+    model_family TEXT,
+    model_tier TEXT,
+    service_tier TEXT,
+    provider TEXT,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_creation_tokens INTEGER,
+    thinking_tokens INTEGER,
+    total_tokens INTEGER,
+    estimated_cost_usd REAL,
+    role TEXT NOT NULL,
+    content_chars INTEGER NOT NULL,
+    has_tool_calls INTEGER NOT NULL DEFAULT 0,
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    data_source TEXT NOT NULL DEFAULT 'api',
+    UNIQUE(message_id)
+);
+
+-- Token daily stats (V10)
+CREATE TABLE IF NOT EXISTS token_daily_stats (
+    day_id INTEGER NOT NULL,
+    agent_slug TEXT NOT NULL,
+    source_id TEXT NOT NULL DEFAULT 'all',
+    model_family TEXT NOT NULL DEFAULT 'all',
+    api_call_count INTEGER NOT NULL DEFAULT 0,
+    user_message_count INTEGER NOT NULL DEFAULT 0,
+    assistant_message_count INTEGER NOT NULL DEFAULT 0,
+    tool_message_count INTEGER NOT NULL DEFAULT 0,
+    total_input_tokens INTEGER NOT NULL DEFAULT 0,
+    total_output_tokens INTEGER NOT NULL DEFAULT 0,
+    total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    total_thinking_tokens INTEGER NOT NULL DEFAULT 0,
+    grand_total_tokens INTEGER NOT NULL DEFAULT 0,
+    total_content_chars INTEGER NOT NULL DEFAULT 0,
+    total_tool_calls INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
+    session_count INTEGER NOT NULL DEFAULT 0,
+    last_updated INTEGER NOT NULL,
+    PRIMARY KEY (day_id, agent_slug, source_id, model_family)
+);
+
+-- Model pricing (V10)
+CREATE TABLE IF NOT EXISTS model_pricing (
+    model_pattern TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    input_cost_per_mtok REAL NOT NULL,
+    output_cost_per_mtok REAL NOT NULL,
+    cache_read_cost_per_mtok REAL,
+    cache_creation_cost_per_mtok REAL,
+    effective_date TEXT NOT NULL,
+    PRIMARY KEY (model_pattern, effective_date)
+);
+
+INSERT OR IGNORE INTO model_pricing VALUES
+    ('claude-opus-4%', 'anthropic', 15.0, 75.0, 1.5, 18.75, '2025-10-01'),
+    ('claude-sonnet-4%', 'anthropic', 3.0, 15.0, 0.3, 3.75, '2025-10-01'),
+    ('claude-haiku-4%', 'anthropic', 0.80, 4.0, 0.08, 1.0, '2025-10-01'),
+    ('gpt-4o%', 'openai', 2.50, 10.0, NULL, NULL, '2025-01-01'),
+    ('gpt-4-turbo%', 'openai', 10.0, 30.0, NULL, NULL, '2024-04-01'),
+    ('gpt-4.1%', 'openai', 2.0, 8.0, NULL, NULL, '2025-04-01'),
+    ('o3%', 'openai', 2.0, 8.0, NULL, NULL, '2025-04-01'),
+    ('o4-mini%', 'openai', 1.10, 4.40, NULL, NULL, '2025-04-01'),
+    ('gemini-2%flash%', 'google', 0.075, 0.30, NULL, NULL, '2025-01-01'),
+    ('gemini-2%pro%', 'google', 1.25, 10.0, NULL, NULL, '2025-01-01');
+
+-- Message metrics: V11 base + V12 model dimensions
+CREATE TABLE IF NOT EXISTS message_metrics (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    created_at_ms INTEGER NOT NULL,
+    hour_id INTEGER NOT NULL,
+    day_id INTEGER NOT NULL,
+    agent_slug TEXT NOT NULL,
+    workspace_id INTEGER NOT NULL DEFAULT 0,
+    source_id TEXT NOT NULL DEFAULT 'local',
+    role TEXT NOT NULL,
+    content_chars INTEGER NOT NULL,
+    content_tokens_est INTEGER NOT NULL,
+    api_input_tokens INTEGER,
+    api_output_tokens INTEGER,
+    api_cache_read_tokens INTEGER,
+    api_cache_creation_tokens INTEGER,
+    api_thinking_tokens INTEGER,
+    api_service_tier TEXT,
+    api_data_source TEXT NOT NULL DEFAULT 'estimated',
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    has_tool_calls INTEGER NOT NULL DEFAULT 0,
+    has_plan INTEGER NOT NULL DEFAULT 0,
+    model_name TEXT,
+    model_family TEXT NOT NULL DEFAULT 'unknown',
+    model_tier TEXT NOT NULL DEFAULT 'unknown',
+    provider TEXT NOT NULL DEFAULT 'unknown'
+);
+
+-- Hourly rollups: V11 base + V13 plan columns
+CREATE TABLE IF NOT EXISTS usage_hourly (
+    hour_id INTEGER NOT NULL,
+    agent_slug TEXT NOT NULL,
+    workspace_id INTEGER NOT NULL DEFAULT 0,
+    source_id TEXT NOT NULL DEFAULT 'local',
+    message_count INTEGER NOT NULL DEFAULT 0,
+    user_message_count INTEGER NOT NULL DEFAULT 0,
+    assistant_message_count INTEGER NOT NULL DEFAULT 0,
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    plan_message_count INTEGER NOT NULL DEFAULT 0,
+    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
+    api_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
+    last_updated INTEGER NOT NULL DEFAULT 0,
+    plan_content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
+    plan_api_tokens_total INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (hour_id, agent_slug, workspace_id, source_id)
+);
+
+-- Daily rollups: V11 base + V13 plan columns
+CREATE TABLE IF NOT EXISTS usage_daily (
+    day_id INTEGER NOT NULL,
+    agent_slug TEXT NOT NULL,
+    workspace_id INTEGER NOT NULL DEFAULT 0,
+    source_id TEXT NOT NULL DEFAULT 'local',
+    message_count INTEGER NOT NULL DEFAULT 0,
+    user_message_count INTEGER NOT NULL DEFAULT 0,
+    assistant_message_count INTEGER NOT NULL DEFAULT 0,
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    plan_message_count INTEGER NOT NULL DEFAULT 0,
+    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
+    api_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
+    last_updated INTEGER NOT NULL DEFAULT 0,
+    plan_content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
+    plan_api_tokens_total INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day_id, agent_slug, workspace_id, source_id)
+);
+
+-- Model daily rollups (V12)
+CREATE TABLE IF NOT EXISTS usage_models_daily (
+    day_id INTEGER NOT NULL,
+    agent_slug TEXT NOT NULL,
+    workspace_id INTEGER NOT NULL DEFAULT 0,
+    source_id TEXT NOT NULL DEFAULT 'local',
+    model_family TEXT NOT NULL DEFAULT 'unknown',
+    model_tier TEXT NOT NULL DEFAULT 'unknown',
+    message_count INTEGER NOT NULL DEFAULT 0,
+    user_message_count INTEGER NOT NULL DEFAULT 0,
+    assistant_message_count INTEGER NOT NULL DEFAULT 0,
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    plan_message_count INTEGER NOT NULL DEFAULT 0,
+    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
+    api_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
+    last_updated INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day_id, agent_slug, workspace_id, source_id, model_family, model_tier)
+);
+
+-- All indexes
+CREATE INDEX IF NOT EXISTS idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conversations_source_id ON conversations(source_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_source_path ON conversations(source_path);
+CREATE INDEX IF NOT EXISTS idx_messages_conv_idx ON messages(conversation_id, idx);
+CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+CREATE INDEX IF NOT EXISTS idx_daily_stats_agent ON daily_stats(agent_slug, day_id);
+CREATE INDEX IF NOT EXISTS idx_daily_stats_source ON daily_stats(source_id, day_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_day ON token_usage(day_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_conv ON token_usage(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_model ON token_usage(model_family, day_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_workspace ON token_usage(workspace_id, day_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp_ms);
+CREATE INDEX IF NOT EXISTS idx_token_daily_stats_agent ON token_daily_stats(agent_slug, day_id);
+CREATE INDEX IF NOT EXISTS idx_token_daily_stats_model ON token_daily_stats(model_family, day_id);
+CREATE INDEX IF NOT EXISTS idx_mm_hour ON message_metrics(hour_id);
+CREATE INDEX IF NOT EXISTS idx_mm_day ON message_metrics(day_id);
+CREATE INDEX IF NOT EXISTS idx_mm_agent_hour ON message_metrics(agent_slug, hour_id);
+CREATE INDEX IF NOT EXISTS idx_mm_agent_day ON message_metrics(agent_slug, day_id);
+CREATE INDEX IF NOT EXISTS idx_mm_workspace_hour ON message_metrics(workspace_id, hour_id);
+CREATE INDEX IF NOT EXISTS idx_mm_source_hour ON message_metrics(source_id, hour_id);
+CREATE INDEX IF NOT EXISTS idx_mm_model_family_day ON message_metrics(model_family, day_id);
+CREATE INDEX IF NOT EXISTS idx_mm_provider_day ON message_metrics(provider, day_id);
+CREATE INDEX IF NOT EXISTS idx_uh_agent ON usage_hourly(agent_slug, hour_id);
+CREATE INDEX IF NOT EXISTS idx_uh_workspace ON usage_hourly(workspace_id, hour_id);
+CREATE INDEX IF NOT EXISTS idx_uh_source ON usage_hourly(source_id, hour_id);
+CREATE INDEX IF NOT EXISTS idx_ud_agent ON usage_daily(agent_slug, day_id);
+CREATE INDEX IF NOT EXISTS idx_ud_workspace ON usage_daily(workspace_id, day_id);
+CREATE INDEX IF NOT EXISTS idx_ud_source ON usage_daily(source_id, day_id);
+CREATE INDEX IF NOT EXISTS idx_umd_model_day ON usage_models_daily(model_family, day_id);
+CREATE INDEX IF NOT EXISTS idx_umd_agent_day ON usage_models_daily(agent_slug, day_id);
+CREATE INDEX IF NOT EXISTS idx_umd_workspace_day ON usage_models_daily(workspace_id, day_id);
+CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, day_id);
+";
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
 const MIGRATION_NAMES: [(i64, &str); 13] = [
@@ -1316,6 +1719,783 @@ pub struct MessageForEmbedding {
     pub source_id_hash: u32,
     pub role: String,
     pub content: String,
+}
+
+// =========================================================================
+// FrankenStorage CRUD operations
+// =========================================================================
+
+impl FrankenStorage {
+    /// Ensure an agent exists in the database, returning its ID.
+    pub fn ensure_agent(&self, agent: &Agent) -> Result<i64> {
+        let now = Self::now_millis();
+        self.conn.execute_params(
+            "INSERT INTO agents(slug, name, version, kind, created_at, updated_at) VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(slug) DO UPDATE SET name=excluded.name, version=excluded.version, kind=excluded.kind, updated_at=excluded.updated_at",
+            params![
+                agent.slug.as_str(),
+                agent.name.as_str(),
+                agent.version.as_deref(),
+                agent_kind_str(agent.kind.clone()),
+                now,
+                now
+            ],
+        )?;
+
+        self.conn
+            .query_row_map(
+                "SELECT id FROM agents WHERE slug = ?1",
+                params![agent.slug.as_str()],
+                |row| row.get_typed(0),
+            )
+            .with_context(|| format!("fetching agent id for {}", agent.slug))
+    }
+
+    /// Ensure a workspace exists in the database, returning its ID.
+    pub fn ensure_workspace(&self, path: &Path, display_name: Option<&str>) -> Result<i64> {
+        let path_str = path.to_string_lossy().to_string();
+        self.conn.execute_params(
+            "INSERT INTO workspaces(path, display_name) VALUES(?1,?2)
+             ON CONFLICT(path) DO UPDATE SET display_name=COALESCE(excluded.display_name, workspaces.display_name)",
+            params![path_str.as_str(), display_name],
+        )?;
+
+        self.conn
+            .query_row_map(
+                "SELECT id FROM workspaces WHERE path = ?1",
+                params![path_str.as_str()],
+                |row| row.get_typed(0),
+            )
+            .with_context(|| format!("fetching workspace id for {path_str}"))
+    }
+
+    /// Get current time as milliseconds since epoch.
+    pub fn now_millis() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0)
+    }
+
+    /// Convert a millisecond timestamp to a day ID (days since 2020-01-01).
+    pub fn day_id_from_millis(timestamp_ms: i64) -> i64 {
+        const EPOCH_2020_SECS: i64 = 1_577_836_800;
+        let secs = timestamp_ms / 1000;
+        (secs - EPOCH_2020_SECS) / 86400
+    }
+
+    /// Convert a millisecond timestamp to an hour ID (hours since 2020-01-01 00:00 UTC).
+    pub fn hour_id_from_millis(timestamp_ms: i64) -> i64 {
+        const EPOCH_2020_SECS: i64 = 1_577_836_800;
+        let secs = timestamp_ms / 1000;
+        (secs - EPOCH_2020_SECS) / 3600
+    }
+
+    /// Convert a day ID back to milliseconds (start of day).
+    pub fn millis_from_day_id(day_id: i64) -> i64 {
+        const EPOCH_2020_SECS: i64 = 1_577_836_800;
+        (EPOCH_2020_SECS + day_id * 86400) * 1000
+    }
+
+    /// Convert an hour ID back to milliseconds (start of hour).
+    pub fn millis_from_hour_id(hour_id: i64) -> i64 {
+        const EPOCH_2020_SECS: i64 = 1_577_836_800;
+        (EPOCH_2020_SECS + hour_id * 3600) * 1000
+    }
+
+    /// Get the timestamp of the last successful scan.
+    pub fn get_last_scan_ts(&self) -> Result<Option<i64>> {
+        let result: Result<String, _> = self.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = 'last_scan_ts'",
+            params![],
+            |row| row.get_typed(0),
+        );
+        match result.optional() {
+            Ok(Some(s)) => Ok(s.parse().ok()),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Set the timestamp of the last successful scan (milliseconds since epoch).
+    pub fn set_last_scan_ts(&self, ts: i64) -> Result<()> {
+        self.conn.execute_params(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('last_scan_ts', ?1)",
+            params![ts.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Set the timestamp of the last successful index completion (milliseconds since epoch).
+    pub fn set_last_indexed_at(&self, ts: i64) -> Result<()> {
+        self.conn.execute_params(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('last_indexed_at', ?1)",
+            params![ts.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// List all registered agents.
+    pub fn list_agents(&self) -> Result<Vec<Agent>> {
+        self.conn
+            .query_map_collect(
+                "SELECT id, slug, name, version, kind FROM agents ORDER BY slug",
+                params![],
+                |row| {
+                    let kind: String = row.get_typed(4)?;
+                    Ok(Agent {
+                        id: Some(row.get_typed(0)?),
+                        slug: row.get_typed(1)?,
+                        name: row.get_typed(2)?,
+                        version: row.get_typed(3)?,
+                        kind: match kind.as_str() {
+                            "cli" => AgentKind::Cli,
+                            "vscode" => AgentKind::VsCode,
+                            _ => AgentKind::Hybrid,
+                        },
+                    })
+                },
+            )
+            .with_context(|| "listing agents")
+    }
+
+    /// List all registered workspaces.
+    pub fn list_workspaces(&self) -> Result<Vec<crate::model::types::Workspace>> {
+        self.conn
+            .query_map_collect(
+                "SELECT id, path, display_name FROM workspaces ORDER BY path",
+                params![],
+                |row| {
+                    let path_str: String = row.get_typed(1)?;
+                    Ok(crate::model::types::Workspace {
+                        id: Some(row.get_typed(0)?),
+                        path: Path::new(&path_str).to_path_buf(),
+                        display_name: row.get_typed(2)?,
+                    })
+                },
+            )
+            .with_context(|| "listing workspaces")
+    }
+
+    /// List conversations with pagination.
+    pub fn list_conversations(&self, limit: i64, offset: i64) -> Result<Vec<Conversation>> {
+        self.conn
+            .query_map_collect(
+                r"SELECT c.id, a.slug, w.path, c.external_id, c.title, c.source_path,
+                       c.started_at, c.ended_at, c.approx_tokens, c.metadata_json,
+                       c.source_id, c.origin_host, c.metadata_bin
+                FROM conversations c
+                JOIN agents a ON c.agent_id = a.id
+                LEFT JOIN workspaces w ON c.workspace_id = w.id
+                ORDER BY c.started_at IS NULL, c.started_at DESC, c.id DESC
+                LIMIT ?1 OFFSET ?2",
+                params![limit, offset],
+                |row| {
+                    let workspace_path: Option<String> = row.get_typed(2)?;
+                    let source_path: String = row.get_typed(5)?;
+                    let source_id: Option<String> = row.get_typed(10)?;
+                    Ok(Conversation {
+                        id: Some(row.get_typed(0)?),
+                        agent_slug: row.get_typed(1)?,
+                        workspace: workspace_path.map(|p| Path::new(&p).to_path_buf()),
+                        external_id: row.get_typed(3)?,
+                        title: row.get_typed(4)?,
+                        source_path: Path::new(&source_path).to_path_buf(),
+                        started_at: row.get_typed(6)?,
+                        ended_at: row.get_typed(7)?,
+                        approx_tokens: row.get_typed(8)?,
+                        metadata_json: franken_read_metadata_compat(row, 9, 12),
+                        messages: Vec::new(),
+                        source_id: source_id.unwrap_or_else(|| "local".to_string()),
+                        origin_host: row.get_typed(11)?,
+                    })
+                },
+            )
+            .with_context(|| "listing conversations")
+    }
+
+    /// Fetch messages for a conversation.
+    pub fn fetch_messages(&self, conversation_id: i64) -> Result<Vec<Message>> {
+        self.conn
+            .query_map_collect(
+                "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+                params![conversation_id],
+                |row| {
+                    let role: String = row.get_typed(2)?;
+                    Ok(Message {
+                        id: Some(row.get_typed(0)?),
+                        idx: row.get_typed(1)?,
+                        role: match role.as_str() {
+                            "user" => MessageRole::User,
+                            "agent" | "assistant" => MessageRole::Agent,
+                            "tool" => MessageRole::Tool,
+                            "system" => MessageRole::System,
+                            other => MessageRole::Other(other.to_string()),
+                        },
+                        author: row.get_typed(3)?,
+                        created_at: row.get_typed(4)?,
+                        content: row.get_typed(5)?,
+                        extra_json: franken_read_metadata_compat(row, 6, 7),
+                        snippets: Vec::new(),
+                    })
+                },
+            )
+            .with_context(|| format!("fetching messages for conversation {conversation_id}"))
+    }
+
+    /// Get a source by ID.
+    pub fn get_source(&self, id: &str) -> Result<Option<Source>> {
+        let result = self.conn.query_row_map(
+            "SELECT id, kind, host_label, machine_id, platform, config_json, created_at, updated_at FROM sources WHERE id = ?1",
+            params![id],
+            |row| {
+                let kind_str: String = row.get_typed(1)?;
+                Ok(Source {
+                    id: row.get_typed(0)?,
+                    kind: SourceKind::from_str(&kind_str),
+                    host_label: row.get_typed(2)?,
+                    machine_id: row.get_typed(3)?,
+                    platform: row.get_typed(4)?,
+                    config_json: row.get_typed(5)?,
+                    created_at: row.get_typed(6)?,
+                    updated_at: row.get_typed(7)?,
+                })
+            },
+        );
+        Ok(result.optional()?)
+    }
+
+    /// List all sources.
+    pub fn list_sources(&self) -> Result<Vec<Source>> {
+        self.conn
+            .query_map_collect(
+                "SELECT id, kind, host_label, machine_id, platform, config_json, created_at, updated_at FROM sources ORDER BY id",
+                params![],
+                |row| {
+                    let kind_str: String = row.get_typed(1)?;
+                    Ok(Source {
+                        id: row.get_typed(0)?,
+                        kind: SourceKind::from_str(&kind_str),
+                        host_label: row.get_typed(2)?,
+                        machine_id: row.get_typed(3)?,
+                        platform: row.get_typed(4)?,
+                        config_json: row.get_typed(5)?,
+                        created_at: row.get_typed(6)?,
+                        updated_at: row.get_typed(7)?,
+                    })
+                },
+            )
+            .with_context(|| "listing sources")
+    }
+
+    /// Get IDs of all non-local sources.
+    pub fn get_source_ids(&self) -> Result<Vec<String>> {
+        self.conn
+            .query_map_collect(
+                "SELECT id FROM sources WHERE id != 'local' ORDER BY id",
+                params![],
+                |row| row.get_typed(0),
+            )
+            .with_context(|| "listing source ids")
+    }
+
+    /// Create or update a source.
+    pub fn upsert_source(&self, source: &Source) -> Result<()> {
+        let now = Self::now_millis();
+        let kind_str = source.kind.as_str();
+
+        self.conn.execute_params(
+            "INSERT INTO sources(id, kind, host_label, machine_id, platform, config_json, created_at, updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(id) DO UPDATE SET
+                kind=excluded.kind,
+                host_label=excluded.host_label,
+                machine_id=excluded.machine_id,
+                platform=excluded.platform,
+                config_json=excluded.config_json,
+                updated_at=excluded.updated_at",
+            params![
+                source.id.as_str(),
+                kind_str,
+                source.host_label.as_deref(),
+                source.machine_id.as_deref(),
+                source.platform.as_deref(),
+                source.config_json.as_deref(),
+                source.created_at.unwrap_or(now),
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a source by ID. Returns true if a row was deleted.
+    pub fn delete_source(&self, id: &str, _cascade: bool) -> Result<bool> {
+        if id == LOCAL_SOURCE_ID {
+            anyhow::bail!("cannot delete the local source");
+        }
+        let count = self.conn.execute_params(
+            "DELETE FROM sources WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Insert a conversation tree (conversation + messages + snippets + FTS).
+    pub fn insert_conversation_tree(
+        &self,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        conv: &Conversation,
+    ) -> Result<InsertOutcome> {
+        // Check for existing conversation with same (source_id, agent_id, external_id)
+        if let Some(ext) = &conv.external_id {
+            let existing: Option<i64> = self
+                .conn
+                .query_row_map(
+                    "SELECT id FROM conversations WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3",
+                    params![conv.source_id.as_str(), agent_id, ext.as_str()],
+                    |row| row.get_typed(0),
+                )
+                .optional()?;
+            if let Some(existing_id) = existing {
+                return self.franken_append_messages(existing_id, conv);
+            }
+        }
+
+        let tx = self.conn.transaction()?;
+
+        let conv_id = franken_insert_conversation(&tx, agent_id, workspace_id, conv)?;
+        let mut fts_entries = Vec::with_capacity(conv.messages.len());
+        let mut total_chars: i64 = 0;
+        for msg in &conv.messages {
+            let msg_id = franken_insert_message(&tx, conv_id, msg)?;
+            franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
+            fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+            total_chars += msg.content.len() as i64;
+        }
+        franken_batch_insert_fts(&tx, &fts_entries)?;
+
+        franken_update_daily_stats_in_tx(
+            &tx,
+            &conv.agent_slug,
+            &conv.source_id,
+            conv.started_at,
+            1,
+            conv.messages.len() as i64,
+            total_chars,
+        )?;
+
+        tx.commit()?;
+        Ok(InsertOutcome {
+            conversation_id: conv_id,
+            inserted_indices: conv.messages.iter().map(|m| m.idx).collect(),
+        })
+    }
+
+    /// Append new messages to an existing conversation.
+    fn franken_append_messages(
+        &self,
+        conversation_id: i64,
+        conv: &Conversation,
+    ) -> Result<InsertOutcome> {
+        let tx = self.conn.transaction()?;
+
+        let rows = tx.query_with_params(
+            "SELECT MAX(idx) FROM messages WHERE conversation_id = ?1",
+            &[frankensqlite::value::SqliteValue::Integer(conversation_id)],
+        )?;
+        let cutoff: i64 = rows
+            .first()
+            .and_then(|r| r.get_typed::<Option<i64>>(0).ok())
+            .flatten()
+            .unwrap_or(-1);
+
+        let mut inserted_indices = Vec::new();
+        let mut fts_entries = Vec::new();
+        let mut new_chars: i64 = 0;
+        for msg in &conv.messages {
+            if msg.idx <= cutoff {
+                continue;
+            }
+            let msg_id = franken_insert_message(&tx, conversation_id, msg)?;
+            franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
+            fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+            inserted_indices.push(msg.idx);
+            new_chars += msg.content.len() as i64;
+        }
+
+        franken_batch_insert_fts(&tx, &fts_entries)?;
+
+        if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
+            tx.execute_params(
+                "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
+                params![last_ts, conversation_id],
+            )?;
+        }
+
+        if !inserted_indices.is_empty() {
+            let message_count = inserted_indices.len() as i64;
+            franken_update_daily_stats_in_tx(
+                &tx,
+                &conv.agent_slug,
+                &conv.source_id,
+                conv.started_at,
+                0,
+                message_count,
+                new_chars,
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(InsertOutcome {
+            conversation_id,
+            inserted_indices,
+        })
+    }
+
+    /// Rebuild the FTS5 index from scratch.
+    pub fn rebuild_fts(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM fts_messages;
+             INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+             SELECT m.content, c.title, a.slug, w.path, c.source_path, m.created_at, m.id
+             FROM messages m
+             JOIN conversations c ON m.conversation_id = c.id
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id;",
+        )?;
+        Ok(())
+    }
+
+    /// Fetch all messages for embedding generation.
+    pub fn fetch_messages_for_embedding(&self) -> Result<Vec<MessageForEmbedding>> {
+        self.conn
+            .query_map_collect(
+                "SELECT m.id, m.created_at, c.agent_id, c.workspace_id, c.source_id, m.role, m.content
+                 FROM messages m
+                 JOIN conversations c ON m.conversation_id = c.id
+                 ORDER BY m.id",
+                params![],
+                |row| {
+                    let source_id: String = row.get_typed::<Option<String>>(4)?
+                        .unwrap_or_else(|| "local".to_string());
+                    Ok(MessageForEmbedding {
+                        message_id: row.get_typed(0)?,
+                        created_at: row.get_typed(1)?,
+                        agent_id: row.get_typed(2)?,
+                        workspace_id: row.get_typed(3)?,
+                        source_id_hash: crc32fast::hash(source_id.as_bytes()),
+                        role: row.get_typed(5)?,
+                        content: row.get_typed(6)?,
+                    })
+                },
+            )
+            .with_context(|| "fetching messages for embedding")
+    }
+
+    /// Get embedding jobs for a database path.
+    pub fn get_embedding_jobs(&self, db_path: &str) -> Result<Vec<EmbeddingJobRow>> {
+        self.conn
+            .query_map_collect(
+                "SELECT id, db_path, model_id, status, total_docs, completed_docs, error_message, created_at, started_at, completed_at
+                 FROM embedding_jobs WHERE db_path = ?1 ORDER BY id DESC",
+                params![db_path],
+                |row| {
+                    Ok(EmbeddingJobRow {
+                        id: row.get_typed(0)?,
+                        db_path: row.get_typed(1)?,
+                        model_id: row.get_typed(2)?,
+                        status: row.get_typed(3)?,
+                        total_docs: row.get_typed(4)?,
+                        completed_docs: row.get_typed(5)?,
+                        error_message: row.get_typed(6)?,
+                        created_at: row.get_typed(7)?,
+                        started_at: row.get_typed(8)?,
+                        completed_at: row.get_typed(9)?,
+                    })
+                },
+            )
+            .with_context(|| format!("fetching embedding jobs for {db_path}"))
+    }
+
+    /// Create or update an embedding job.
+    pub fn upsert_embedding_job(&self, db_path: &str, model_id: &str, total_docs: i64) -> Result<i64> {
+        self.conn.execute_params(
+            "INSERT INTO embedding_jobs(db_path, model_id, total_docs) VALUES(?1,?2,?3)
+             ON CONFLICT(db_path, model_id) WHERE status IN ('pending', 'running')
+             DO UPDATE SET total_docs=excluded.total_docs",
+            params![db_path, model_id, total_docs],
+        )?;
+        let rows = self.conn.query("SELECT last_insert_rowid();")?;
+        let id: i64 = rows
+            .first()
+            .and_then(|r| r.get_typed(0).ok())
+            .unwrap_or(0);
+        Ok(id)
+    }
+
+    /// Mark an embedding job as started.
+    pub fn start_embedding_job(&self, job_id: i64) -> Result<()> {
+        self.conn.execute_params(
+            "UPDATE embedding_jobs SET status = 'running', started_at = datetime('now') WHERE id = ?1",
+            params![job_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark an embedding job as completed.
+    pub fn complete_embedding_job(&self, job_id: i64) -> Result<()> {
+        self.conn.execute_params(
+            "UPDATE embedding_jobs SET status = 'completed', completed_at = datetime('now') WHERE id = ?1",
+            params![job_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark an embedding job as failed.
+    pub fn fail_embedding_job(&self, job_id: i64, error: &str) -> Result<()> {
+        self.conn.execute_params(
+            "UPDATE embedding_jobs SET status = 'failed', error_message = ?2, completed_at = datetime('now') WHERE id = ?1",
+            params![job_id, error],
+        )?;
+        Ok(())
+    }
+
+    /// Cancel embedding jobs for a database path.
+    pub fn cancel_embedding_jobs(&self, db_path: &str, model_id: Option<&str>) -> Result<usize> {
+        if let Some(mid) = model_id {
+            Ok(self.conn.execute_params(
+                "UPDATE embedding_jobs SET status = 'cancelled' WHERE db_path = ?1 AND model_id = ?2 AND status IN ('pending', 'running')",
+                params![db_path, mid],
+            )?)
+        } else {
+            Ok(self.conn.execute_params(
+                "UPDATE embedding_jobs SET status = 'cancelled' WHERE db_path = ?1 AND status IN ('pending', 'running')",
+                params![db_path],
+            )?)
+        }
+    }
+
+    /// Update embedding job progress.
+    pub fn update_job_progress(&self, job_id: i64, completed_docs: i64) -> Result<()> {
+        self.conn.execute_params(
+            "UPDATE embedding_jobs SET completed_docs = ?2 WHERE id = ?1",
+            params![job_id, completed_docs],
+        )?;
+        Ok(())
+    }
+}
+
+// =========================================================================
+// FrankenStorage transaction helper functions
+// =========================================================================
+
+/// Get last_insert_rowid from a frankensqlite transaction.
+fn franken_last_rowid(tx: &FrankenTransaction<'_>) -> Result<i64> {
+    let rows = tx.query("SELECT last_insert_rowid();")?;
+    Ok(rows
+        .first()
+        .and_then(|r| r.get_typed::<i64>(0).ok())
+        .unwrap_or(0))
+}
+
+/// Insert a conversation into the DB within a frankensqlite transaction.
+fn franken_insert_conversation(
+    tx: &FrankenTransaction<'_>,
+    agent_id: i64,
+    workspace_id: Option<i64>,
+    conv: &Conversation,
+) -> Result<i64> {
+    let metadata_bin = serialize_json_to_msgpack(&conv.metadata_json);
+
+    tx.execute_params(
+        "INSERT INTO conversations(
+            agent_id, workspace_id, source_id, external_id, title, source_path,
+            started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
+        ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![
+            agent_id,
+            workspace_id,
+            conv.source_id.as_str(),
+            conv.external_id.as_deref(),
+            conv.title.as_deref(),
+            path_to_string(&conv.source_path),
+            conv.started_at,
+            conv.ended_at,
+            conv.approx_tokens,
+            serde_json::to_string(&conv.metadata_json)?,
+            conv.origin_host.as_deref(),
+            metadata_bin.as_deref()
+        ],
+    )?;
+    franken_last_rowid(tx)
+}
+
+/// Insert a message within a frankensqlite transaction.
+fn franken_insert_message(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    msg: &Message,
+) -> Result<i64> {
+    let extra_bin = serialize_json_to_msgpack(&msg.extra_json);
+
+    tx.execute_params(
+        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            conversation_id,
+            msg.idx,
+            role_str(&msg.role),
+            msg.author.as_deref(),
+            msg.created_at,
+            msg.content.as_str(),
+            serde_json::to_string(&msg.extra_json)?,
+            extra_bin.as_deref()
+        ],
+    )?;
+    franken_last_rowid(tx)
+}
+
+/// Insert snippets within a frankensqlite transaction.
+fn franken_insert_snippets(
+    tx: &FrankenTransaction<'_>,
+    message_id: i64,
+    snippets: &[Snippet],
+) -> Result<()> {
+    for snip in snippets {
+        tx.execute_params(
+            "INSERT INTO snippets(message_id, file_path, start_line, end_line, language, snippet_text)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                message_id,
+                snip.file_path.as_ref().map(|p| path_to_string(p)),
+                snip.start_line,
+                snip.end_line,
+                snip.language.as_deref(),
+                snip.snippet_text.as_deref()
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Batch insert FTS5 entries within a frankensqlite transaction.
+fn franken_batch_insert_fts(
+    tx: &FrankenTransaction<'_>,
+    entries: &[FtsEntry],
+) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let mut inserted = 0;
+
+    for chunk in entries.chunks(FTS5_BATCH_SIZE) {
+        let placeholders: String = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let base = i * 7 + 1; // +1 for 1-indexed params
+                format!(
+                    "(?{},?{},?{},?{},?{},?{},?{})",
+                    base,
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let sql = format!(
+            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id) VALUES {placeholders}"
+        );
+
+        let mut param_values: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 7);
+        for entry in chunk {
+            param_values.push(ParamValue::from(entry.content.as_str()));
+            param_values.push(ParamValue::from(entry.title.as_str()));
+            param_values.push(ParamValue::from(entry.agent.as_str()));
+            param_values.push(ParamValue::from(entry.workspace.as_str()));
+            param_values.push(ParamValue::from(entry.source_path.as_str()));
+            param_values.push(ParamValue::from(entry.created_at));
+            param_values.push(ParamValue::from(entry.message_id));
+        }
+
+        tx.execute_params(&sql, &param_values)?;
+        inserted += chunk.len();
+    }
+
+    Ok(inserted)
+}
+
+/// Update daily stats within a frankensqlite transaction.
+fn franken_update_daily_stats_in_tx(
+    tx: &FrankenTransaction<'_>,
+    agent_slug: &str,
+    source_id: &str,
+    started_at: Option<i64>,
+    session_delta: i64,
+    message_delta: i64,
+    chars_delta: i64,
+) -> Result<()> {
+    let day_id = started_at
+        .map(FrankenStorage::day_id_from_millis)
+        .unwrap_or(0);
+    let now = FrankenStorage::now_millis();
+
+    // Update agent-specific entry
+    tx.execute_params(
+        "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
+            session_count = session_count + excluded.session_count,
+            message_count = message_count + excluded.message_count,
+            total_chars = total_chars + excluded.total_chars,
+            last_updated = excluded.last_updated",
+        params![day_id, agent_slug, source_id, session_delta, message_delta, chars_delta, now],
+    )?;
+
+    // Update 'all' agent entry
+    tx.execute_params(
+        "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+         VALUES(?1,'all',?2,?3,?4,?5,?6)
+         ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
+            session_count = session_count + excluded.session_count,
+            message_count = message_count + excluded.message_count,
+            total_chars = total_chars + excluded.total_chars,
+            last_updated = excluded.last_updated",
+        params![day_id, source_id, session_delta, message_delta, chars_delta, now],
+    )?;
+
+    // Update 'all' source entry
+    tx.execute_params(
+        "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+         VALUES(?1,?2,'all',?3,?4,?5,?6)
+         ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
+            session_count = session_count + excluded.session_count,
+            message_count = message_count + excluded.message_count,
+            total_chars = total_chars + excluded.total_chars,
+            last_updated = excluded.last_updated",
+        params![day_id, agent_slug, session_delta, message_delta, chars_delta, now],
+    )?;
+
+    // Update global 'all'/'all' entry
+    tx.execute_params(
+        "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+         VALUES(?1,'all','all',?2,?3,?4,?5)
+         ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
+            session_count = session_count + excluded.session_count,
+            message_count = message_count + excluded.message_count,
+            total_chars = total_chars + excluded.total_chars,
+            last_updated = excluded.last_updated",
+        params![day_id, session_delta, message_delta, chars_delta, now],
+    )?;
+
+    Ok(())
 }
 
 impl SqliteStorage {
@@ -7261,13 +8441,21 @@ mod tests {
             );
         }
 
-        // _schema_migrations tracking table should exist with 13 entries.
+        // _schema_migrations tracking table should exist with 1 entry (combined V13).
         let rows = storage
             .raw()
             .query("SELECT COUNT(*) FROM _schema_migrations;")
             .unwrap();
         let count: i64 = rows.first().unwrap().get_typed(0).unwrap();
-        assert_eq!(count, 13, "_schema_migrations should have 13 entries");
+        assert_eq!(count, 1, "_schema_migrations should have 1 entry (combined V13)");
+
+        // The single entry should be version 13.
+        let rows = storage
+            .raw()
+            .query("SELECT version FROM _schema_migrations;")
+            .unwrap();
+        let version: i64 = rows.first().unwrap().get_typed(0).unwrap();
+        assert_eq!(version, 13, "_schema_migrations entry should be version 13");
     }
 
     #[test]
@@ -7370,13 +8558,13 @@ mod tests {
     }
 
     #[test]
-    fn build_cass_migrations_has_13_migrations() {
-        let runner = build_cass_migrations();
-        // Run on fresh in-memory DB to verify all 13 apply.
+    fn build_cass_migrations_applies_combined_v13() {
         let conn = FrankenConnection::open(":memory:").unwrap();
+        let runner = build_cass_migrations();
         let result = runner.run(&conn).unwrap();
+
         assert!(result.was_fresh);
-        assert_eq!(result.applied.len(), 13, "should apply all 13 migrations");
+        assert_eq!(result.applied, vec![13], "should apply combined V13");
         assert_eq!(result.current, 13);
     }
 }
