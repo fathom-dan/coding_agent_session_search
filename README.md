@@ -31,13 +31,15 @@ Installs the latest release by default. Pass `--version <tag>` / `-Version <tag>
 **Or via package managers:**
 
 ```bash
-# macOS/Linux (Homebrew)
+# Homebrew (Apple Silicon macOS + Linux)
 brew install dicklesworthstone/tap/cass
 
 # Windows (Scoop)
 scoop bucket add dicklesworthstone https://github.com/Dicklesworthstone/scoop-bucket
 scoop install dicklesworthstone/cass
 ```
+
+Homebrew bottles are currently published for Linux and Apple Silicon macOS. On Intel macOS, use the install script with `--from-source`.
 
 </div>
 
@@ -1773,12 +1775,12 @@ classDiagram
 
 ## 🧠 Architecture & Engineering
 
-`cass` employs a dual-storage strategy to balance data integrity with search performance.
+`cass` employs a dual-storage strategy to balance data integrity with search performance, powered by a suite of integrated "franken" libraries.
 
 ### The Pipeline
-1. **Ingestion**: Connectors scan proprietary agent files and normalize them into standard structs.
-2. **Storage (SQLite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`). This ensures ACID compliance, reliable storage, and supports complex relational queries (stats, grouping).
-3. **Search Index (Tantivy)**: The **Speed Layer**. New messages are incrementally pushed to a Tantivy full-text index. This index is optimized for speed:
+1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 15+ coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Copilot, and more).
+2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation with `BEGIN CONCURRENT` support for MVCC multi-writer transactions.
+3. **Search Index (frankensearch)**: The **Speed Layer**. New messages are incrementally pushed to a unified search index via [frankensearch](https://github.com/Dicklesworthstone/frankensearch) which provides BM25 lexical search, semantic embeddings, RRF fusion, and cross-encoder reranking in a single library.
  * **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.
  * **Prefix Fields**: `title_prefix` and `content_prefix` use **Index-Time Edge N-Grams** (not stored on disk to save space) for instant prefix matching.
  * **Deduping**: Search results are deduplicated by content hash to remove noise from repeated tool outputs.
@@ -1812,12 +1814,12 @@ flowchart LR
  end
 
  subgraph "Ingestion Layer"
- C1["Connectors\nDetect & Scan\nNormalize & Dedupe"]:::pastel2
+ C1["franken_agent_detection\nAuto-Discover & Scan\nNormalize & Dedupe"]:::pastel2
  end
 
  subgraph "Dual Storage"
- S1["SQLite (WAL)\nSource of Truth\nRelational Data\nMigrations"]:::pastel3
- T1["Tantivy Index\nSearch Optimized\nEdge N-Grams\nPrefix Cache"]:::pastel4
+ S1["frankensqlite (WAL)\nSource of Truth\nBEGIN CONCURRENT\nMigrations"]:::pastel3
+ T1["frankensearch\nBM25 + Semantic\nRRF Fusion\nReranking"]:::pastel4
  end
 
  subgraph "Presentation"
@@ -1877,7 +1879,7 @@ graph TD
 ```
 
 ### Append-Only Storage Strategy
-Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sqlite.rs`) as an **append-only log** for conversations:
+Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sqlite.rs`, powered by frankensqlite) as an **append-only log** for conversations:
 
 - **Immutable History**: When an agent adds a message to a conversation, we don't update the existing row. We insert the new message linked to the conversation ID.
 - **Deduplication**: The connector layer uses content hashing to prevent duplicate messages if an agent re-writes a file.
@@ -2093,10 +2095,15 @@ cass completions powershell >> $PROFILE
 
 ### 1. Install
 
-**Recommended: Homebrew (macOS/Linux)**
+**Recommended: Homebrew (Apple Silicon macOS + Linux)**
 ```bash
 brew install dicklesworthstone/tap/cass
+
+# Update later
+brew upgrade cass
 ```
+
+Homebrew bottles are currently published for Linux and Apple Silicon macOS. On Intel macOS, use the install script with `--from-source`.
 
 **Windows: Scoop**
 ```powershell
@@ -2115,9 +2122,9 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_ses
 2. Verify `SHA256SUMS.txt` against the downloaded archive.
 3. Extract and move `cass` into your PATH.
 
-Example (Linux x86_64, replace `VERSION` with desired release tag):
+Example (Linux x86_64, replace `VERSION` with an explicit release tag):
 ```bash
-VERSION=latest  # or e.g. v0.1.65
+VERSION=v0.2.0  # e.g. v0.2.0
 curl -L -o cass-linux-amd64.tar.gz \
   "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/${VERSION}/cass-linux-amd64.tar.gz"
 curl -L -o SHA256SUMS.txt \

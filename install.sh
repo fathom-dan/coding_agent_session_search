@@ -280,4 +280,4 @@ if [ "$QUICKSTART" -eq 1 ]; then
 fi
 
 ok "Done. Run: cass"
-info "Tip: For automatic updates, install via Homebrew: brew install dicklesworthstone/tap/cass"
+info "Tip: If installed via Homebrew, update with: brew upgrade cass"
