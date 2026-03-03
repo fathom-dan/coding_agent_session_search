@@ -126,3 +126,6 @@ ci-artifacts/
 proptest-regressions/
 test_meminfo
 path_test
+
+# One-off scan output
+scan.txt
