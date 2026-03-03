@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn preset_cycling_wraps() {
         let mut theme = CassTheme::with_options(
-            ThemePreset::HighContrast,
+            ThemePreset::Colorblind,
             ColorProfile::TrueColor,
             ThemeFlags::all_enabled(),
         );

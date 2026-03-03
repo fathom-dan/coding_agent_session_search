@@ -960,10 +960,10 @@ impl ThemePalette {
             surface: colors::BG_SURFACE,                       // #24283b (unchanged)
             hint: colors::TEXT_MUTED,                           // #696e9e (unchanged)
             border: colors::BORDER,                             // #3b4261 (unchanged)
-            user: PackedRgba::rgb(122, 162, 247),              // #7aa2f7 blue (was green #9ece6a)
-            agent: colors::ROLE_AGENT,                         // #7aa2f7 (unchanged)
+            user: PackedRgba::rgb(125, 207, 255),              // #7dcfff cyan (was green #9ece6a — distinct from agent blue)
+            agent: colors::ROLE_AGENT,                         // #7aa2f7 blue (unchanged)
             tool: PackedRgba::rgb(224, 175, 104),              // #e0af68 yellow (was orange #ff9e64)
-            system: PackedRgba::rgb(187, 154, 247),            // #bb9af7 magenta (was red-ish #e0af68)
+            system: PackedRgba::rgb(208, 154, 247),            // #d09af7 light magenta (was amber #e0af68 — distinct from accent_alt/error)
             stripe_even: colors::BG_DEEP,                      // #1a1b26
             stripe_odd: PackedRgba::rgb(30, 32, 48),           // #1e2030
         }

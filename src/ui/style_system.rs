@@ -100,7 +100,7 @@ pub enum UiThemePreset {
     Nightfox,
     CyberpunkAurora,
     Synthwave84,
-    #[serde(alias = "cb")]
+    #[serde(alias = "cb", alias = "cvd")]
     Colorblind,
 }
 
@@ -1435,8 +1435,8 @@ fn colorblind_theme() -> Theme {
         .success(Color::rgb(125, 207, 255)) // #7dcfff cyan (was green #73daca)
         // warning → warm yellow (was amber, still yellow family but brighter)
         .warning(Color::rgb(224, 175, 104)) // #e0af68 (unchanged, already CB-safe)
-        // error → magenta/purple instead of red
-        .error(Color::rgb(187, 154, 247)) // #bb9af7 (was red #f7768e)
+        // error → light magenta instead of red (distinct from accent_alt #bb9af7)
+        .error(Color::rgb(208, 154, 247)) // #d09af7 (was red #f7768e)
         .build()
 }
 
