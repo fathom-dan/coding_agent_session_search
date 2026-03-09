@@ -1518,7 +1518,7 @@ impl FrankenStorage {
         }
 
         self.conn
-            .execute_params(
+            .execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1);",
                 &[ParamValue::from(version.to_string())],
             )
@@ -2122,7 +2122,7 @@ fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
         if version > current_version {
             break;
         }
-        conn.execute_params(
+        conn.execute_compat(
             "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
             &[ParamValue::from(version), ParamValue::from(name)],
         )
@@ -2161,7 +2161,7 @@ impl FrankenStorage {
     /// Ensure an agent exists in the database, returning its ID.
     pub fn ensure_agent(&self, agent: &Agent) -> Result<i64> {
         let now = Self::now_millis();
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "INSERT INTO agents(slug, name, version, kind, created_at, updated_at) VALUES(?1,?2,?3,?4,?5,?6)
              ON CONFLICT(slug) DO UPDATE SET name=excluded.name, version=excluded.version, kind=excluded.kind, updated_at=excluded.updated_at",
             fparams![
@@ -2186,7 +2186,7 @@ impl FrankenStorage {
     /// Ensure a workspace exists in the database, returning its ID.
     pub fn ensure_workspace(&self, path: &Path, display_name: Option<&str>) -> Result<i64> {
         let path_str = path.to_string_lossy().to_string();
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "INSERT INTO workspaces(path, display_name) VALUES(?1,?2)
              ON CONFLICT(path) DO UPDATE SET display_name=COALESCE(excluded.display_name, workspaces.display_name)",
             fparams![path_str.as_str(), display_name],
@@ -2251,7 +2251,7 @@ impl FrankenStorage {
 
     /// Set the timestamp of the last successful scan (milliseconds since epoch).
     pub fn set_last_scan_ts(&self, ts: i64) -> Result<()> {
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('last_scan_ts', ?1)",
             fparams![ts.to_string()],
         )?;
@@ -2260,7 +2260,7 @@ impl FrankenStorage {
 
     /// Set the timestamp of the last successful index completion (milliseconds since epoch).
     pub fn set_last_indexed_at(&self, ts: i64) -> Result<()> {
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('last_indexed_at', ?1)",
             fparams![ts.to_string()],
         )?;
@@ -2443,7 +2443,7 @@ impl FrankenStorage {
             .map(serde_json::to_string)
             .transpose()?;
 
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "INSERT INTO sources(id, kind, host_label, machine_id, platform, config_json, created_at, updated_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
              ON CONFLICT(id) DO UPDATE SET
@@ -2474,7 +2474,7 @@ impl FrankenStorage {
         }
         let count = self
             .conn
-            .execute_params("DELETE FROM sources WHERE id = ?1", fparams![id])?;
+            .execute_compat("DELETE FROM sources WHERE id = ?1", fparams![id])?;
         Ok(count > 0)
     }
 
@@ -2565,7 +2565,7 @@ impl FrankenStorage {
         franken_batch_insert_fts(&tx, &fts_entries)?;
 
         if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
-            tx.execute_params(
+            tx.execute_compat(
                 "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
                 fparams![last_ts, conversation_id],
             )?;
@@ -2663,7 +2663,7 @@ impl FrankenStorage {
         model_id: &str,
         total_docs: i64,
     ) -> Result<i64> {
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "INSERT INTO embedding_jobs(db_path, model_id, total_docs) VALUES(?1,?2,?3)
              ON CONFLICT(db_path, model_id) WHERE status IN ('pending', 'running')
              DO UPDATE SET total_docs=excluded.total_docs",
@@ -2676,7 +2676,7 @@ impl FrankenStorage {
 
     /// Mark an embedding job as started.
     pub fn start_embedding_job(&self, job_id: i64) -> Result<()> {
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "UPDATE embedding_jobs SET status = 'running', started_at = datetime('now') WHERE id = ?1",
             fparams![job_id],
         )?;
@@ -2685,7 +2685,7 @@ impl FrankenStorage {
 
     /// Mark an embedding job as completed.
     pub fn complete_embedding_job(&self, job_id: i64) -> Result<()> {
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "UPDATE embedding_jobs SET status = 'completed', completed_at = datetime('now') WHERE id = ?1",
             fparams![job_id],
         )?;
@@ -2694,7 +2694,7 @@ impl FrankenStorage {
 
     /// Mark an embedding job as failed.
     pub fn fail_embedding_job(&self, job_id: i64, error: &str) -> Result<()> {
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "UPDATE embedding_jobs SET status = 'failed', error_message = ?2, completed_at = datetime('now') WHERE id = ?1",
             fparams![job_id, error],
         )?;
@@ -2704,12 +2704,12 @@ impl FrankenStorage {
     /// Cancel embedding jobs for a database path.
     pub fn cancel_embedding_jobs(&self, db_path: &str, model_id: Option<&str>) -> Result<usize> {
         if let Some(mid) = model_id {
-            Ok(self.conn.execute_params(
+            Ok(self.conn.execute_compat(
                 "UPDATE embedding_jobs SET status = 'cancelled' WHERE db_path = ?1 AND model_id = ?2 AND status IN ('pending', 'running')",
                 fparams![db_path, mid],
             )?)
         } else {
-            Ok(self.conn.execute_params(
+            Ok(self.conn.execute_compat(
                 "UPDATE embedding_jobs SET status = 'cancelled' WHERE db_path = ?1 AND status IN ('pending', 'running')",
                 fparams![db_path],
             )?)
@@ -2718,7 +2718,7 @@ impl FrankenStorage {
 
     /// Update embedding job progress.
     pub fn update_job_progress(&self, job_id: i64, completed_docs: i64) -> Result<()> {
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "UPDATE embedding_jobs SET completed_docs = ?2 WHERE id = ?1",
             fparams![job_id, completed_docs],
         )?;
@@ -3253,7 +3253,7 @@ fn franken_insert_conversation(
     let metadata_json_str = serde_json::to_string(&conv.metadata_json)?;
     let metadata_bin_bytes = metadata_bin.as_deref();
 
-    tx.execute_params(
+    tx.execute_compat(
         "INSERT INTO conversations(
             agent_id, workspace_id, source_id, external_id, title, source_path,
             started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
@@ -3287,7 +3287,7 @@ fn franken_insert_message(
     let extra_json_str = serde_json::to_string(&msg.extra_json)?;
     let extra_bin_bytes = extra_bin.as_deref();
 
-    tx.execute_params(
+    tx.execute_compat(
         "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
         fparams![
@@ -3312,7 +3312,7 @@ fn franken_insert_snippets(
 ) -> Result<()> {
     for snip in snippets {
         let file_path_str = snip.file_path.as_ref().map(path_to_string);
-        tx.execute_params(
+        tx.execute_compat(
             "INSERT INTO snippets(message_id, file_path, start_line, end_line, language, snippet_text)
              VALUES(?1,?2,?3,?4,?5,?6)",
             fparams![
@@ -3371,7 +3371,7 @@ fn franken_batch_insert_fts(tx: &FrankenTransaction<'_>, entries: &[FtsEntry]) -
             param_values.push(ParamValue::from(entry.message_id));
         }
 
-        tx.execute_params(&sql, &param_values)?;
+        tx.execute_compat(&sql, &param_values)?;
         inserted += chunk.len();
     }
 
@@ -3394,7 +3394,7 @@ fn franken_update_daily_stats_in_tx(
     let now = FrankenStorage::now_millis();
 
     // Update agent-specific entry
-    tx.execute_params(
+    tx.execute_compat(
         "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
          VALUES(?1,?2,?3,?4,?5,?6,?7)
          ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
@@ -3406,7 +3406,7 @@ fn franken_update_daily_stats_in_tx(
     )?;
 
     // Update 'all' agent entry
-    tx.execute_params(
+    tx.execute_compat(
         "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
          VALUES(?1,'all',?2,?3,?4,?5,?6)
          ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
@@ -3418,7 +3418,7 @@ fn franken_update_daily_stats_in_tx(
     )?;
 
     // Update 'all' source entry
-    tx.execute_params(
+    tx.execute_compat(
         "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
          VALUES(?1,?2,'all',?3,?4,?5,?6)
          ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
@@ -3430,7 +3430,7 @@ fn franken_update_daily_stats_in_tx(
     )?;
 
     // Update global 'all'/'all' entry
-    tx.execute_params(
+    tx.execute_compat(
         "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
          VALUES(?1,'all','all',?2,?3,?4,?5)
          ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
@@ -3905,7 +3905,7 @@ fn franken_update_conversation_token_summaries_in_tx(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
 ) -> Result<()> {
-    tx.execute_params(
+    tx.execute_compat(
         "UPDATE conversations SET
             total_input_tokens = (SELECT SUM(input_tokens) FROM token_usage WHERE conversation_id = ?1),
             total_output_tokens = (SELECT SUM(output_tokens) FROM token_usage WHERE conversation_id = ?1),

@@ -1071,7 +1071,7 @@ mod tests {
             for idx in 0..msg_count {
                 let role = if idx % 2 == 0 { "user" } else { "assistant" };
                 let created_at = 1700000000000i64 + (conv_id * 100000000) + (idx as i64 * 1000);
-                conn.execute_params(
+                conn.execute_compat(
                     "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![

@@ -141,7 +141,7 @@ impl BookmarkStore {
     pub fn add(&self, bookmark: &Bookmark) -> Result<i64> {
         let line_number = line_number_to_db(bookmark.line_number)?;
 
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "INSERT INTO bookmarks (title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
@@ -170,7 +170,7 @@ impl BookmarkStore {
     pub fn update(&self, bookmark: &Bookmark) -> Result<bool> {
         let now = current_timestamp();
 
-        let rows = self.conn.execute_params(
+        let rows = self.conn.execute_compat(
             "UPDATE bookmarks SET title = ?1, note = ?2, tags = ?3, updated_at = ?4 WHERE id = ?5",
             params![
                 bookmark.title.as_str(),
@@ -188,7 +188,7 @@ impl BookmarkStore {
     pub fn remove(&self, id: i64) -> Result<bool> {
         let rows = self
             .conn
-            .execute_params("DELETE FROM bookmarks WHERE id = ?1", params![id])?;
+            .execute_compat("DELETE FROM bookmarks WHERE id = ?1", params![id])?;
         Ok(rows > 0)
     }
 
@@ -310,7 +310,7 @@ impl BookmarkStore {
 
             if exists == 0 {
                 bookmark.id = 0; // Reset ID for new insert
-                tx.execute_params(
+                tx.execute_compat(
                     "INSERT INTO bookmarks (title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
@@ -530,7 +530,7 @@ mod tests {
         let now = current_timestamp();
         store
             .conn
-            .execute_params(
+            .execute_compat(
                 "INSERT INTO bookmarks (title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![

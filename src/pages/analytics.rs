@@ -846,7 +846,7 @@ mod tests {
                 let created_at =
                     1700000000000i64 + (conv_id as i64 * 100000000) + (idx as i64 * 1000);
                 let content = format!("Message {} for conv {}", idx, conv_id);
-                conn.execute_params(
+                conn.execute_compat(
                     "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                     frankensqlite::params![
@@ -992,7 +992,7 @@ mod tests {
             let started_at = 1_700_000_000_000i64 + i as i64 * 1_000;
             let title = format!("Claude conversation {}", i);
             let source = format!("/path/{}.jsonl", conv_id);
-            conn.execute_params(
+            conn.execute_compat(
                 "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
                  VALUES (?1, 'claude-code', ?2, ?3, ?4, ?5, 1)",
                 frankensqlite::params![
@@ -1005,7 +1005,7 @@ mod tests {
             )
             .unwrap();
             let content = format!("message {}", i);
-            conn.execute_params(
+            conn.execute_compat(
                 "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                  VALUES (?1, 0, 'assistant', ?2, ?3)",
                 frankensqlite::params![conv_id, content.as_str(), started_at],
@@ -1019,7 +1019,7 @@ mod tests {
             let started_at = 1_700_100_000_000i64 + i as i64 * 1_000;
             let title = format!("Codex conversation {}", i);
             let source = format!("/path/{}.jsonl", conv_id);
-            conn.execute_params(
+            conn.execute_compat(
                 "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
                  VALUES (?1, 'codex', '/home/user/codex-ws', ?2, ?3, ?4, 1)",
                 frankensqlite::params![
@@ -1031,7 +1031,7 @@ mod tests {
             )
             .unwrap();
             let content = format!("codex {}", i);
-            conn.execute_params(
+            conn.execute_compat(
                 "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                  VALUES (?1, 0, 'assistant', ?2, ?3)",
                 frankensqlite::params![conv_id, content.as_str(), started_at],

@@ -255,7 +255,7 @@ impl ExportEngine {
             // Transform Path
             let transformed_path = self.transform_path(source_path, workspace);
 
-            tx.execute_params(
+            tx.execute_compat(
                 "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, ended_at, message_count, metadata_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 frankensqlite::params![
@@ -289,7 +289,7 @@ impl ExportEngine {
             )?;
 
             for (role, content, created_at, idx) in &msg_rows {
-                tx.execute_params(
+                tx.execute_compat(
                     "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                     frankensqlite::params![*id, *idx, role.as_str(), content.as_str(), *created_at],
@@ -298,11 +298,11 @@ impl ExportEngine {
                 let msg_id: i64 = tx.query_row("SELECT last_insert_rowid()")?.get_typed(0)?;
 
                 // Populate FTS
-                tx.execute_params(
+                tx.execute_compat(
                     "INSERT INTO messages_fts (rowid, content) VALUES (?1, ?2)",
                     frankensqlite::params![msg_id, content.as_str()],
                 )?;
-                tx.execute_params(
+                tx.execute_compat(
                     "INSERT INTO messages_code_fts (rowid, content) VALUES (?1, ?2)",
                     frankensqlite::params![msg_id, content.as_str()],
                 )?;
@@ -317,7 +317,7 @@ impl ExportEngine {
         // Metadata
         tx.execute("INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')")?;
         let exported_at = Utc::now().to_rfc3339();
-        tx.execute_params(
+        tx.execute_compat(
             "INSERT INTO export_meta (key, value) VALUES ('exported_at', ?1)",
             frankensqlite::params![exported_at.as_str()],
         )?;

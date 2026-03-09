@@ -11069,7 +11069,7 @@ fn run_index_with_data(
 
         // Clean expired keys
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let _ = conn.execute_params(
+        let _ = conn.execute_compat(
             "DELETE FROM idempotency_keys WHERE expires_at < ?1",
             frankensqlite::params![now_ms],
         );
@@ -11437,7 +11437,7 @@ fn run_index_with_data(
                 let expires_ms = now_ms + 24 * 60 * 60 * 1000; // 24 hours
                 let result_json = serde_json::to_string(&payload).unwrap_or_default();
                 let hash_str = params_hash.to_string();
-                let _ = conn.execute_params(
+                let _ = conn.execute_compat(
                     "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                     frankensqlite::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
                 );

@@ -5071,7 +5071,7 @@ mod tests {
              );",
         )?;
         conn.execute("INSERT INTO messages(id, idx) VALUES(1, 0)")?;
-        conn.execute_params(
+        conn.execute_compat(
             "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
              VALUES(?1, ?2, ?3, NULL, ?4, ?5, ?6)",
             params![

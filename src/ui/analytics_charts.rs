@@ -2876,12 +2876,12 @@ mod tests {
             );",
         )
         .unwrap();
-        conn.execute_params(
+        conn.execute_compat(
             "INSERT INTO workspaces (id, path) VALUES (?1, ?2)",
             params![1_i64, "/workspace/one"],
         )
         .unwrap();
-        conn.execute_params(
+        conn.execute_compat(
             "INSERT INTO workspaces (id, path) VALUES (?1, ?2)",
             params![2_i64, "/workspace/two"],
         )
@@ -2916,7 +2916,7 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         let conn = storage.raw();
-        conn.execute_params(
+        conn.execute_compat(
             "INSERT INTO usage_daily (
                 day_id, agent_slug, workspace_id, source_id,
                 message_count, tool_call_count, api_tokens_total, last_updated
@@ -2924,7 +2924,7 @@ mod tests {
             params![20260220_i64, ws_a, now_ms],
         )
         .unwrap();
-        conn.execute_params(
+        conn.execute_compat(
             "INSERT INTO usage_daily (
                 day_id, agent_slug, workspace_id, source_id,
                 message_count, tool_call_count, api_tokens_total, last_updated

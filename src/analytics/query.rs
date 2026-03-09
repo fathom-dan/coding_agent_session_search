@@ -1641,7 +1641,7 @@ mod tests {
         ];
 
         for r in &rows {
-            conn.execute_params(
+            conn.execute_compat(
                 "INSERT INTO usage_daily (day_id, agent_slug, workspace_id, source_id,
                     message_count, user_message_count, assistant_message_count,
                     tool_call_count, plan_message_count, api_coverage_message_count,
@@ -1730,7 +1730,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_params(
+        conn.execute_compat(
             "INSERT INTO usage_hourly (
                 hour_id, agent_slug, workspace_id, source_id,
                 message_count, user_message_count, assistant_message_count,
@@ -1752,7 +1752,7 @@ mod tests {
             frankensqlite::params![1000_i64, 1_i64],
         )
         .unwrap();
-        conn.execute_params(
+        conn.execute_compat(
             "INSERT INTO usage_hourly (
                 hour_id, agent_slug, workspace_id, source_id,
                 message_count, user_message_count, assistant_message_count,
@@ -1811,15 +1811,15 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        conn.execute_params(
+        conn.execute_compat(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             frankensqlite::params![20250, "claude_code", "local", "opus", 80, 40, 40, 5, 30000, 25000, 3000, 1500, 500, 60000, 160000, 20, 1.50, 3, now],
         ).unwrap();
-        conn.execute_params(
+        conn.execute_compat(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             frankensqlite::params![20250, "claude_code", "local", "sonnet", 40, 20, 20, 2, 10000, 8000, 1000, 500, 200, 19700, 80000, 8, 0.40, 2, now],
         ).unwrap();
-        conn.execute_params(
+        conn.execute_compat(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             frankensqlite::params![20250, "codex", "local", "gpt-4o", 50, 25, 25, 3, 15000, 12000, 2000, 800, 0, 29800, 100000, 10, 0.80, 1, now],
         ).unwrap();
@@ -1844,12 +1844,12 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_params(
+        conn.execute_compat(
             "INSERT INTO usage_hourly (hour_id, last_updated) VALUES (?1, ?2)",
             frankensqlite::params![123_i64, hourly_last_updated],
         )
         .unwrap();
-        conn.execute_params(
+        conn.execute_compat(
             "INSERT INTO token_daily_stats (day_id, last_updated) VALUES (?1, ?2)",
             frankensqlite::params![456_i64, track_b_last_updated],
         )
