@@ -94,6 +94,8 @@ dialoguer = "*"
 
 # SFTP fallback for sync when rsync is unavailable
 ssh2 = "*"
+# Statically link OpenSSL so release binaries don't require system libssl.so.3
+openssl = { version = "*", features = ["vendored"] }
 argon2 = "*"
 hkdf = "*"
 zeroize = { version = "*", features = ["derive"] }
