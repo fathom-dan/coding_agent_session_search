@@ -1,3 +1,4 @@
+pub mod redact_secrets;
 pub mod semantic;
 
 use std::collections::HashMap;
@@ -2486,9 +2487,13 @@ pub mod persist {
     /// Convert a NormalizedConversation to the internal Conversation type for SQLite storage.
     ///
     /// Extracts provenance from `metadata.cass.origin` if present, otherwise defaults to local.
+    ///
+    /// Applies secret redaction to message content and extra_json before storage
+    /// (security fix for #112: tool-result secrets were persisted unredacted).
     pub fn map_to_internal(conv: &NormalizedConversation) -> Conversation {
         // Extract provenance from metadata (P2.2)
         let (source_id, origin_host) = extract_provenance(&conv.metadata);
+        let should_redact = super::redact_secrets::redaction_enabled();
 
         Conversation {
             id: None,
@@ -2504,26 +2509,38 @@ pub mod persist {
             messages: conv
                 .messages
                 .iter()
-                .map(|m| Message {
-                    id: None,
-                    idx: m.idx,
-                    role: map_role(&m.role),
-                    author: m.author.clone(),
-                    created_at: m.created_at,
-                    content: m.content.clone(),
-                    extra_json: m.extra.clone(),
-                    snippets: m
-                        .snippets
-                        .iter()
-                        .map(|s| Snippet {
-                            id: None,
-                            file_path: s.file_path.clone(),
-                            start_line: s.start_line,
-                            end_line: s.end_line,
-                            language: s.language.clone(),
-                            snippet_text: s.snippet_text.clone(),
-                        })
-                        .collect(),
+                .map(|m| {
+                    let content = if should_redact {
+                        super::redact_secrets::redact_text(&m.content)
+                    } else {
+                        m.content.clone()
+                    };
+                    let extra_json = if should_redact {
+                        super::redact_secrets::redact_json(&m.extra)
+                    } else {
+                        m.extra.clone()
+                    };
+                    Message {
+                        id: None,
+                        idx: m.idx,
+                        role: map_role(&m.role),
+                        author: m.author.clone(),
+                        created_at: m.created_at,
+                        content,
+                        extra_json,
+                        snippets: m
+                            .snippets
+                            .iter()
+                            .map(|s| Snippet {
+                                id: None,
+                                file_path: s.file_path.clone(),
+                                start_line: s.start_line,
+                                end_line: s.end_line,
+                                language: s.language.clone(),
+                                snippet_text: s.snippet_text.clone(),
+                            })
+                            .collect(),
+                    }
                 })
                 .collect(),
             source_id,
