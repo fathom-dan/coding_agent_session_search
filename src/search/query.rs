@@ -1905,6 +1905,25 @@ impl SearchClient {
             let path_str = path.to_string_lossy().to_string();
             match Connection::open(&path_str) {
                 Ok(conn) => {
+                    // Fix #26: FrankenSQLite skips virtual-table entries (rootpage=0)
+                    // when loading sqlite_master from a stock-SQLite database.  The
+                    // FTS5 module is compiled in but the `fts_messages` virtual table
+                    // is not materialised until we explicitly execute the CREATE
+                    // statement, which triggers FrankenSQLite's legacy FTS5 fallback
+                    // path.  Without this, workspace-filtered searches that fall back
+                    // to SQLite FTS fail with "table not found: fts_messages".
+                    if let Err(e) = conn.execute(
+                        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(\
+                            content, title, agent, workspace, source_path, \
+                            created_at UNINDEXED, message_id UNINDEXED, \
+                            tokenize='porter'\
+                        )"
+                    ) {
+                        tracing::debug!(
+                            error = %e,
+                            "fts_messages virtual table registration failed (non-fatal)"
+                        );
+                    }
                     *guard = Some(SendConnection(conn));
                 }
                 Err(e) => {
