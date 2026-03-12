@@ -596,7 +596,7 @@ pub const FTS5_REGISTER_SQL: &str = "\
 pub fn register_fts5_on_connection(
     conn: &FrankenConnection,
 ) -> std::result::Result<(), frankensqlite::FrankenError> {
-    conn.execute(FTS5_REGISTER_SQL)
+    conn.execute(FTS5_REGISTER_SQL).map(|_| ())
 }
 
 /// Create a timestamped backup of the database file.
