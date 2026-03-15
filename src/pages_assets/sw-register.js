@@ -200,7 +200,7 @@ export async function unregisterServiceWorker() {
  * Clear the service worker cache
  */
 export async function clearCache() {
-    if (navigator.serviceWorker.controller) {
+    if (navigator?.serviceWorker?.controller) {
         return new Promise((resolve) => {
             const channel = new MessageChannel();
             channel.port1.onmessage = () => {
@@ -219,7 +219,7 @@ export async function clearCache() {
  * Get service worker version
  */
 export async function getVersion() {
-    if (navigator.serviceWorker.controller) {
+    if (navigator?.serviceWorker?.controller) {
         return new Promise((resolve) => {
             const channel = new MessageChannel();
             channel.port1.onmessage = (event) => {

@@ -117,11 +117,11 @@ async function runLighthouse(url) {
 
     const lhr = result.lhr;
     return {
-      performanceScore: lhr.categories.performance.score * 100,
-      fcp: lhr.audits['first-contentful-paint'].numericValue,
-      lcp: lhr.audits['largest-contentful-paint'].numericValue,
-      tti: lhr.audits['interactive'].numericValue,
-      tbt: lhr.audits['total-blocking-time'].numericValue
+      performanceScore: lhr?.categories?.performance?.score ? lhr.categories.performance.score * 100 : 0,
+      fcp: lhr?.audits?.['first-contentful-paint']?.numericValue || 0,
+      lcp: lhr?.audits?.['largest-contentful-paint']?.numericValue || 0,
+      tti: lhr?.audits?.['interactive']?.numericValue || 0,
+      tbt: lhr?.audits?.['total-blocking-time']?.numericValue || 0
     };
   } catch (error) {
     return { error: error.message || String(error) };

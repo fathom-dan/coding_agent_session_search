@@ -154,7 +154,7 @@ class Router {
      * @private
      */
     _handleHashChange() {
-        const hash = window.location.hash.slice(1) || '/';
+        const hash = (window.location.hash || '').slice(1) || '/';
         const parsed = this._parseHash(hash);
 
         currentRoute = parsed;
