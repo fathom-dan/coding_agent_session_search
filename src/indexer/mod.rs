@@ -162,6 +162,8 @@ pub struct StaleDetector {
     last_check: Mutex<Instant>,
     /// Total successful ingests since start.
     total_ingests: std::sync::atomic::AtomicU64,
+    /// Time when the detector was created.
+    start_time: Instant,
 }
 
 impl StaleDetector {
@@ -174,6 +176,7 @@ impl StaleDetector {
             warning_emitted: AtomicBool::new(false),
             last_check: Mutex::new(Instant::now()),
             total_ingests: std::sync::atomic::AtomicU64::new(0),
+            start_time: Instant::now(),
         }
     }
 
@@ -238,11 +241,7 @@ impl StaleDetector {
         let is_stale = match self.last_successful_ingest.lock().ok()?.as_ref() {
             Some(last) => now.duration_since(*last) > threshold,
             // No successful ingests ever - check if we've been running long enough
-            None => {
-                // If we've never had a successful ingest and have had many zero scans,
-                // consider stale after threshold period from start
-                true
-            }
+            None => now.duration_since(self.start_time) > threshold,
         };
 
         if is_stale {

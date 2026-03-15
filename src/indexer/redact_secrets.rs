@@ -114,7 +114,8 @@ pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
         serde_json::Value::Object(obj) => {
             let mut new_obj = serde_json::Map::new();
             for (k, v) in obj {
-                new_obj.insert(k.clone(), redact_json(v));
+                let redacted_key = redact_text(k);
+                new_obj.insert(redacted_key, redact_json(v));
             }
             serde_json::Value::Object(new_obj)
         }
