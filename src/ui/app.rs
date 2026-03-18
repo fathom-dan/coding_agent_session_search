@@ -6529,18 +6529,31 @@ impl CassApp {
             })
             .unwrap_or_else(|| "0/0".to_string());
 
-        let lanes = vec![
-            ("pane", active_pane_label, value_s),
-            ("idx", active_pane_idx, info_s),
-            ("hits", total_hits.to_string(), value_s),
-            ("row", row_position, info_s),
-            ("sel", self.selected.len().to_string(), info_s),
-            ("exact", exact.to_string(), success_s),
-            ("prefix", prefix.to_string(), info_s),
-            ("fuzzy", fuzzy.to_string(), warn_s),
-            ("mix", mix_token, mix_style),
-            ("src", source_scope, value_s),
-        ];
+        // Only show lanes with meaningful (non-default) values to reduce visual noise.
+        let mut lanes: Vec<(&str, String, ftui::Style)> = Vec::with_capacity(10);
+        if pane_count > 1 {
+            lanes.push(("pane", active_pane_label, value_s));
+            lanes.push(("idx", active_pane_idx, info_s));
+        }
+        lanes.push(("hits", total_hits.to_string(), value_s));
+        lanes.push(("row", row_position, info_s));
+        if !self.selected.is_empty() {
+            lanes.push(("sel", self.selected.len().to_string(), info_s));
+        }
+        // Show match-type breakdown only when there's a mix (not all exact).
+        if prefix > 0 || fuzzy > 0 {
+            lanes.push(("exact", exact.to_string(), success_s));
+            if prefix > 0 {
+                lanes.push(("prefix", prefix.to_string(), info_s));
+            }
+            if fuzzy > 0 {
+                lanes.push(("fuzzy", fuzzy.to_string(), warn_s));
+            }
+            lanes.push(("mix", mix_token, mix_style));
+        }
+        if !self.filters.source_filter.is_all() {
+            lanes.push(("src", source_scope, value_s));
+        }
 
         let max_chars = width as usize;
         let mut used = 0usize;
@@ -6738,10 +6751,13 @@ impl CassApp {
                         accent_s.bold(),
                     ),
                 ]));
-                if inner.height >= 6 {
+                if inner.height >= 6 && !self.query.is_empty() {
                     lines.push(ftui::text::Line::from(""));
                     lines.push(ftui::text::Line::from_spans(vec![
-                        ftui::text::Span::styled(format!("query: {}", self.query), subtle_s),
+                        ftui::text::Span::styled(
+                            format!("\u{201c}{}\u{201d}", self.query),
+                            subtle_s.italic(),
+                        ),
                     ]));
                 }
                 let y_offset = inner.height.saturating_sub(lines.len() as u16) / 3;
@@ -6820,7 +6836,7 @@ impl CassApp {
 
                 // Compact ASCII logo for visual impact
                 if inner.height >= 18 && inner.width >= 40 {
-                    // 5-line block letters: C A S S (each letter 4 cols wide, 1 col gap)
+                    // 5-line block letters: C A S S (each letter 3 cols wide, 1 col gap)
                     //  ██  ██  ███ ███
                     // █   █ █ █   █
                     // █   ███  ██  ██
@@ -18096,31 +18112,43 @@ impl super::ftui_adapter::Model for CassApp {
                     Block::new()
                         .style(query_inset_style)
                         .render(query_row, frame);
+                    // Only show search icon when there's enough width (emoji is 2 cols + padding).
+                    let show_search_icon = query_row.width >= 50;
                     let query_line = match self.input_mode {
                         InputMode::Query => {
                             if self.query.is_empty() {
-                                ftui::text::Line::from_spans(vec![
-                                    ftui::text::Span::styled(" \u{1f50e} ", text_muted_style),
-                                    ftui::text::Span::styled("\u{2502}", caret_style),
-                                    ftui::text::Span::styled(
-                                        " Search sessions, messages, code across all agents\u{2026}",
-                                        text_muted_style.italic(),
-                                    ),
-                                ])
+                                let mut spans = Vec::with_capacity(3);
+                                if show_search_icon {
+                                    spans.push(ftui::text::Span::styled(
+                                        " \u{1f50e} ",
+                                        text_muted_style,
+                                    ));
+                                }
+                                spans.push(ftui::text::Span::styled("\u{2502}", caret_style));
+                                spans.push(ftui::text::Span::styled(
+                                    " Search sessions, messages, code across all agents\u{2026}",
+                                    text_muted_style.italic(),
+                                ));
+                                ftui::text::Line::from_spans(spans)
                             } else {
                                 let cpos = clamp_cursor_boundary(&self.query, self.cursor_pos);
-                                ftui::text::Line::from_spans(vec![
-                                    ftui::text::Span::styled(" \u{1f50e} ", text_muted_style),
-                                    ftui::text::Span::styled(
-                                        self.query[..cpos].to_string(),
-                                        query_primary_style,
-                                    ),
-                                    ftui::text::Span::styled("\u{2502}", caret_style),
-                                    ftui::text::Span::styled(
-                                        self.query[cpos..].to_string(),
-                                        query_primary_style,
-                                    ),
-                                ])
+                                let mut spans = Vec::with_capacity(4);
+                                if show_search_icon {
+                                    spans.push(ftui::text::Span::styled(
+                                        " \u{1f50e} ",
+                                        text_muted_style,
+                                    ));
+                                }
+                                spans.push(ftui::text::Span::styled(
+                                    self.query[..cpos].to_string(),
+                                    query_primary_style,
+                                ));
+                                spans.push(ftui::text::Span::styled("\u{2502}", caret_style));
+                                spans.push(ftui::text::Span::styled(
+                                    self.query[cpos..].to_string(),
+                                    query_primary_style,
+                                ));
+                                ftui::text::Line::from_spans(spans)
                             }
                         }
                         InputMode::Agent => ftui::text::Line::from_spans(vec![
