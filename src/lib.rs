@@ -531,6 +531,12 @@ pub enum Commands {
         #[arg(long)]
         no_cdns: bool,
 
+        /// Include skill content in export (default: stripped for privacy).
+        /// Skills injected by Claude Code/Codex contain proprietary SKILL.md
+        /// content that should not appear in shared/published exports.
+        #[arg(long)]
+        include_skills: bool,
+
         /// Default theme (dark or light)
         #[arg(long, default_value = "dark")]
         theme: String,
@@ -3418,6 +3424,7 @@ async fn execute_cli(
                     include_tools,
                     show_timestamps,
                     no_cdns,
+                    include_skills,
                     theme,
                     dry_run,
                     explain,
@@ -3434,6 +3441,7 @@ async fn execute_cli(
                         include_tools,
                         show_timestamps,
                         !no_cdns,
+                        include_skills,
                         &theme,
                         dry_run,
                         explain,
@@ -12138,6 +12146,7 @@ fn run_export_html(
     include_tools: bool,
     show_timestamps: bool,
     enable_cdns: bool,
+    include_skills: bool,
     theme: &str,
     dry_run: bool,
     explain: bool,
@@ -12368,6 +12377,34 @@ fn run_export_html(
             } else {
                 content
             };
+
+            // --- Drop entire messages that are skill injections (unless opted in) ---
+            // When Claude Code/Codex/Gemini load a skill, the FULL SKILL.md body is
+            // injected as a user message starting with "Base directory for this skill:".
+            // These are often highly proprietary. DROP THE ENTIRE MESSAGE — don't try
+            // to parse, redact, or pattern-match the content. Just skip it.
+            if !include_skills {
+                if content.contains("Base directory for this skill:") {
+                    return None;
+                }
+                // System reminders contain skill listings, hook metadata, and other
+                // internal context. Drop entire messages that are system-reminder blocks.
+                if content.contains("<system-reminder>") {
+                    return None;
+                }
+                // Skill listing dumps (injected by hooks)
+                if content.contains("The following skills are available for use with the Skill tool:") {
+                    return None;
+                }
+                // Vercel plugin hook injections with skill metadata
+                if content.contains("skillInjection:") && content.contains("matchedSkills") {
+                    return None;
+                }
+                // Hook injection blocks (contain skill names, patterns, metadata)
+                if content.contains("<!-- skillInjection:") {
+                    return None;
+                }
+            }
 
             // Skip non-message records (queue-operation, summary, etc.)
             // These are internal bookkeeping entries, not actual conversation messages.
@@ -14212,9 +14249,6 @@ fn extract_role(msg: &serde_json::Value) -> String {
 }
 
 /// Strip redundant "[Tool: X]" markers from content when tool call is shown separately.
-///
-/// When a message has a tool_call object that's rendered as a collapsible section,
-/// including the "[Tool: X]" text in the content is redundant and looks bad.
 fn strip_tool_marker(content: &str) -> String {
     let trimmed = content.trim();
 
