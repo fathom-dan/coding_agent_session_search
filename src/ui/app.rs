@@ -19470,7 +19470,8 @@ fn export_session_task(
         duration: None,
         project: None,
         human_turns: 0,
-        tool_calls: 0,
+        assistant_msgs: 0,
+        tool_use_count: 0,
     };
 
     let groups = crate::group_messages_for_export(messages);
