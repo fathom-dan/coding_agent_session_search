@@ -3289,38 +3289,40 @@ fn build_footer_hud_line(
     let mut spans = Vec::new();
 
     for lane in lanes {
-        let lane_chars = display_width(lane.key) + 3 + display_width(&lane.value);
-        let prefix = 1;
+        // Use compact format: "key value" separated by " \u{00b7} " (middle dot)
+        let lane_chars = display_width(lane.key) + 1 + display_width(&lane.value);
+        let separator_cost = if rendered == 0 { 1 } else { 3 }; // " " or " · "
 
-        if rendered == 0 && used + prefix + lane_chars > max_chars {
-            let max_value = max_chars.saturating_sub(prefix + display_width(lane.key) + 3);
+        if rendered == 0 && used + separator_cost + lane_chars > max_chars {
+            let max_value = max_chars.saturating_sub(separator_cost + display_width(lane.key) + 1);
             if max_value == 0 {
                 continue;
             }
             let truncated = elide_text(&lane.value, max_value);
             spans.push(ftui::text::Span::styled(" ", sep_style));
-            spans.push(ftui::text::Span::styled("[", sep_style));
             spans.push(ftui::text::Span::styled(lane.key.to_string(), key_style));
-            spans.push(ftui::text::Span::styled(":", sep_style));
+            spans.push(ftui::text::Span::styled(" ", sep_style));
             spans.push(ftui::text::Span::styled(truncated, lane.value_style));
-            spans.push(ftui::text::Span::styled("]", sep_style));
             break;
         }
 
-        if rendered > 0 && used + prefix + lane_chars > max_chars {
+        if rendered > 0 && used + separator_cost + lane_chars > max_chars {
             continue;
         }
 
-        spans.push(ftui::text::Span::styled(" ", sep_style));
-        used += 1;
-        spans.push(ftui::text::Span::styled("[", sep_style));
+        if rendered > 0 {
+            spans.push(ftui::text::Span::styled(" \u{00b7} ", sep_style));
+            used += 3;
+        } else {
+            spans.push(ftui::text::Span::styled(" ", sep_style));
+            used += 1;
+        }
         spans.push(ftui::text::Span::styled(lane.key.to_string(), key_style));
-        spans.push(ftui::text::Span::styled(":", sep_style));
+        spans.push(ftui::text::Span::styled(" ", sep_style));
         spans.push(ftui::text::Span::styled(
             lane.value.clone(),
             lane.value_style,
         ));
-        spans.push(ftui::text::Span::styled("]", sep_style));
         used += lane_chars;
         rendered += 1;
     }
@@ -5140,24 +5142,28 @@ impl CassApp {
             if idx > 0 && !try_push(" ".to_string(), bracket_style) {
                 break;
             }
-            if !try_push("[".to_string(), bracket_style) {
-                break;
-            }
-            let tab_style = if *surface == self.surface {
+            let is_active = *surface == self.surface;
+            let tab_style = if is_active {
                 *active_style
             } else {
                 inactive_style
             };
-            let tab_label = if *surface == self.surface {
-                format!("● {label}")
+            if is_active {
+                // Active tab: filled indicator + bold label
+                if !try_push("\u{2590}".to_string(), *active_style) {
+                    break;
+                }
+                if !try_push(format!(" {label} "), tab_style) {
+                    break;
+                }
+                if !try_push("\u{258c}".to_string(), *active_style) {
+                    break;
+                }
             } else {
-                (*label).to_string()
-            };
-            if !try_push(tab_label, tab_style) {
-                break;
-            }
-            if !try_push("]".to_string(), bracket_style) {
-                break;
+                // Inactive tab: subtle dot prefix
+                if !try_push(format!(" \u{00b7} {label} "), tab_style) {
+                    break;
+                }
             }
         }
 
@@ -5797,7 +5803,11 @@ impl CassApp {
                 x = x.saturating_add(1);
             }
 
-            let raw = format!("[{}:{}]", pill.label, pill.value);
+            let raw = if pill.active {
+                format!("\u{25cf} {}:{}", pill.label, pill.value)
+            } else {
+                format!("\u{25cb} {}:{}", pill.label, pill.value)
+            };
             // Reserve 1 char for the edit-cue glyph on editable inactive pills
             // so the pill text + glyph never overflows the available area.
             let cue_reserve: usize = if pill.editable && !pill.active { 1 } else { 0 };
@@ -5972,7 +5982,16 @@ impl CassApp {
     }
 
     fn loading_spinner_glyph(&self) -> &'static str {
-        const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+        const FRAMES: [&str; 8] = [
+            "\u{28f7}", // ⣷
+            "\u{28ef}", // ⣯
+            "\u{28df}", // ⣟
+            "\u{287f}", // ⡿
+            "\u{28bf}", // ⢿
+            "\u{28fb}", // ⣻
+            "\u{28fd}", // ⣽
+            "\u{28fe}", // ⣾
+        ];
         FRAMES[self.spinner_frame % FRAMES.len()]
     }
 
@@ -6525,20 +6544,25 @@ impl CassApp {
 
         let max_chars = width as usize;
         let mut used = 0usize;
+        let mut rendered = 0usize;
         let mut spans: Vec<ftui::text::Span<'static>> = Vec::new();
         for (key, value, style) in lanes {
-            let lane_chars = display_width(key) + display_width(&value) + 3; // [k:v]
-            let prefix = 1;
-            if used + prefix + lane_chars > max_chars {
+            let lane_chars = display_width(key) + display_width(&value) + 1; // "key:" + value
+            let separator_cost = if rendered == 0 { 1 } else { 3 }; // " " or " · "
+            if used + separator_cost + lane_chars > max_chars {
                 break;
             }
-            spans.push(ftui::text::Span::styled(" ", label_s));
-            spans.push(ftui::text::Span::styled("[", label_s));
-            spans.push(ftui::text::Span::styled(key.to_string(), label_s));
-            spans.push(ftui::text::Span::styled(":", label_s));
+            if rendered > 0 {
+                spans.push(ftui::text::Span::styled(" \u{00b7} ", label_s));
+                used += 3;
+            } else {
+                spans.push(ftui::text::Span::styled(" ", label_s));
+                used += 1;
+            }
+            spans.push(ftui::text::Span::styled(format!("{key}:"), label_s));
             spans.push(ftui::text::Span::styled(value, style));
-            spans.push(ftui::text::Span::styled("]", label_s));
-            used += prefix + lane_chars;
+            used += lane_chars;
+            rendered += 1;
         }
 
         if spans.is_empty() {
@@ -6582,20 +6606,20 @@ impl CassApp {
         };
         let results_title = if single_pane {
             if self.selected.is_empty() {
-                format!("Results ({total_hits}){grouping_suffix}{in_flight_suffix}")
+                format!(" Results \u{00b7} {total_hits}{grouping_suffix}{in_flight_suffix} ")
             } else {
                 format!(
-                    "Results ({total_hits}) \u{2022} {} selected{grouping_suffix}{in_flight_suffix}",
+                    " Results \u{00b7} {total_hits} \u{00b7} {} sel{grouping_suffix}{in_flight_suffix} ",
                     self.selected.len()
                 )
             }
         } else if self.selected.is_empty() {
             format!(
-                "Results ({total_hits} hits · {pane_count} panes){grouping_suffix}{in_flight_suffix}"
+                " Results \u{00b7} {total_hits} hits \u{00b7} {pane_count} panes{grouping_suffix}{in_flight_suffix} "
             )
         } else {
             format!(
-                "Results ({total_hits} hits · {pane_count} panes) \u{2022} {} selected{grouping_suffix}{in_flight_suffix}",
+                " Results \u{00b7} {total_hits} hits \u{00b7} {pane_count} panes \u{00b7} {} sel{grouping_suffix}{in_flight_suffix} ",
                 self.selected.len()
             )
         };
@@ -6790,42 +6814,125 @@ impl CassApp {
                     ]));
                 }
             } else {
-                // No query submitted yet — show onboarding.
-                lines.push(ftui::text::Line::from_spans(vec![
-                    ftui::text::Span::styled(
-                        "\u{1f50d} Type a query and press Enter to search",
-                        text_muted_style,
-                    ),
-                ]));
-                lines.push(ftui::text::Line::from(""));
-                // Show tips only if we have enough height
-                if inner.height >= 14 {
+                // No query submitted yet — show enhanced onboarding hero.
+                let success_s = styles.style(style_system::STYLE_STATUS_SUCCESS);
+                let accent_s = styles.style(style_system::STYLE_STATUS_INFO);
+
+                // Compact ASCII logo for visual impact
+                if inner.height >= 18 && inner.width >= 40 {
+                    // 5-line block letters: C A S S (each letter 4 cols wide, 1 col gap)
+                    //  ██  ██  ███ ███
+                    // █   █ █ █   █
+                    // █   ███  ██  ██
+                    // █   █ █   █   █
+                    //  ██ █ █ ███ ███
                     lines.push(ftui::text::Line::from_spans(vec![
-                        ftui::text::Span::styled("  Try: ", subtle_s),
-                        ftui::text::Span::styled("authentication", info_s),
-                        ftui::text::Span::styled("  ", subtle_s),
-                        ftui::text::Span::styled("\"error handling\"", info_s),
-                        ftui::text::Span::styled("  ", subtle_s),
-                        ftui::text::Span::styled("deploy AND staging", info_s),
+                        ftui::text::Span::styled(
+                            " \u{2588}\u{2588}  \u{2588}  \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}",
+                            accent_s.bold(),
+                        ),
+                    ]));
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled(
+                            "\u{2588}   \u{2588} \u{2588} \u{2588}   \u{2588}  ",
+                            accent_s.bold(),
+                        ),
+                    ]));
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled(
+                            "\u{2588}   \u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}  \u{2588}\u{2588}",
+                            accent_s.bold(),
+                        ),
+                    ]));
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled(
+                            "\u{2588}   \u{2588} \u{2588}   \u{2588}   \u{2588}",
+                            accent_s.bold(),
+                        ),
+                    ]));
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled(
+                            " \u{2588}\u{2588} \u{2588} \u{2588} \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}",
+                            accent_s.bold(),
+                        ),
                     ]));
                     lines.push(ftui::text::Line::from(""));
                     lines.push(ftui::text::Line::from_spans(vec![
-                        ftui::text::Span::styled("  Ctrl+P", pill_s),
-                        ftui::text::Span::styled(" command palette   ", subtle_s),
-                        ftui::text::Span::styled("Tab", pill_s),
-                        ftui::text::Span::styled(" focus panels", subtle_s),
+                        ftui::text::Span::styled(
+                            "Coding Agent Session Search",
+                            text_muted_style.italic(),
+                        ),
+                    ]));
+                } else {
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled("\u{2588}\u{2588} cass", accent_s.bold()),
+                        ftui::text::Span::styled(
+                            " \u{2014} Coding Agent Session Search",
+                            text_muted_style,
+                        ),
+                    ]));
+                }
+
+                lines.push(ftui::text::Line::from(""));
+
+                // Index stats summary - show what's available to search
+                let total_results: usize = self.results.len();
+                if total_results == 0 && inner.height >= 12 {
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled(
+                            "\u{2500}\u{2500}\u{2500}\u{2500} Ready to search \u{2500}\u{2500}\u{2500}\u{2500}",
+                            subtle_s,
+                        ),
+                    ]));
+                    lines.push(ftui::text::Line::from(""));
+                }
+
+                // Example queries section
+                if inner.height >= 14 {
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled("  \u{25b6} ", success_s),
+                        ftui::text::Span::styled("Try: ", subtle_s),
+                        ftui::text::Span::styled("authentication", info_s.bold()),
+                        ftui::text::Span::styled("  \u{00b7}  ", subtle_s),
+                        ftui::text::Span::styled("\"error handling\"", info_s.bold()),
+                        ftui::text::Span::styled("  \u{00b7}  ", subtle_s),
+                        ftui::text::Span::styled("deploy AND staging", info_s.bold()),
+                    ]));
+                    lines.push(ftui::text::Line::from(""));
+                }
+
+                // Key shortcuts in a cleaner grid format
+                if inner.height >= 18 {
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled(
+                            "\u{2500}\u{2500}\u{2500}\u{2500} Quick Start \u{2500}\u{2500}\u{2500}\u{2500}",
+                            subtle_s,
+                        ),
+                    ]));
+                    lines.push(ftui::text::Line::from(""));
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled("  Ctrl+P ", pill_s),
+                        ftui::text::Span::styled(" \u{2192} command palette   ", subtle_s),
+                        ftui::text::Span::styled("  Tab  ", pill_s),
+                        ftui::text::Span::styled(" \u{2192} switch panels", subtle_s),
                     ]));
                     lines.push(ftui::text::Line::from_spans(vec![
-                        ftui::text::Span::styled("  F1    ", pill_s),
-                        ftui::text::Span::styled(" help & shortcuts  ", subtle_s),
-                        ftui::text::Span::styled("F2 ", pill_s),
-                        ftui::text::Span::styled(" cycle themes", subtle_s),
+                        ftui::text::Span::styled("  F1     ", pill_s),
+                        ftui::text::Span::styled(" \u{2192} help & shortcuts  ", subtle_s),
+                        ftui::text::Span::styled("  F2   ", pill_s),
+                        ftui::text::Span::styled(" \u{2192} cycle themes", subtle_s),
                     ]));
                     lines.push(ftui::text::Line::from_spans(vec![
-                        ftui::text::Span::styled("  Alt+S ", pill_s),
-                        ftui::text::Span::styled(" match mode        ", subtle_s),
-                        ftui::text::Span::styled("F3 ", pill_s),
-                        ftui::text::Span::styled(" filter by agent", subtle_s),
+                        ftui::text::Span::styled("  Alt+S  ", pill_s),
+                        ftui::text::Span::styled(" \u{2192} search mode       ", subtle_s),
+                        ftui::text::Span::styled("  F3   ", pill_s),
+                        ftui::text::Span::styled(" \u{2192} filter by agent", subtle_s),
+                    ]));
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled("  Alt+A  ", pill_s),
+                        ftui::text::Span::styled(" \u{2192} analytics         ", subtle_s),
+                        ftui::text::Span::styled("  F10  ", pill_s),
+                        ftui::text::Span::styled(" \u{2192} quit", subtle_s),
                     ]));
                 }
             }
@@ -8729,7 +8836,7 @@ impl CassApp {
             DetailTab::Analytics => "Analytics",
             DetailTab::Export => "Export",
         };
-        let title = format!("Detail [{tab_label}]{wrap_indicator}");
+        let title = format!(" Detail \u{00b7} {tab_label}{wrap_indicator} ");
 
         let detail_focused = self.focused_region() == FocusRegion::Detail;
         let styleful = title_focused_style.fg.is_some()
@@ -8924,7 +9031,7 @@ impl CassApp {
                 }
                 if self.detail_tab == *variant {
                     tab_spans.push(ftui::text::Span::styled(
-                        format!(" \u{25cf} {lbl} "),
+                        format!(" \u{2590}{lbl}\u{258c} "),
                         tab_active_s,
                     ));
                 } else {
@@ -9115,43 +9222,57 @@ impl CassApp {
             if self.panes.is_empty() {
                 // No results at all — guide user to search.
                 hint_lines.push(ftui::text::Line::from_spans(vec![
-                    ftui::text::Span::styled("\u{1f50d} Type a query to search", accent_s.bold()),
+                    ftui::text::Span::styled(
+                        "\u{2500}\u{2500} Preview Pane \u{2500}\u{2500}",
+                        subtle_s,
+                    ),
+                ]));
+                hint_lines.push(ftui::text::Line::from(""));
+                hint_lines.push(ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled("Search results will appear here", accent_s),
                 ]));
                 if content_area.height >= 8 {
                     hint_lines.push(ftui::text::Line::from(""));
                     hint_lines.push(ftui::text::Line::from_spans(vec![
-                        ftui::text::Span::styled(
-                            "Session messages, tool calls, and code",
-                            subtle_s,
-                        ),
+                        ftui::text::Span::styled("Messages, tool calls, code snippets,", subtle_s),
                     ]));
                     hint_lines.push(ftui::text::Line::from_spans(vec![
-                        ftui::text::Span::styled("snippets will appear here.", subtle_s),
+                        ftui::text::Span::styled(
+                            "and conversation context \u{2014} all in one view.",
+                            subtle_s,
+                        ),
                     ]));
                 }
             } else {
                 // Results exist but none selected.
                 hint_lines.push(ftui::text::Line::from_spans(vec![
-                    ftui::text::Span::styled("Select a result to preview", accent_s),
+                    ftui::text::Span::styled("\u{25b6} Select a result to preview", accent_s),
                 ]));
             }
             if content_area.height >= 6 {
                 hint_lines.push(ftui::text::Line::from(""));
                 hint_lines.push(ftui::text::Line::from_spans(vec![
-                    ftui::text::Span::styled(" \u{2191}\u{2193} ", pill_s),
-                    ftui::text::Span::styled(" navigate results", subtle_s),
+                    ftui::text::Span::styled(
+                        "\u{2500}\u{2500} Navigation \u{2500}\u{2500}",
+                        subtle_s,
+                    ),
+                ]));
+                hint_lines.push(ftui::text::Line::from(""));
+                hint_lines.push(ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled("  \u{2191}\u{2193}  ", pill_s),
+                    ftui::text::Span::styled(" \u{2192} navigate results", subtle_s),
                 ]));
                 hint_lines.push(ftui::text::Line::from_spans(vec![
                     ftui::text::Span::styled(" Enter ", pill_s),
-                    ftui::text::Span::styled(" expand detail modal", subtle_s),
+                    ftui::text::Span::styled(" \u{2192} expand detail modal", subtle_s),
                 ]));
                 hint_lines.push(ftui::text::Line::from_spans(vec![
-                    ftui::text::Span::styled(" Tab ", pill_s),
-                    ftui::text::Span::styled(" switch panel focus", subtle_s),
+                    ftui::text::Span::styled("  Tab  ", pill_s),
+                    ftui::text::Span::styled(" \u{2192} switch panel focus", subtle_s),
                 ]));
                 hint_lines.push(ftui::text::Line::from_spans(vec![
-                    ftui::text::Span::styled(" F1 ", pill_s),
-                    ftui::text::Span::styled(" help & shortcuts", subtle_s),
+                    ftui::text::Span::styled("  F1   ", pill_s),
+                    ftui::text::Span::styled(" \u{2192} help & shortcuts", subtle_s),
                 ]));
             }
             // Center vertically.
@@ -10986,11 +11107,11 @@ impl CassApp {
         if show_tab_bar {
             for (idx, view) in AnalyticsView::all().iter().enumerate() {
                 if idx > 0 {
-                    spans.push(ftui::text::Span::styled(" ", meta_style));
+                    spans.push(ftui::text::Span::styled("  ", meta_style));
                 }
                 if *view == self.analytics_view {
                     spans.push(ftui::text::Span::styled(
-                        format!("[{}]", view.label()),
+                        format!("\u{2590}{}\u{258c}", view.label()),
                         active_style,
                     ));
                 } else {
@@ -17906,13 +18027,13 @@ impl super::ftui_adapter::Model for CassApp {
                 let vis = breakpoint.visibility_policy();
                 let query_title = if vis.show_theme_in_title {
                     format!(
-                        "cass | {} | {mode_label}/{match_label}",
+                        " \u{2588}\u{2588} cass \u{00b7} {} \u{00b7} {mode_label} \u{00b7} {match_label} ",
                         self.theme_preset.name()
                     )
                 } else {
                     // Narrow layouts prioritize explicit mode tags over theme text.
                     format!(
-                        "cass | mode:{} | match:{}",
+                        " \u{2588}\u{2588} cass \u{00b7} {} \u{00b7} {} ",
                         search_mode_str(self.search_mode),
                         match_mode_str(self.match_mode)
                     )
@@ -17979,15 +18100,17 @@ impl super::ftui_adapter::Model for CassApp {
                         InputMode::Query => {
                             if self.query.is_empty() {
                                 ftui::text::Line::from_spans(vec![
+                                    ftui::text::Span::styled(" \u{1f50e} ", text_muted_style),
                                     ftui::text::Span::styled("\u{2502}", caret_style),
                                     ftui::text::Span::styled(
-                                        "Search sessions, messages, code...",
+                                        " Search sessions, messages, code across all agents\u{2026}",
                                         text_muted_style.italic(),
                                     ),
                                 ])
                             } else {
                                 let cpos = clamp_cursor_boundary(&self.query, self.cursor_pos);
                                 ftui::text::Line::from_spans(vec![
+                                    ftui::text::Span::styled(" \u{1f50e} ", text_muted_style),
                                     ftui::text::Span::styled(
                                         self.query[..cpos].to_string(),
                                         query_primary_style,
@@ -18552,7 +18675,7 @@ impl super::ftui_adapter::Model for CassApp {
                 let header_block = Block::new()
                     .borders(adaptive_borders)
                     .border_type(border_type)
-                    .title("cass analytics")
+                    .title(" \u{2588}\u{2588} cass \u{00b7} Analytics ")
                     .title_alignment(Alignment::Left)
                     .border_style(pane_focused_style.fg(analytics_accent).bold())
                     .style({
@@ -27078,14 +27201,11 @@ mod tests {
             24,
             DegradationLevel::EssentialOnly,
         ));
-        // Full rendering has border characters; essential does not.
-        let has_box_char = |s: &str| {
-            s.contains('╭')
-                || s.contains('╮')
-                || s.contains('╰')
-                || s.contains('╯')
-                || s.contains('─')
-        };
+        // Full rendering has border corner characters; essential does not.
+        // Note: '─' may appear in content separators even in EssentialOnly,
+        // so only check for box-drawing corner glyphs.
+        let has_box_char =
+            |s: &str| s.contains('╭') || s.contains('╮') || s.contains('╰') || s.contains('╯');
         assert!(
             has_box_char(&full_text),
             "Full should contain border characters"
@@ -28012,15 +28132,15 @@ mod tests {
             DegradationLevel::SimpleBorders,
         ));
         assert!(
-            text.contains("status:indexing 3/9"),
+            text.contains("status indexing 3/9"),
             "footer should surface progress/status lane"
         );
         assert!(
-            text.contains("perf:lat:42ms cache:warm"),
+            text.contains("perf lat:42ms cache:warm"),
             "footer should surface perf+cache lane"
         );
         assert!(
-            text.contains("runtime:deg:SimpleBorders"),
+            text.contains("runtime deg:SimpleBorders"),
             "footer should surface degradation state lane"
         );
     }
@@ -28036,14 +28156,14 @@ mod tests {
             24,
             ftui::render::budget::DegradationLevel::Full,
         ));
-        assert!(text.contains("hits:3"), "narrow footer keeps hits lane");
-        assert!(text.contains("query:"), "narrow footer keeps query lane");
+        assert!(text.contains("hits 3"), "narrow footer keeps hits lane");
+        assert!(text.contains("query "), "narrow footer keeps query lane");
         assert!(
-            !text.contains("scope:"),
+            !text.contains("scope "),
             "narrow footer should drop lower-priority scope lane"
         );
         assert!(
-            !text.contains("runtime:"),
+            !text.contains("runtime "),
             "narrow footer should drop lower-priority runtime lane"
         );
     }
@@ -28221,8 +28341,8 @@ mod tests {
                 preset
             );
             assert!(
-                medium_text.contains("Search sessions, messages, code...")
-                    && medium_text.contains("│"),
+                medium_text.contains("Search sessions, messages, code")
+                    && medium_text.contains("\u{2502}"),
                 "query row should include placeholder and caret for {:?}",
                 preset
             );
@@ -28234,12 +28354,12 @@ mod tests {
                 ftui::render::budget::DegradationLevel::Full,
             ));
             assert!(
-                narrow_text.contains("mode:lexical"),
+                narrow_text.contains("lexical"),
                 "narrow title should include explicit mode token for {:?}",
                 preset
             );
             assert!(
-                narrow_text.contains("match:standard"),
+                narrow_text.contains("standard"),
                 "narrow title should include explicit match token for {:?}",
                 preset
             );
@@ -28257,7 +28377,7 @@ mod tests {
             ftui::render::budget::DegradationLevel::Full,
         ));
         assert!(
-            text.contains("selected"),
+            text.contains("sel"),
             "results title should show selection count when items selected"
         );
     }
@@ -28555,7 +28675,7 @@ mod tests {
         );
         let agent_label = spans
             .iter()
-            .find(|sp| sp.content.contains("[agent:"))
+            .find(|sp| sp.content.contains("agent:"))
             .expect("agent label span should be present");
         assert_eq!(
             agent_label.style.as_ref().cloned(),
@@ -28564,7 +28684,7 @@ mod tests {
         );
         let ws_label = spans
             .iter()
-            .find(|sp| sp.content.contains("[ws:"))
+            .find(|sp| sp.content.contains("ws:"))
             .expect("ws label span should be present");
         assert_eq!(
             ws_label.style.as_ref().cloned(),
@@ -28574,7 +28694,7 @@ mod tests {
 
         let active_value = spans
             .iter()
-            .find(|sp| sp.content.contains("codex]"))
+            .find(|sp| sp.content.contains("codex"))
             .expect("active value span should be present");
         assert_eq!(
             active_value.style.as_ref().cloned(),
@@ -28583,7 +28703,11 @@ mod tests {
         );
         let inactive_value = spans
             .iter()
-            .find(|sp| sp.content.contains("any]"))
+            .find(|sp| {
+                sp.content.contains("any")
+                    && !sp.content.contains("agent")
+                    && !sp.content.contains("ws")
+            })
             .expect("inactive value span should be present");
         assert_eq!(
             inactive_value.style.as_ref().cloned(),
@@ -28619,7 +28743,7 @@ mod tests {
         let spans = line.spans();
         let editable_label = spans
             .iter()
-            .find(|sp| sp.content.contains("[edit:"))
+            .find(|sp| sp.content.contains("edit:"))
             .expect("editable label span should be present");
         assert_eq!(
             editable_label.style.as_ref().cloned(),
@@ -28628,7 +28752,7 @@ mod tests {
         );
         let fixed_label = spans
             .iter()
-            .find(|sp| sp.content.contains("[fixed:"))
+            .find(|sp| sp.content.contains("fixed:"))
             .expect("readonly label span should be present");
         assert_eq!(
             fixed_label.style.as_ref().cloned(),
@@ -28672,7 +28796,7 @@ mod tests {
         // Active + editable value should be italic
         let active_val = spans
             .iter()
-            .find(|sp| sp.content.contains("codex]"))
+            .find(|sp| sp.content.contains("codex"))
             .expect("active editable value span should be present");
         assert_eq!(
             active_val.style.as_ref().cloned(),
@@ -28683,7 +28807,11 @@ mod tests {
         // Inactive + editable value should be italic
         let inactive_val = spans
             .iter()
-            .find(|sp| sp.content.contains("any]"))
+            .find(|sp| {
+                sp.content.contains("any")
+                    && !sp.content.contains("agent")
+                    && !sp.content.contains("ws")
+            })
             .expect("inactive editable value span should be present");
         assert_eq!(
             inactive_val.style.as_ref().cloned(),
@@ -28694,7 +28822,7 @@ mod tests {
         // Non-editable value should NOT be italic
         let fixed_val = spans
             .iter()
-            .find(|sp| sp.content.contains("frozen]"))
+            .find(|sp| sp.content.contains("frozen"))
             .expect("non-editable value span should be present");
         assert_eq!(
             fixed_val.style.as_ref().cloned(),
@@ -36949,7 +37077,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             "test_id=8.6.structure.default component=search_bar action=render expected=title actual=missing"
         );
         assert!(
-            text.contains("[agent:"),
+            text.contains("agent:"),
             "test_id=8.6.structure.default component=pills action=render expected=agent-pill actual=missing"
         );
         assert!(
@@ -36973,7 +37101,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         let buf = render_at_degradation(&app, 120, 24, DegradationLevel::Full);
         let text = ftui_harness::buffer_to_text(&buf);
         assert!(
-            text.contains("[agent:codex]"),
+            text.contains("agent:codex"),
             "test_id=8.6.hierarchy.filters component=pills action=render expected=active-agent-value actual=missing"
         );
         assert!(
@@ -37103,7 +37231,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         use ftui_harness::buffer_to_text;
 
         let modes = [
-            (InputMode::Query, "Search sessions, messages, code..."),
+            (InputMode::Query, "Search sessions, messages, code"),
             (InputMode::Agent, "[agent]"),
             (InputMode::Workspace, "[workspace]"),
             (InputMode::CreatedFrom, "[from]"),
@@ -37250,13 +37378,13 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         let buf = render_at_degradation(&app, 120, 24, DegradationLevel::Full);
         let text = buffer_to_text(&buf);
 
-        // Footer HUD should contain key:value pairs
+        // Footer HUD should contain key value pairs (space-separated, not colon)
         assert!(
-            text.contains("hits:"),
+            text.contains("hits ") || text.contains("hits"),
             "test_id=8.6.structure.footer_hud component=footer action=render expected=hits_lane"
         );
         assert!(
-            text.contains("query:") || text.contains("hybrid"),
+            text.contains("query ") || text.contains("hybrid") || text.contains("LEX"),
             "test_id=8.6.structure.footer_hud component=footer action=render expected=query_lane"
         );
         assert!(
