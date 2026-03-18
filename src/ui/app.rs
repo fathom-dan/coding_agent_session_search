@@ -1090,6 +1090,8 @@ pub enum LayoutBreakpoint {
     Medium,
     /// >=160 cols: comfortable side-by-side results + detail panes
     Wide,
+    /// >=240 cols: massive screen real-estate with expansive detail pane
+    UltraWide,
 }
 
 /// Per-breakpoint layout parameters for the search surface.
@@ -1156,7 +1158,9 @@ pub const ULTRA_NARROW_MIN_HEIGHT: u16 = 6;
 impl LayoutBreakpoint {
     /// Classify from terminal width.
     pub fn from_width(cols: u16) -> Self {
-        if cols >= 160 {
+        if cols >= 240 {
+            Self::UltraWide
+        } else if cols >= 160 {
             Self::Wide
         } else if cols >= 120 {
             Self::Medium
@@ -1197,8 +1201,14 @@ impl LayoutBreakpoint {
                 dual_pane: true,
             },
             Self::Wide => SearchTopology {
-                min_results: 50,
-                min_detail: 34,
+                min_results: 60,
+                min_detail: 60,
+                has_split_handle: true,
+                dual_pane: true,
+            },
+            Self::UltraWide => SearchTopology {
+                min_results: 80,
+                min_detail: 120, // Huge detail pane
                 has_split_handle: true,
                 dual_pane: true,
             },
@@ -1227,6 +1237,12 @@ impl LayoutBreakpoint {
                 show_footer_hints: true,
             },
             Self::Wide => AnalyticsTopology {
+                show_tab_bar: true,
+                show_filter_summary: true,
+                header_rows: 3,
+                show_footer_hints: true,
+            },
+            Self::UltraWide => AnalyticsTopology {
                 show_tab_bar: true,
                 show_filter_summary: true,
                 header_rows: 3,
@@ -1262,6 +1278,12 @@ impl LayoutBreakpoint {
                 footer_hint_budget: 52,
                 saved_view_path_max: 80,
             },
+            Self::UltraWide => VisibilityPolicy {
+                show_theme_in_title: true,
+                footer_hint_slots: 6,
+                footer_hint_budget: 80,
+                saved_view_path_max: 120,
+            },
         }
     }
 
@@ -1272,6 +1294,7 @@ impl LayoutBreakpoint {
             Self::MediumNarrow => "med-n",
             Self::Medium => "med",
             Self::Wide => "wide",
+            Self::UltraWide => "u-wide",
         }
     }
 
@@ -1281,7 +1304,8 @@ impl LayoutBreakpoint {
             Self::Narrow => "Narrow (<80)",
             Self::MediumNarrow => "MedNarrow (80-119)",
             Self::Medium => "Medium (120-159)",
-            Self::Wide => "Wide (>=160)",
+            Self::Wide => "Wide (160-239)",
+            Self::UltraWide => "UltraWide (>=240)",
         }
     }
 
@@ -1333,28 +1357,32 @@ impl LayoutBreakpoint {
                 label_width: 8,
                 show_footer_hint: true,
             },
-            (Self::Medium | Self::Wide, CockpitMode::Overlay) => CockpitTopology {
-                overlay_max_w: 66,
-                overlay_max_h: 16,
-                overlay_min_w: 20,
-                overlay_min_h: 6,
-                use_short_labels: false,
-                show_mode_indicator: true,
-                max_timeline_events: 8,
-                label_width: 9,
-                show_footer_hint: true,
-            },
-            (Self::Medium | Self::Wide, CockpitMode::Expanded) => CockpitTopology {
-                overlay_max_w: 72,
-                overlay_max_h: 30,
-                overlay_min_w: 20,
-                overlay_min_h: 6,
-                use_short_labels: false,
-                show_mode_indicator: true,
-                max_timeline_events: 18,
-                label_width: 9,
-                show_footer_hint: true,
-            },
+            (Self::Medium | Self::Wide | Self::UltraWide, CockpitMode::Overlay) => {
+                CockpitTopology {
+                    overlay_max_w: 66,
+                    overlay_max_h: 16,
+                    overlay_min_w: 20,
+                    overlay_min_h: 6,
+                    use_short_labels: false,
+                    show_mode_indicator: true,
+                    max_timeline_events: 8,
+                    label_width: 9,
+                    show_footer_hint: true,
+                }
+            }
+            (Self::Medium | Self::Wide | Self::UltraWide, CockpitMode::Expanded) => {
+                CockpitTopology {
+                    overlay_max_w: 72,
+                    overlay_max_h: 30,
+                    overlay_min_w: 20,
+                    overlay_min_h: 6,
+                    use_short_labels: false,
+                    show_mode_indicator: true,
+                    max_timeline_events: 18,
+                    label_width: 9,
+                    show_footer_hint: true,
+                }
+            }
         }
     }
 }
@@ -2458,6 +2486,29 @@ fn decode_html_entities(text: &str) -> String {
     out
 }
 
+/// Strip markdown bold markers (`**word**`) from text, leaving just the word.
+/// The search engine injects these for query-term highlighting.
+fn strip_markdown_bold(text: &str) -> String {
+    if !text.contains("**") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("**") {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        if let Some(end) = after_open.find("**") {
+            out.push_str(&after_open[..end]);
+            rest = &after_open[end + 2..];
+        } else {
+            out.push_str("**");
+            rest = after_open;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn clamp_cursor_boundary(text: &str, cursor: usize) -> usize {
     let mut idx = cursor.min(text.len());
     while idx > 0 && !text.is_char_boundary(idx) {
@@ -2702,7 +2753,8 @@ impl ResultItem {
         if raw_source.is_empty() {
             return vec!["<no snippet>".to_string()];
         }
-        let source_owned = decode_html_entities(raw_source);
+        let decoded = decode_html_entities(raw_source);
+        let source_owned = strip_markdown_bold(&decoded);
         let source = source_owned.as_str();
 
         let width = max_width.max(8);
@@ -2774,10 +2826,12 @@ impl ResultItem {
                 ftui::text::Span::styled("● ", self.agent_accent_style),
                 ftui::text::Span::styled(msg_text.clone(), self.text_primary_style),
             ],
-            LayoutBreakpoint::Medium | LayoutBreakpoint::Wide => vec![
-                ftui::text::Span::styled("● ", self.agent_accent_style),
-                ftui::text::Span::styled(msg_text, self.text_primary_style),
-            ],
+            LayoutBreakpoint::Medium | LayoutBreakpoint::Wide | LayoutBreakpoint::UltraWide => {
+                vec![
+                    ftui::text::Span::styled("● ", self.agent_accent_style),
+                    ftui::text::Span::styled(msg_text, self.text_primary_style),
+                ]
+            }
         }
     }
 }
@@ -5932,96 +5986,6 @@ impl CassApp {
             ));
         }
         (ftui::text::Line::from_spans(spans), rects)
-    }
-
-    fn breadcrumb_line(
-        &self,
-        width: u16,
-        active_style: ftui::Style,
-        inactive_style: ftui::Style,
-        separator_style: ftui::Style,
-    ) -> ftui::text::Line<'_> {
-        let agent_text = summarize_filter_values(&self.filters.agents, "All agents");
-        let agent_active = !self.filters.agents.is_empty();
-
-        let ws_text = summarize_filter_values(&self.filters.workspaces, "All workspaces");
-        let ws_active = !self.filters.workspaces.is_empty();
-
-        let time_text = format_time_chip(self.filters.created_from, self.filters.created_to)
-            .unwrap_or_else(|| "Any time".to_string());
-        let time_active = self.filters.created_from.is_some() || self.filters.created_to.is_some();
-
-        let ranking_text = ranking_mode_label(self.ranking_mode).to_string();
-
-        let source_text = if self.filters.source_filter.is_all() {
-            "all sources".to_string()
-        } else {
-            format!("source {}", self.filters.source_filter)
-        };
-        let source_active = !self.filters.source_filter.is_all();
-
-        let sep = " \u{203a} "; // ›
-
-        // Build segments: (text, is_active)
-        let segments = [
-            (agent_text, agent_active),
-            (ws_text, ws_active),
-            (time_text, time_active),
-            (ranking_text, true), // ranking mode is always "active" context
-            (source_text, source_active),
-        ];
-
-        // Check total width — if it fits, render with spans; if not, elide
-        let sep_w = display_width(sep);
-        let total_len: usize = segments
-            .iter()
-            .map(|(t, _)| display_width(t))
-            .sum::<usize>()
-            + sep_w * (segments.len() - 1);
-
-        if total_len > width as usize {
-            // Fall back to elided flat text with per-crumb styling
-            let mut spans = Vec::new();
-            let mut used = 0usize;
-            let budget = width as usize;
-
-            for (i, (text, is_active)) in segments.iter().enumerate() {
-                if i > 0 {
-                    if used + sep_w > budget {
-                        break;
-                    }
-                    spans.push(ftui::text::Span::styled(sep, separator_style));
-                    used += sep_w;
-                }
-                let remaining = budget.saturating_sub(used);
-                let elided = elide_text(text, remaining);
-                if elided.is_empty() {
-                    break;
-                }
-                used += display_width(&elided);
-                let style = if *is_active {
-                    active_style
-                } else {
-                    inactive_style
-                };
-                spans.push(ftui::text::Span::styled(elided, style));
-            }
-            ftui::text::Line::from_spans(spans)
-        } else {
-            let mut spans = Vec::new();
-            for (i, (text, is_active)) in segments.iter().enumerate() {
-                if i > 0 {
-                    spans.push(ftui::text::Span::styled(sep, separator_style));
-                }
-                let style = if *is_active {
-                    active_style
-                } else {
-                    inactive_style
-                };
-                spans.push(ftui::text::Span::styled(text.clone(), style));
-            }
-            ftui::text::Line::from_spans(spans)
-        }
     }
 
     fn results_reveal_motion_enabled(
@@ -9292,47 +9256,26 @@ impl CassApp {
                 // No results at all — guide user to search.
                 if content_area.height >= 16 {
                     hint_lines.push(ftui::text::Line::from_spans(vec![
-                        ftui::text::Span::styled(
-                            "  ██████╗  █████╗ ███████╗███████╗ ",
-                            accent_s,
-                        ),
+                        ftui::text::Span::styled("  ██████╗  █████╗ ███████╗███████╗ ", accent_s),
                     ]));
                     hint_lines.push(ftui::text::Line::from_spans(vec![
-                        ftui::text::Span::styled(
-                            " ██╔════╝ ██╔══██╗██╔════╝██╔════╝ ",
-                            accent_s,
-                        ),
+                        ftui::text::Span::styled(" ██╔════╝ ██╔══██╗██╔════╝██╔════╝ ", accent_s),
                     ]));
                     hint_lines.push(ftui::text::Line::from_spans(vec![
-                        ftui::text::Span::styled(
-                            " ██║      ███████║███████╗███████╗ ",
-                            accent_s,
-                        ),
+                        ftui::text::Span::styled(" ██║      ███████║███████╗███████╗ ", accent_s),
                     ]));
                     hint_lines.push(ftui::text::Line::from_spans(vec![
-                        ftui::text::Span::styled(
-                            " ██║      ██╔══██║╚════██║╚════██║ ",
-                            accent_s,
-                        ),
+                        ftui::text::Span::styled(" ██║      ██╔══██║╚════██║╚════██║ ", accent_s),
                     ]));
                     hint_lines.push(ftui::text::Line::from_spans(vec![
-                        ftui::text::Span::styled(
-                            " ╚██████╗ ██║  ██║███████║███████║ ",
-                            accent_s,
-                        ),
+                        ftui::text::Span::styled(" ╚██████╗ ██║  ██║███████║███████║ ", accent_s),
                     ]));
                     hint_lines.push(ftui::text::Line::from_spans(vec![
-                        ftui::text::Span::styled(
-                            "  ╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝ ",
-                            accent_s,
-                        ),
+                        ftui::text::Span::styled("  ╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝ ", accent_s),
                     ]));
                     hint_lines.push(ftui::text::Line::from(""));
                     hint_lines.push(ftui::text::Line::from_spans(vec![
-                        ftui::text::Span::styled(
-                            "CODING AGENT SESSION SEARCH",
-                            subtle_s.bold(),
-                        ),
+                        ftui::text::Span::styled("CODING AGENT SESSION SEARCH", subtle_s.bold()),
                     ]));
                     hint_lines.push(ftui::text::Line::from(""));
                 } else {
@@ -9344,7 +9287,7 @@ impl CassApp {
                     ]));
                     hint_lines.push(ftui::text::Line::from(""));
                 }
-                
+
                 hint_lines.push(ftui::text::Line::from_spans(vec![
                     ftui::text::Span::styled("Search results will appear here", accent_s),
                 ]));
@@ -29645,7 +29588,14 @@ mod tests {
     fn breakpoint_wide_160_plus() {
         assert_eq!(LayoutBreakpoint::from_width(160), LayoutBreakpoint::Wide);
         assert_eq!(LayoutBreakpoint::from_width(200), LayoutBreakpoint::Wide);
-        assert_eq!(LayoutBreakpoint::from_width(300), LayoutBreakpoint::Wide);
+        assert_eq!(
+            LayoutBreakpoint::from_width(240),
+            LayoutBreakpoint::UltraWide
+        );
+        assert_eq!(
+            LayoutBreakpoint::from_width(300),
+            LayoutBreakpoint::UltraWide
+        );
     }
 
     #[test]
@@ -29685,8 +29635,8 @@ mod tests {
         let t = LayoutBreakpoint::Wide.search_topology();
         assert!(t.dual_pane);
         assert!(t.has_split_handle);
-        assert_eq!(t.min_results, 50);
-        assert_eq!(t.min_detail, 34);
+        assert_eq!(t.min_results, 60);
+        assert_eq!(t.min_detail, 60);
     }
 
     #[test]
@@ -29708,6 +29658,12 @@ mod tests {
         assert!(
             w.min_results + w.min_detail <= 160,
             "Wide mins must fit in 160 cols"
+        );
+
+        let uw = LayoutBreakpoint::UltraWide.search_topology();
+        assert!(
+            uw.min_results + uw.min_detail <= 240,
+            "UltraWide mins must fit in 240 cols"
         );
     }
 
@@ -31567,6 +31523,7 @@ mod tests {
                     LayoutBreakpoint::MediumNarrow => 1,
                     LayoutBreakpoint::Medium => 2,
                     LayoutBreakpoint::Wide => 3,
+                    LayoutBreakpoint::UltraWide => 4,
                 }
             };
             // Note: SIZE_MATRIX is not sorted by width, so we don't assert monotonicity
@@ -31580,11 +31537,13 @@ mod tests {
                 LayoutBreakpoint::MediumNarrow => 1,
                 LayoutBreakpoint::Medium => 2,
                 LayoutBreakpoint::Wide => 3,
+                LayoutBreakpoint::UltraWide => 4,
             }
         };
         assert!(rank(79) < rank(80));
         assert!(rank(119) < rank(120));
         assert!(rank(159) < rank(160));
+        assert!(rank(239) < rank(240));
     }
 
     #[test]
@@ -37046,109 +37005,6 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         assert_affordance_snapshot("cassapp_baseline_detail_find_current_match", &buf);
     }
 
-    // ── Breadcrumb rendering tests (2dccg.8.2) ────────────────────────
-
-    /// Breadcrumb line contains all expected segments.
-    #[test]
-    fn breadcrumb_contains_all_segments() {
-        let app = app_with_hits(5);
-        let s = ftui::Style::default();
-        let line = app.breadcrumb_line(200, s, s, s);
-        let plain: String = line.spans().iter().map(|sp| sp.content.as_ref()).collect();
-        assert!(plain.contains("All agents"), "should show agent segment");
-        assert!(
-            plain.contains("All workspaces"),
-            "should show workspace segment"
-        );
-        assert!(plain.contains("Any time"), "should show time segment");
-        assert!(plain.contains("all sources"), "should show source segment");
-    }
-
-    /// Active filter crumbs get a different style from inactive ones.
-    #[test]
-    fn breadcrumb_active_filter_gets_active_style() {
-        let mut app = app_with_hits(5);
-        app.filters.agents.insert("codex".to_string());
-        let ctx = StyleContext::from_options(crate::ui::style_system::StyleOptions::default());
-        let active = ctx.style(style_system::STYLE_CRUMB_ACTIVE);
-        let inactive = ctx.style(style_system::STYLE_CRUMB_INACTIVE);
-        let sep = ctx.style(style_system::STYLE_CRUMB_SEPARATOR);
-        let line = app.breadcrumb_line(200, active, inactive, sep);
-        // First span should be agent "codex" with active style
-        let agent_span = &line.spans()[0];
-        assert!(
-            agent_span.content.contains("codex"),
-            "first crumb should be agent"
-        );
-        assert_eq!(
-            agent_span.style.as_ref().and_then(|s| s.fg),
-            active.fg,
-            "active agent crumb should use active style"
-        );
-        // Workspace should be inactive
-        let ws_span = line
-            .spans()
-            .iter()
-            .find(|sp| sp.content.contains("All workspaces"));
-        assert!(ws_span.is_some(), "workspace crumb should be present");
-        if let Some(ws) = ws_span {
-            assert_eq!(
-                ws.style.as_ref().and_then(|s| s.fg),
-                inactive.fg,
-                "inactive workspace crumb should use inactive style"
-            );
-        }
-    }
-
-    /// Breadcrumb uses › separator between segments.
-    #[test]
-    fn breadcrumb_uses_separator_glyph() {
-        let app = app_with_hits(5);
-        let s = ftui::Style::default();
-        let line = app.breadcrumb_line(200, s, s, s);
-        let has_sep = line
-            .spans()
-            .iter()
-            .any(|sp| sp.content.contains('\u{203a}'));
-        assert!(has_sep, "breadcrumb should use › separator");
-    }
-
-    /// Breadcrumb renders in output buffer.
-    #[test]
-    fn breadcrumb_renders_in_output() {
-        use ftui::render::budget::DegradationLevel;
-        use ftui_harness::buffer_to_text;
-
-        let app = app_with_hits(5);
-        let text = buffer_to_text(&render_at_degradation(
-            &app,
-            120,
-            24,
-            DegradationLevel::Full,
-        ));
-        assert!(
-            text.contains("\u{203a}") || text.contains(">"),
-            "breadcrumb separator should appear in rendered output"
-        );
-    }
-
-    /// Breadcrumb elides gracefully at narrow widths.
-    #[test]
-    fn breadcrumb_elides_at_narrow_width() {
-        let app = app_with_hits(5);
-        let s = ftui::Style::default();
-        let line = app.breadcrumb_line(20, s, s, s);
-        let total: usize = line
-            .spans()
-            .iter()
-            .map(|sp| sp.content.chars().count())
-            .sum();
-        assert!(
-            total <= 20,
-            "breadcrumb at width=20 should fit budget, got {total}"
-        );
-    }
-
     // ── Search-surface regression snapshots (2dccg.8.6) ─────────────────
 
     fn search_surface_fixture_app() -> CassApp {
@@ -37431,47 +37287,6 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         assert!(
             !inactive_value_spans.is_empty(),
             "test_id=8.6.hierarchy.pill_inactive component=pills expected=inactive_styled_span actual=none"
-        );
-    }
-
-    #[test]
-    fn breadcrumb_spans_differentiate_active_inactive_segments() {
-        let mut app = search_surface_fixture_app();
-        app.filters.agents.insert("codex".to_string());
-        // ws filter NOT set — should be inactive
-
-        let active_style =
-            ftui::Style::new().fg(ftui::render::cell::PackedRgba::rgba(0, 255, 0, 255));
-        let inactive_style =
-            ftui::Style::new().fg(ftui::render::cell::PackedRgba::rgba(100, 100, 100, 255));
-        let sep_style =
-            ftui::Style::new().fg(ftui::render::cell::PackedRgba::rgba(50, 50, 50, 255));
-
-        let line = app.breadcrumb_line(120, active_style, inactive_style, sep_style);
-        let spans = line.spans();
-
-        // Should have multiple spans with mixed styles
-        let active_count = spans
-            .iter()
-            .filter(|sp| {
-                sp.style.as_ref().and_then(|s| s.fg)
-                    == Some(ftui::render::cell::PackedRgba::rgba(0, 255, 0, 255))
-            })
-            .count();
-        let inactive_count = spans
-            .iter()
-            .filter(|sp| {
-                sp.style.as_ref().and_then(|s| s.fg)
-                    == Some(ftui::render::cell::PackedRgba::rgba(100, 100, 100, 255))
-            })
-            .count();
-        assert!(
-            active_count >= 1,
-            "test_id=8.6.hierarchy.crumb_active component=breadcrumbs expected>=1_active_span actual={active_count}"
-        );
-        assert!(
-            inactive_count >= 1,
-            "test_id=8.6.hierarchy.crumb_inactive component=breadcrumbs expected>=1_inactive_span actual={inactive_count}"
         );
     }
 

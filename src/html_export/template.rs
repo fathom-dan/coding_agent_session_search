@@ -483,19 +483,28 @@ impl HtmlTemplate {
                 format!(
                     "{} prompt{}, {} response{}, {} tool use{}",
                     self.metadata.human_turns,
-                    if self.metadata.human_turns == 1 { "" } else { "s" },
+                    if self.metadata.human_turns == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
                     self.metadata.assistant_msgs,
-                    if self.metadata.assistant_msgs == 1 { "" } else { "s" },
+                    if self.metadata.assistant_msgs == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
                     self.metadata.tool_use_count,
-                    if self.metadata.tool_use_count == 1 { "" } else { "s" },
+                    if self.metadata.tool_use_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
                 )
             } else {
                 format!("{} messages", self.metadata.message_count)
             };
-            meta_items.push(format!(
-                r#"<span>{}</span>"#,
-                count_str
-            ));
+            meta_items.push(format!(r#"<span>{}</span>"#, count_str));
         }
 
         if let Some(duration) = &self.metadata.duration {

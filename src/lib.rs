@@ -12507,8 +12507,9 @@ fn run_export_html(
                     .and_then(|m| m.get("content"))
                     .and_then(|c| c.as_array())
                     .is_some_and(|arr| {
-                        arr.iter()
-                            .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                        arr.iter().any(|item| {
+                            item.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                        })
                     });
                 if !is_tool_result {
                     human_turns += 1;

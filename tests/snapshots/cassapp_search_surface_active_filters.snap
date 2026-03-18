@@ -2,7 +2,6 @@
 ╭ ██ cass · Tokyo Night · Hybrid · Prefix ─────────────────────────────────────────────────────────────────────────────╮
 │ ?? authenticatio│n regression                                                                                        │
 │● agent:codex ● ws:/workspace/cass ● time:Jan 20, 1970 -> now ● source:remote-ci ● pane:triage                        │
-│codex › /workspace/cass › Jan 20, 1970 -> now › Balanced › source remote-ci                                           │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭ Results · 1 ─────────────────────────────────────────────────────────────────────│╭ Detail · Messages ↩ ─────────────╮
 │ hits:1 · row:1/1 · src:remote-ci                                                 ││  ▐Messages▌  │  Snippets  │  Raw │
@@ -18,7 +17,8 @@
 │                                                                                  ││snippet line that includes        │
 │                                                                                  ││repeated context windows, remote  │
 │                                                                                  ││provenance markers, and unicode   │
-│0 sessions │ 0 msgs                                                               ││glyphs → λ Δ ✓ to stress wrapping │
+│                                                                                  ││glyphs → λ Δ ✓ to stress wrapping │
+│0 sessions │ 0 msgs                                                               ││behavior.                         │
 ╰──────────────────────────────────────────────────────────────────────────────────│╰──────────────────────────────────╯
  hits 1 · view med/cozy · query HYB / PFX · perf lat:— cache:cold · scope rank:balanced ctx:M src:remote-ci             
   | Enter=open Ctrl+X=select Alt+S=mode Tab=focus                                                                       

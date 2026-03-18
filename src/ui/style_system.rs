@@ -676,6 +676,7 @@ fn breakpoint_name(breakpoint: super::app::LayoutBreakpoint) -> &'static str {
         LB::MediumNarrow => "medium-narrow",
         LB::Medium => "medium",
         LB::Wide => "wide",
+        LB::UltraWide => "ultra-wide",
     }
 }
 

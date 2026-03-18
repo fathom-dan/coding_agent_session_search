@@ -491,7 +491,7 @@ pub fn render_dashboard(
         };
         let mut lines: Vec<ftui::text::Line<'static>> = Vec::new();
         lines.push(ftui::text::Line::from(""));
-        
+
         if area.height >= 14 && area.width >= 40 {
             lines.push(ftui::text::Line::from_spans(vec![
                 ftui::text::Span::styled("         ▆", ftui::Style::new().fg(accent)),
@@ -580,20 +580,28 @@ pub fn render_dashboard(
     // Compute exact height needed for agent bar chart (1 row per agent).
     let agent_count = data.agent_tokens.len().min(8);
     let ws_count = data.workspace_tokens.len().min(8);
-    
-    let agent_rows = if agent_count > 0 { agent_count as u16 + 1 } else { 0 };
+
+    let agent_rows = if agent_count > 0 {
+        agent_count as u16 + 1
+    } else {
+        0
+    };
     let ws_rows = if ws_count > 0 { ws_count as u16 + 1 } else { 0 };
-    
-    let max_bar_rows = if wide_mode { agent_rows.max(ws_rows) } else { agent_rows };
+
+    let max_bar_rows = if wide_mode {
+        agent_rows.max(ws_rows)
+    } else {
+        agent_rows
+    };
     let has_bar = max_bar_rows > 0 && area.height >= 6 + max_bar_rows + 4;
 
     let chunks = if has_bar {
         Flex::vertical()
             .constraints([
-                Constraint::Fixed(6),           // KPI tile grid
-                Constraint::Fixed(max_bar_rows),// Top bar charts (exact fit)
-                Constraint::Fixed(2),           // Aggregate sparkline (label + bars)
-                Constraint::Min(0),             // Remaining space
+                Constraint::Fixed(6),            // KPI tile grid
+                Constraint::Fixed(max_bar_rows), // Top bar charts (exact fit)
+                Constraint::Fixed(2),            // Aggregate sparkline (label + bars)
+                Constraint::Min(0),              // Remaining space
             ])
             .split(area)
     } else {
@@ -612,7 +620,7 @@ pub fn render_dashboard(
     // ── Top Bar Charts (manual rendering with full labels) ──
     if has_bar {
         let bar_area = chunks[1];
-        
+
         let (agent_area, ws_area) = if wide_mode {
             let cols = Flex::horizontal()
                 .constraints([Constraint::Percentage(50.0), Constraint::Percentage(50.0)])
@@ -623,57 +631,106 @@ pub fn render_dashboard(
         };
 
         // Inner function to render a mini bar chart.
-        let mut render_mini_bar = |items: &[(String, f64)], area: Rect, header_label: &str, use_agent_colors: bool| {
-            if area.is_empty() || items.is_empty() { return; }
-            let max_val = items.iter().take(8).map(|(_, v)| *v).fold(0.0_f64, f64::max);
-            let label_w = items.iter().take(8).map(|(name, _)| name.len().min(14)).max().unwrap_or(6) as u16;
-            
-            let header = format!(" {:label_w$}  tokens", header_label, label_w = label_w as usize);
-            let header_line = ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
-                header,
-                ftui::Style::new().fg(cc.muted),
-            )]);
-            Paragraph::new(header_line).render(Rect { x: area.x, y: area.y, width: area.width, height: 1 }, frame);
-            
-            let val_col = 8_u16;
-            let bar_start = area.x + 1 + label_w + 1;
-            let bar_end = area.right().saturating_sub(val_col);
-            if bar_end <= bar_start { return; }
-            let bar_max_w = bar_end.saturating_sub(bar_start) as f64;
-            
-            for (i, (name, val)) in items.iter().take(8).enumerate() {
-                let y = area.y + 1 + i as u16;
-                if y >= area.bottom() { break; }
-                let color = if use_agent_colors { agent_color(i) } else { cc.emphasis };
-                let truncated_name: String = name.chars().take(label_w as usize).collect();
-                let val_str = format_compact(*val as i64);
-                
-                let label_span = ftui::text::Span::styled(
-                    format!(" {:<label_w$}", truncated_name, label_w = label_w as usize),
-                    ftui::Style::new().fg(cc.axis),
-                );
-                Paragraph::new(ftui::text::Line::from_spans(vec![label_span])).render(
-                    Rect { x: area.x, y, width: label_w + 1, height: 1 }, frame
-                );
-                
-                let bar_len = if max_val > 0.0 && *val > 0.0 {
-                    ((val / max_val) * bar_max_w).round().max(1.0) as u16
-                } else { 0 };
-                for dx in 0..bar_len {
-                    let x = bar_start + dx;
-                    if x < bar_end {
-                        let mut cell = ftui::render::cell::Cell::from_char('\u{2588}');
-                        cell.fg = color;
-                        frame.buffer.set_fast(x, y, cell);
-                    }
+        let mut render_mini_bar =
+            |items: &[(String, f64)], area: Rect, header_label: &str, use_agent_colors: bool| {
+                if area.is_empty() || items.is_empty() {
+                    return;
                 }
-                
-                let val_span = ftui::text::Span::styled(format!(" {val_str}"), ftui::Style::new().fg(cc.muted));
-                Paragraph::new(ftui::text::Line::from_spans(vec![val_span])).render(
-                    Rect { x: bar_end, y, width: val_col.min(area.right().saturating_sub(bar_end)), height: 1 }, frame
+                let max_val = items
+                    .iter()
+                    .take(8)
+                    .map(|(_, v)| *v)
+                    .fold(0.0_f64, f64::max);
+                let label_w = items
+                    .iter()
+                    .take(8)
+                    .map(|(name, _)| name.len().min(14))
+                    .max()
+                    .unwrap_or(6) as u16;
+
+                let header = format!(
+                    " {:label_w$}  tokens",
+                    header_label,
+                    label_w = label_w as usize
                 );
-            }
-        };
+                let header_line = ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    header,
+                    ftui::Style::new().fg(cc.muted),
+                )]);
+                Paragraph::new(header_line).render(
+                    Rect {
+                        x: area.x,
+                        y: area.y,
+                        width: area.width,
+                        height: 1,
+                    },
+                    frame,
+                );
+
+                let val_col = 8_u16;
+                let bar_start = area.x + 1 + label_w + 1;
+                let bar_end = area.right().saturating_sub(val_col);
+                if bar_end <= bar_start {
+                    return;
+                }
+                let bar_max_w = bar_end.saturating_sub(bar_start) as f64;
+
+                for (i, (name, val)) in items.iter().take(8).enumerate() {
+                    let y = area.y + 1 + i as u16;
+                    if y >= area.bottom() {
+                        break;
+                    }
+                    let color = if use_agent_colors {
+                        agent_color(i)
+                    } else {
+                        cc.emphasis
+                    };
+                    let truncated_name: String = name.chars().take(label_w as usize).collect();
+                    let val_str = format_compact(*val as i64);
+
+                    let label_span = ftui::text::Span::styled(
+                        format!(" {:<label_w$}", truncated_name, label_w = label_w as usize),
+                        ftui::Style::new().fg(cc.axis),
+                    );
+                    Paragraph::new(ftui::text::Line::from_spans(vec![label_span])).render(
+                        Rect {
+                            x: area.x,
+                            y,
+                            width: label_w + 1,
+                            height: 1,
+                        },
+                        frame,
+                    );
+
+                    let bar_len = if max_val > 0.0 && *val > 0.0 {
+                        ((val / max_val) * bar_max_w).round().max(1.0) as u16
+                    } else {
+                        0
+                    };
+                    for dx in 0..bar_len {
+                        let x = bar_start + dx;
+                        if x < bar_end {
+                            let mut cell = ftui::render::cell::Cell::from_char('\u{2588}');
+                            cell.fg = color;
+                            frame.buffer.set_fast(x, y, cell);
+                        }
+                    }
+
+                    let val_span = ftui::text::Span::styled(
+                        format!(" {val_str}"),
+                        ftui::Style::new().fg(cc.muted),
+                    );
+                    Paragraph::new(ftui::text::Line::from_spans(vec![val_span])).render(
+                        Rect {
+                            x: bar_end,
+                            y,
+                            width: val_col.min(area.right().saturating_sub(bar_end)),
+                            height: 1,
+                        },
+                        frame,
+                    );
+                }
+            };
 
         render_mini_bar(&data.agent_tokens, agent_area, "Agent", true);
         if let Some(w_area) = ws_area {
@@ -2045,11 +2102,15 @@ pub fn render_breakdowns(
         height: layout[1].height,
     };
 
+    // Determine how many rows we can fit (max 25 to avoid overwhelm).
+    // BarChart uses 1 row per group + some overhead.
+    let max_items = (content.height as usize).saturating_sub(2).clamp(8, 25);
+
     // For Model tab, show a single tokens-only chart (no message counts).
     if matches!(tab, BreakdownTab::Model) {
         let groups: Vec<BarGroup<'_>> = tokens
             .iter()
-            .take(10)
+            .take(max_items)
             .map(|(name, val)| BarGroup::new(name, vec![*val]))
             .collect();
         let colors: Vec<PackedRgba> = (0..groups.len()).map(color_fn).collect();
@@ -2069,7 +2130,7 @@ pub fn render_breakdowns(
     {
         let token_rows: Vec<(String, f64)> = tokens
             .iter()
-            .take(8)
+            .take(max_items)
             .map(|(name, val)| (shorten_label(name, 20), *val))
             .collect();
         let groups: Vec<BarGroup<'_>> = token_rows
@@ -2088,7 +2149,7 @@ pub fn render_breakdowns(
     {
         let message_rows: Vec<(String, f64)> = messages
             .iter()
-            .take(8)
+            .take(max_items)
             .map(|(name, val)| (shorten_label(name, 20), *val))
             .collect();
         let groups: Vec<BarGroup<'_>> = message_rows
