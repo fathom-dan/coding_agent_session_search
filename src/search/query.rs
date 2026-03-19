@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel as mpsc;
 use frankensearch::lexical::{
     BooleanQuery, CASS_SCHEMA_HASH as FS_CASS_SCHEMA_HASH, CassFields as FsCassFields,
@@ -16,10 +16,15 @@ use frankensearch::lexical::{
     try_build_snippet_generator as fs_try_build_snippet_generator,
 };
 use frankensearch::{
+    Cx as FsCx, LexicalSearch as FsLexicalSearch,
     InMemoryTwoTierIndex as FsInMemoryTwoTierIndex, InMemoryVectorIndex as FsInMemoryVectorIndex,
     QueryClass as FsQueryClass, RrfConfig as FsRrfConfig, ScoreSource as FsScoreSource,
-    ScoredResult as FsScoredResult, SyncTwoTierSearcher as FsSyncTwoTierSearcher,
-    TwoTierConfig as FsTwoTierConfig, VectorHit as FsVectorHit,
+    ScoredResult as FsScoredResult, SearchError as FsSearchError,
+    SearchFuture as FsSearchFuture, SearchPhase as FsSearchPhase,
+    SyncEmbedderAdapter as FsSyncEmbedderAdapter,
+    SyncTwoTierSearcher as FsSyncTwoTierSearcher, TwoTierConfig as FsTwoTierConfig,
+    TwoTierIndex as FsTwoTierIndex, TwoTierSearcher as FsTwoTierSearcher,
+    VectorHit as FsVectorHit,
     candidate_count as fs_candidate_count,
     core::filter::SearchFilter as FsSearchFilter,
     index::{
@@ -65,10 +70,12 @@ impl std::ops::Deref for SendConnection {
     }
 }
 
-use crate::search::canonicalize::canonicalize_for_embedding;
+use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use crate::search::embedder::Embedder;
 use crate::search::vector_index::{
-    SemanticFilter, SemanticFilterMaps, VectorIndex, VectorSearchResult, parse_semantic_doc_id,
+    ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER, SemanticDocId, SemanticFilter,
+    SemanticFilterMaps, VectorIndex, VectorSearchResult, parse_semantic_doc_id,
+    role_code_from_str,
 };
 
 use crate::sources::provenance::SourceFilter;
@@ -998,6 +1005,25 @@ pub struct SearchResult {
     pub ann_stats: Option<crate::search::ann_index::AnnSearchStats>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressivePhaseKind {
+    Initial,
+    Refined,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProgressiveSearchEvent {
+    Phase {
+        kind: ProgressivePhaseKind,
+        result: SearchResult,
+        elapsed_ms: u128,
+    },
+    RefinementFailed {
+        latency_ms: u128,
+        error: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SearchHitKey {
     source_id: String,
@@ -1351,9 +1377,72 @@ struct SemanticSearchState {
     ann_path: Option<PathBuf>,
     fs_in_memory_two_tier_index: Option<Arc<FsInMemoryTwoTierIndex>>,
     in_memory_two_tier_init_attempted: bool,
+    progressive_context: Option<Arc<ProgressiveTwoTierContext>>,
+    progressive_context_init_attempted: bool,
     filter_maps: SemanticFilterMaps,
     roles: Option<HashSet<u8>>,
     query_cache: QueryCache,
+}
+
+struct ProgressiveTwoTierContext {
+    index: Arc<FsTwoTierIndex>,
+    fast_embedder: Arc<dyn Embedder>,
+    quality_embedder: Option<Arc<dyn Embedder>>,
+}
+
+struct SharedCassSyncEmbedder {
+    inner: Arc<dyn Embedder>,
+}
+
+impl SharedCassSyncEmbedder {
+    fn new(inner: Arc<dyn Embedder>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Embedder for SharedCassSyncEmbedder {
+    fn embed_sync(&self, text: &str) -> crate::search::embedder::EmbedderResult<Vec<f32>> {
+        self.inner.embed_sync(text)
+    }
+
+    fn embed_batch_sync(
+        &self,
+        texts: &[&str],
+    ) -> crate::search::embedder::EmbedderResult<Vec<Vec<f32>>> {
+        self.inner.embed_batch_sync(texts)
+    }
+
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+
+    fn is_ready(&self) -> bool {
+        self.inner.is_ready()
+    }
+
+    fn is_semantic(&self) -> bool {
+        self.inner.is_semantic()
+    }
+
+    fn category(&self) -> frankensearch::ModelCategory {
+        self.inner.category()
+    }
+
+    fn tier(&self) -> frankensearch::ModelTier {
+        self.inner.tier()
+    }
+
+    fn supports_mrl(&self) -> bool {
+        self.inner.supports_mrl()
+    }
 }
 
 impl SemanticSearchState {
@@ -1417,6 +1506,143 @@ impl SemanticSearchState {
                 None
             }
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedSemanticDocId {
+    message_id: u64,
+    doc_id: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ProgressiveLexicalCache {
+    hits_by_message: HashMap<u64, SearchHit>,
+    wildcard_fallback: bool,
+    suggestions: Vec<QuerySuggestion>,
+}
+
+struct CassProgressiveLexicalAdapter {
+    client: Arc<SearchClient>,
+    filters: SearchFilters,
+    field_mask: FieldMask,
+    sparse_threshold: usize,
+    shared: Arc<Mutex<ProgressiveLexicalCache>>,
+}
+
+impl CassProgressiveLexicalAdapter {
+    fn new(
+        client: Arc<SearchClient>,
+        filters: SearchFilters,
+        field_mask: FieldMask,
+        sparse_threshold: usize,
+        shared: Arc<Mutex<ProgressiveLexicalCache>>,
+    ) -> Self {
+        Self {
+            client,
+            filters,
+            field_mask,
+            sparse_threshold,
+            shared,
+        }
+    }
+}
+
+impl FsLexicalSearch for CassProgressiveLexicalAdapter {
+    fn search<'a>(
+        &'a self,
+        cx: &'a FsCx,
+        query: &'a str,
+        limit: usize,
+    ) -> FsSearchFuture<'a, Vec<FsScoredResult>> {
+        Box::pin(async move {
+            if cx.is_cancel_requested() {
+                return Err(FsSearchError::Cancelled {
+                    phase: "lexical".to_string(),
+                    reason: "cancel requested".to_string(),
+                });
+            }
+
+            let result = self
+                .client
+                .search_with_fallback(
+                    query,
+                    self.filters.clone(),
+                    limit,
+                    0,
+                    self.sparse_threshold,
+                    self.field_mask,
+                )
+                .map_err(|err| FsSearchError::SubsystemError {
+                    subsystem: "cass_lexical_adapter",
+                    source: Box::new(std::io::Error::other(err.to_string())),
+                })?;
+
+            let resolved = self
+                .client
+                .resolve_semantic_doc_ids_for_hits(&result.hits)
+                .map_err(|err| FsSearchError::SubsystemError {
+                    subsystem: "cass_lexical_adapter",
+                    source: Box::new(std::io::Error::other(err.to_string())),
+                })?;
+
+            let mut scored = Vec::with_capacity(result.hits.len());
+            let mut hits_by_message = HashMap::with_capacity(result.hits.len());
+
+            for (hit, resolved_doc) in result.hits.iter().zip(resolved.into_iter()) {
+                let Some(resolved_doc) = resolved_doc else {
+                    continue;
+                };
+                hits_by_message
+                    .entry(resolved_doc.message_id)
+                    .or_insert_with(|| hit.clone());
+                scored.push(FsScoredResult {
+                    doc_id: resolved_doc.doc_id,
+                    score: hit.score,
+                    source: FsScoreSource::Lexical,
+                    index: None,
+                    fast_score: None,
+                    quality_score: None,
+                    lexical_score: Some(hit.score),
+                    rerank_score: None,
+                    explanation: None,
+                    metadata: None,
+                });
+            }
+
+            if let Ok(mut guard) = self.shared.lock() {
+                *guard = ProgressiveLexicalCache {
+                    hits_by_message,
+                    wildcard_fallback: result.wildcard_fallback,
+                    suggestions: result.suggestions,
+                };
+            }
+
+            Ok(scored)
+        })
+    }
+
+    fn index_document<'a>(
+        &'a self,
+        _cx: &'a FsCx,
+        _doc: &'a frankensearch::IndexableDocument,
+    ) -> FsSearchFuture<'a, ()> {
+        Box::pin(async move {
+            Err(FsSearchError::SubsystemError {
+                subsystem: "cass_lexical_adapter",
+                source: Box::new(std::io::Error::other(
+                    "cass lexical adapter is read-only",
+                )),
+            })
+        })
+    }
+
+    fn commit<'a>(&'a self, _cx: &'a FsCx) -> FsSearchFuture<'a, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn doc_count(&self) -> usize {
+        self.client.total_docs()
     }
 }
 
@@ -1955,7 +2181,8 @@ impl SearchClient {
         } else {
             limit
         };
-        let can_use_cache = field_mask.allows_cache() && field_mask.needs_content();
+        let can_use_cache =
+            field_mask.allows_cache() && (field_mask.needs_content() || field_mask.wants_snippet());
 
         // Schedule warmup for likely prefixes when user pauses typing.
         if offset == 0
@@ -2184,6 +2411,8 @@ impl SearchClient {
             ann_path,
             fs_in_memory_two_tier_index: None,
             in_memory_two_tier_init_attempted: false,
+            progressive_context: None,
+            progressive_context_init_attempted: false,
             filter_maps,
             roles,
             query_cache: QueryCache::new(embedder_id.as_str(), capacity),
@@ -2198,6 +2427,638 @@ impl SearchClient {
             .map_err(|_| anyhow!("semantic lock poisoned"))?;
         *guard = None;
         Ok(())
+    }
+
+    pub fn can_progressively_refine(&self) -> bool {
+        let mut guard = match self.semantic.lock() {
+            Ok(guard) => guard,
+            Err(_) => return false,
+        };
+        let Some(state) = guard.as_mut() else {
+            return false;
+        };
+        self.load_progressive_context(state)
+            .map(|context| {
+                context
+                    .as_ref()
+                    .is_some_and(|ctx| ctx.quality_embedder.is_some() && ctx.index.has_quality_index())
+            })
+            .unwrap_or(false)
+    }
+
+    fn load_progressive_context(
+        &self,
+        state: &mut SemanticSearchState,
+    ) -> Result<Option<Arc<ProgressiveTwoTierContext>>> {
+        if let Some(context) = state.progressive_context.as_ref() {
+            return Ok(Some(Arc::clone(context)));
+        }
+        if state.progressive_context_init_attempted {
+            return Ok(None);
+        }
+        state.progressive_context_init_attempted = true;
+
+        let Some(index_dir) = state
+            .ann_path
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+        else {
+            return Ok(None);
+        };
+
+        let fast_path = {
+            let explicit = index_dir.join("vector.fast.idx");
+            if explicit.is_file() {
+                explicit
+            } else {
+                let fallback = index_dir.join("vector.idx");
+                if fallback.is_file() {
+                    fallback
+                } else {
+                    return Ok(None);
+                }
+            }
+        };
+        let quality_path = index_dir.join("vector.quality.idx");
+        if !quality_path.is_file() {
+            return Ok(None);
+        }
+
+        let fast_index = FsVectorIndex::open(&fast_path)
+            .map_err(|err| anyhow!("open fast-tier index failed: {err}"))?;
+        let quality_index = FsVectorIndex::open(&quality_path)
+            .map_err(|err| anyhow!("open quality-tier index failed: {err}"))?;
+        let index = Arc::new(
+            FsTwoTierIndex::open(&index_dir, FsTwoTierConfig::default())
+                .map_err(|err| anyhow!("open progressive two-tier index failed: {err}"))?,
+        );
+
+        let fast_embedder = self.load_embedder_for_progressive_id(
+            state,
+            fast_index.embedder_id(),
+            fast_index.dimension(),
+        )?;
+        let quality_embedder = Some(self.load_embedder_for_progressive_id(
+            state,
+            quality_index.embedder_id(),
+            quality_index.dimension(),
+        )?);
+
+        let context = Arc::new(ProgressiveTwoTierContext {
+            index,
+            fast_embedder,
+            quality_embedder,
+        });
+        state.progressive_context = Some(Arc::clone(&context));
+        Ok(Some(context))
+    }
+
+    fn load_embedder_for_progressive_id(
+        &self,
+        state: &SemanticSearchState,
+        embedder_id: &str,
+        dimension: usize,
+    ) -> Result<Arc<dyn Embedder>> {
+        if state.embedder.id() == embedder_id {
+            return Ok(Arc::clone(&state.embedder));
+        }
+
+        if let Some(dim) = embedder_id.strip_prefix("fnv1a-")
+            && let Ok(parsed) = dim.parse::<usize>()
+        {
+            return Ok(Arc::new(crate::search::hash_embedder::HashEmbedder::new(
+                parsed.max(dimension),
+            )));
+        }
+
+        if embedder_id == crate::search::fastembed_embedder::FastEmbedder::embedder_id_static() {
+            let data_dir = self
+                .sqlite_path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .ok_or_else(|| anyhow!("cannot resolve data dir for progressive embedder load"))?;
+            let model_dir =
+                crate::search::fastembed_embedder::FastEmbedder::default_model_dir(data_dir);
+            let embedder = crate::search::fastembed_embedder::FastEmbedder::load_from_dir(&model_dir)
+                .with_context(|| format!("loading FastEmbed model from {}", model_dir.display()))?;
+            if embedder.dimension() != dimension {
+                bail!(
+                    "progressive embedder dimension mismatch: {} index expects {}, model has {}",
+                    embedder_id,
+                    dimension,
+                    embedder.dimension()
+                );
+            }
+            return Ok(Arc::new(embedder));
+        }
+
+        bail!("unsupported progressive embedder id: {embedder_id}");
+    }
+
+    fn resolve_semantic_doc_ids_for_hits(
+        &self,
+        hits: &[SearchHit],
+    ) -> Result<Vec<Option<ResolvedSemanticDocId>>> {
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let lookup_keys: Vec<Option<(String, String, i64)>> = hits
+            .iter()
+            .map(|hit| {
+                let idx = hit
+                    .line_number
+                    .and_then(|line| line.checked_sub(1))
+                    .map(i64::try_from)
+                    .transpose()
+                    .ok()
+                    .flatten()?;
+                Some((hit.source_id.clone(), hit.source_path.clone(), idx))
+            })
+            .collect();
+
+        let unique_keys: Vec<(String, String, i64)> = {
+            let mut seen = HashSet::new();
+            let mut keys = Vec::new();
+            for key in lookup_keys.iter().flatten() {
+                if seen.insert(key.clone()) {
+                    keys.push(key.clone());
+                }
+            }
+            keys
+        };
+
+        if unique_keys.is_empty() {
+            return Ok(vec![None; hits.len()]);
+        }
+
+        let sqlite_guard = self.sqlite_guard()?;
+        let conn = sqlite_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("progressive search requires database connection"))?;
+
+        let mut sql = String::from(
+            "SELECT c.source_id, c.source_path, m.idx, m.id, c.agent_id, c.workspace_id, m.role, m.created_at, m.content
+             FROM messages m
+             JOIN conversations c ON m.conversation_id = c.id
+             WHERE ",
+        );
+        let mut params = Vec::with_capacity(unique_keys.len().saturating_mul(3));
+        for (idx, (source_id, source_path, line_idx)) in unique_keys.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(" OR ");
+            }
+            sql.push_str("(c.source_id = ? AND c.source_path = ? AND m.idx = ?)");
+            params.push(ParamValue::from(source_id.clone()));
+            params.push(ParamValue::from(source_path.clone()));
+            params.push(ParamValue::from(*line_idx));
+        }
+
+        let rows: Vec<Option<((String, String, i64), ResolvedSemanticDocId)>> =
+            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+                let source_id: String = row.get_typed(0)?;
+                let source_path: String = row.get_typed(1)?;
+                let idx: i64 = row.get_typed(2)?;
+                let message_id_raw: i64 = row.get_typed(3)?;
+                let agent_id_raw: i64 = row.get_typed(4)?;
+                let workspace_id_raw: Option<i64> = row.get_typed(5)?;
+                let role_raw: String = row.get_typed(6)?;
+                let created_at_ms: Option<i64> = row.get_typed(7)?;
+                let content: String = row.get_typed(8)?;
+
+                let canonical = canonicalize_for_embedding(&content);
+                if canonical.is_empty() {
+                    return Ok(None);
+                }
+
+                let message_id = u64::try_from(message_id_raw)
+                    .map_err(|_| anyhow!("message id out of range for progressive doc_id"))?;
+                let agent_id = if agent_id_raw < 0 {
+                    0
+                } else {
+                    u32::try_from(agent_id_raw).unwrap_or(u32::MAX)
+                };
+                let workspace_id = if workspace_id_raw.unwrap_or(0) < 0 {
+                    0
+                } else {
+                    u32::try_from(workspace_id_raw.unwrap_or(0)).unwrap_or(u32::MAX)
+                };
+                let role = role_code_from_str(&role_raw).unwrap_or(ROLE_USER);
+                let doc_id = SemanticDocId {
+                    message_id,
+                    chunk_idx: 0,
+                    agent_id,
+                    workspace_id,
+                    source_id: crc32fast::hash(source_id.as_bytes()),
+                    role,
+                    created_at_ms: created_at_ms.unwrap_or(0),
+                    content_hash: Some(content_hash(&canonical)),
+                }
+                .to_doc_id_string();
+
+                Ok(Some((
+                    (source_id, source_path, idx),
+                    ResolvedSemanticDocId { message_id, doc_id },
+                )))
+            })?;
+
+        let mut resolved_by_key = HashMap::with_capacity(rows.len());
+        for row in rows.into_iter().flatten() {
+            resolved_by_key.insert(row.0, row.1);
+        }
+
+        Ok(lookup_keys
+            .into_iter()
+            .map(|key| key.and_then(|lookup| resolved_by_key.get(&lookup).cloned()))
+            .collect())
+    }
+
+    fn load_message_text_by_id(&self, message_id: u64) -> Result<Option<String>> {
+        let sqlite_guard = self.sqlite_guard()?;
+        let conn = sqlite_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("progressive search requires database connection"))?;
+        let rows: Vec<String> = conn.query_map_collect(
+            "SELECT content FROM messages WHERE id = ?",
+            &[ParamValue::from(i64::try_from(message_id)?)],
+            |row: &frankensqlite::Row| row.get_typed(0),
+        )?;
+        Ok(rows.into_iter().next())
+    }
+
+    fn collapse_progressive_scored_results(
+        &self,
+        results: &[FsScoredResult],
+        limit: usize,
+    ) -> Vec<VectorSearchResult> {
+        let fetch = limit.max(1);
+        let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+        for hit in results {
+            let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
+                continue;
+            };
+            best_by_message
+                .entry(parsed.message_id)
+                .and_modify(|entry| {
+                    if hit.score > entry.score {
+                        entry.score = hit.score;
+                        entry.chunk_idx = parsed.chunk_idx;
+                    }
+                })
+                .or_insert(VectorSearchResult {
+                    message_id: parsed.message_id,
+                    chunk_idx: parsed.chunk_idx,
+                    score: hit.score,
+                });
+        }
+        let mut collapsed: Vec<VectorSearchResult> = best_by_message.into_values().collect();
+        collapsed.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        if collapsed.len() > fetch {
+            collapsed.truncate(fetch);
+        }
+        collapsed
+    }
+
+    fn hydrate_semantic_hits_with_ids(
+        &self,
+        results: &[VectorSearchResult],
+        field_mask: FieldMask,
+    ) -> Result<Vec<(u64, SearchHit)>> {
+        if results.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sqlite_guard = self.sqlite_guard()?;
+        let conn = sqlite_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("semantic search requires database connection"))?;
+
+        let placeholder_capacity = results.len().saturating_mul(2).saturating_sub(1);
+        let mut placeholders = String::with_capacity(placeholder_capacity);
+        let mut params: Vec<ParamValue> = Vec::with_capacity(results.len());
+        for (idx, result) in results.iter().enumerate() {
+            if idx > 0 {
+                placeholders.push(',');
+            }
+            placeholders.push('?');
+            params.push(ParamValue::from(i64::try_from(result.message_id)?));
+        }
+
+        let content_expr = if field_mask.needs_content() {
+            "m.content"
+        } else {
+            "''"
+        };
+        let title_expr = if field_mask.wants_title() {
+            "c.title"
+        } else {
+            "''"
+        };
+        let sql = format!(
+            "SELECT m.id, {content_expr}, m.created_at, m.idx, m.role, {title_expr}, c.source_path, c.source_id, c.origin_host, a.slug, w.path, COALESCE(s.kind, 'local'), c.started_at
+             FROM messages m
+             JOIN conversations c ON m.conversation_id = c.id
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             LEFT JOIN sources s ON c.source_id = s.id
+             WHERE m.id IN ({placeholders})"
+        );
+
+        let rows: Vec<(u64, SearchHit)> =
+            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+                let message_id: i64 = row.get_typed(0)?;
+                let content: String = row.get_typed(1)?;
+                let msg_created_at: Option<i64> = row.get_typed(2)?;
+                let idx: Option<i64> = row.get_typed(3)?;
+                let title: Option<String> = if field_mask.wants_title() {
+                    row.get_typed(5)?
+                } else {
+                    None
+                };
+                let source_path: String = row.get_typed(6)?;
+                let source_id: Option<String> = row.get_typed(7)?;
+                let origin_host: Option<String> = row.get_typed(8)?;
+                let agent: String = row.get_typed(9)?;
+                let workspace: Option<String> = row.get_typed(10)?;
+                let origin_kind: String = row.get_typed(11)?;
+                let started_at: Option<i64> = row.get_typed(12)?;
+
+                let created_at = msg_created_at.or(started_at);
+                let line_number = idx.map(|i| (i + 1) as usize);
+                let snippet = if field_mask.wants_snippet() {
+                    snippet_from_content(&content)
+                } else {
+                    String::new()
+                };
+                let hash_basis = if content.is_empty() {
+                    snippet.as_str()
+                } else {
+                    content.as_str()
+                };
+                let content_hash =
+                    stable_hit_hash(hash_basis, &source_path, line_number, created_at);
+
+                let hit = SearchHit {
+                    title: if field_mask.wants_title() {
+                        title.unwrap_or_else(|| "Untitled".to_string())
+                    } else {
+                        String::new()
+                    },
+                    snippet,
+                    content,
+                    content_hash,
+                    score: 0.0,
+                    source_path,
+                    agent,
+                    workspace: workspace.unwrap_or_default(),
+                    workspace_original: None,
+                    created_at,
+                    line_number,
+                    match_type: MatchType::Exact,
+                    source_id: source_id.unwrap_or_else(default_source_id),
+                    origin_kind,
+                    origin_host,
+                };
+
+                Ok((message_id as u64, hit))
+            })?;
+
+        let mut hits_by_id = HashMap::new();
+        for (id, hit) in rows {
+            hits_by_id.insert(id, hit);
+        }
+
+        let mut ordered = Vec::new();
+        for result in results {
+            if let Some(mut hit) = hits_by_id.remove(&result.message_id) {
+                hit.score = result.score;
+                ordered.push((result.message_id, hit));
+            }
+        }
+
+        Ok(ordered)
+    }
+
+    fn overlay_progressive_lexical_fields(
+        &self,
+        hits: &mut [(u64, SearchHit)],
+        cache: &ProgressiveLexicalCache,
+        field_mask: FieldMask,
+    ) {
+        for (message_id, hit) in hits.iter_mut() {
+            let Some(lexical) = cache.hits_by_message.get(message_id) else {
+                continue;
+            };
+            if field_mask.wants_title() && !lexical.title.is_empty() {
+                hit.title = lexical.title.clone();
+            }
+            if field_mask.wants_snippet() && !lexical.snippet.is_empty() {
+                hit.snippet = lexical.snippet.clone();
+            }
+            if field_mask.needs_content() && !lexical.content.is_empty() {
+                hit.content = lexical.content.clone();
+            }
+            hit.match_type = lexical.match_type;
+            hit.line_number = lexical.line_number.or(hit.line_number);
+        }
+    }
+
+    fn progressive_phase_to_result(
+        &self,
+        results: &[FsScoredResult],
+        filters: &SearchFilters,
+        field_mask: FieldMask,
+        lexical_cache: Option<&ProgressiveLexicalCache>,
+        limit: usize,
+    ) -> Result<SearchResult> {
+        let collapsed = self.collapse_progressive_scored_results(results, limit);
+        let mut hydrated = self.hydrate_semantic_hits_with_ids(&collapsed, field_mask)?;
+        if let Some(cache) = lexical_cache {
+            self.overlay_progressive_lexical_fields(&mut hydrated, cache, field_mask);
+        }
+
+        let mut hits: Vec<SearchHit> = hydrated.into_iter().map(|(_, hit)| hit).collect();
+        hits = deduplicate_hits(hits);
+        if !filters.session_paths.is_empty() {
+            hits.retain(|hit| filters.session_paths.contains(&hit.source_path));
+        }
+
+        let (wildcard_fallback, suggestions) = lexical_cache
+            .map(|cache| {
+                let suggestions = if hits.is_empty() {
+                    cache.suggestions.clone()
+                } else {
+                    Vec::new()
+                };
+                (cache.wildcard_fallback, suggestions)
+            })
+            .unwrap_or((false, Vec::new()));
+
+        Ok(SearchResult {
+            hits,
+            wildcard_fallback,
+            cache_stats: self.cache_stats(),
+            suggestions,
+            ann_stats: None,
+        })
+    }
+
+    pub async fn search_progressive_with_callback(
+        self: &Arc<Self>,
+        cx: &FsCx,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        sparse_threshold: usize,
+        field_mask: FieldMask,
+        mode: SearchMode,
+        mut on_event: impl FnMut(ProgressiveSearchEvent) + Send,
+    ) -> Result<()> {
+        let field_mask = effective_field_mask(field_mask);
+        let limit = limit.max(1);
+
+        match mode {
+            SearchMode::Lexical => {
+                let started = Instant::now();
+                let result =
+                    self.search_with_fallback(query, filters, limit, 0, sparse_threshold, field_mask)?;
+                on_event(ProgressiveSearchEvent::Phase {
+                    kind: ProgressivePhaseKind::Initial,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    result,
+                });
+                return Ok(());
+            }
+            SearchMode::Semantic | SearchMode::Hybrid => {}
+        }
+
+        let progressive_context = {
+            let mut guard = self
+                .semantic
+                .lock()
+                .map_err(|_| anyhow!("semantic lock poisoned"))?;
+            let state = guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("semantic search unavailable (no embedder or vector index)"))?;
+            self.load_progressive_context(state)?
+                .ok_or_else(|| anyhow!("progressive two-tier context unavailable"))?
+        };
+
+        let lexical_cache = Arc::new(Mutex::new(ProgressiveLexicalCache::default()));
+        let text_cache: Arc<Mutex<HashMap<u64, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let text_client = Arc::clone(self);
+        let text_cache_for_lookup = Arc::clone(&text_cache);
+        let text_fn = move |doc_id: &str| -> Option<String> {
+            let parsed = parse_semantic_doc_id(doc_id)?;
+            if let Ok(cache) = text_cache_for_lookup.lock()
+                && let Some(text) = cache.get(&parsed.message_id)
+            {
+                return Some(text.clone());
+            }
+            let loaded = text_client.load_message_text_by_id(parsed.message_id).ok().flatten()?;
+            if let Ok(mut cache) = text_cache_for_lookup.lock() {
+                cache.insert(parsed.message_id, loaded.clone());
+            }
+            Some(loaded)
+        };
+
+        let fast_embedder: Arc<dyn frankensearch::Embedder> = Arc::new(FsSyncEmbedderAdapter(
+            SharedCassSyncEmbedder::new(Arc::clone(&progressive_context.fast_embedder)),
+        ));
+        let mut searcher =
+            FsTwoTierSearcher::new(Arc::clone(&progressive_context.index), fast_embedder, FsTwoTierConfig::default());
+
+        if let Some(quality_embedder) = progressive_context.quality_embedder.as_ref() {
+            let quality: Arc<dyn frankensearch::Embedder> = Arc::new(FsSyncEmbedderAdapter(
+                SharedCassSyncEmbedder::new(Arc::clone(quality_embedder)),
+            ));
+            searcher = searcher.with_quality_embedder(quality);
+        }
+
+        if matches!(mode, SearchMode::Hybrid) {
+            let lexical = Arc::new(CassProgressiveLexicalAdapter::new(
+                Arc::clone(self),
+                filters.clone(),
+                field_mask,
+                sparse_threshold,
+                Arc::clone(&lexical_cache),
+            ));
+            searcher = searcher.with_lexical(lexical);
+        }
+
+        let phase_client = Arc::clone(self);
+        let phase_filters = filters.clone();
+        let phase_cache = Arc::clone(&lexical_cache);
+        let phase_cx = cx.clone();
+        let mut phase_error: Option<anyhow::Error> = None;
+
+        let search_result = searcher
+            .search(cx, query, limit, text_fn, |phase| {
+                if phase_error.is_some() {
+                    return;
+                }
+                let lexical_snapshot = phase_cache.lock().ok().map(|guard| guard.clone());
+                let event_result = match phase {
+                    FsSearchPhase::Initial {
+                        results,
+                        latency,
+                        ..
+                    } => phase_client.progressive_phase_to_result(
+                        &results,
+                        &phase_filters,
+                        field_mask,
+                        lexical_snapshot.as_ref(),
+                        limit,
+                    )
+                    .map(|result| ProgressiveSearchEvent::Phase {
+                        kind: ProgressivePhaseKind::Initial,
+                        elapsed_ms: latency.as_millis(),
+                        result,
+                    }),
+                    FsSearchPhase::Refined {
+                        results,
+                        latency,
+                        ..
+                    } => phase_client.progressive_phase_to_result(
+                        &results,
+                        &phase_filters,
+                        field_mask,
+                        lexical_snapshot.as_ref(),
+                        limit,
+                    )
+                    .map(|result| ProgressiveSearchEvent::Phase {
+                        kind: ProgressivePhaseKind::Refined,
+                        elapsed_ms: latency.as_millis(),
+                        result,
+                    }),
+                    FsSearchPhase::RefinementFailed { error, latency, .. } => {
+                        Ok(ProgressiveSearchEvent::RefinementFailed {
+                            latency_ms: latency.as_millis(),
+                            error: error.to_string(),
+                        })
+                    }
+                };
+
+                match event_result {
+                    Ok(event) => on_event(event),
+                    Err(err) => {
+                        phase_error = Some(err);
+                        phase_cx.cancel_fast(asupersync::CancelKind::User);
+                    }
+                }
+            })
+            .await;
+
+        if let Some(err) = phase_error {
+            return Err(err);
+        }
+
+        search_result
+            .map(|_| ())
+            .map_err(|err| anyhow!("progressive search failed: {err}"))
     }
 
     /// Semantic search result containing hits and optional ANN statistics.
@@ -2479,113 +3340,8 @@ impl SearchClient {
         results: &[VectorSearchResult],
         field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
-        if results.is_empty() {
-            return Ok(Vec::new());
-        }
-        let sqlite_guard = self.sqlite_guard()?;
-        let conn = sqlite_guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("semantic search requires database connection"))?;
-
-        // Pre-size: n "?" chars + (n-1) "," chars = 2n-1 total
-        let placeholder_capacity = results.len().saturating_mul(2).saturating_sub(1);
-        let mut placeholders = String::with_capacity(placeholder_capacity);
-        let mut params: Vec<ParamValue> = Vec::with_capacity(results.len());
-        for (idx, result) in results.iter().enumerate() {
-            if idx > 0 {
-                placeholders.push(',');
-            }
-            placeholders.push('?');
-            params.push(ParamValue::from(i64::try_from(result.message_id)?));
-        }
-
-        let content_expr = if field_mask.needs_content() {
-            "m.content"
-        } else {
-            "''"
-        };
-        let title_expr = if field_mask.wants_title() {
-            "c.title"
-        } else {
-            "''"
-        };
-        let sql = format!(
-            "SELECT m.id, {content_expr}, m.created_at, m.idx, m.role, {title_expr}, c.source_path, c.source_id, c.origin_host, a.slug, w.path, COALESCE(s.kind, 'local'), c.started_at
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
-             JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id
-             LEFT JOIN sources s ON c.source_id = s.id
-             WHERE m.id IN ({placeholders})"
-        );
-
-        let rows: Vec<(u64, SearchHit)> =
-            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
-                let message_id: i64 = row.get_typed(0)?;
-                let content: String = row.get_typed(1)?;
-                let msg_created_at: Option<i64> = row.get_typed(2)?;
-                let idx: Option<i64> = row.get_typed(3)?;
-                let title: Option<String> = if field_mask.wants_title() {
-                    row.get_typed(5)?
-                } else {
-                    None
-                };
-                let source_path: String = row.get_typed(6)?;
-                let source_id: Option<String> = row.get_typed(7)?;
-                let origin_host: Option<String> = row.get_typed(8)?;
-                let agent: String = row.get_typed(9)?;
-                let workspace: Option<String> = row.get_typed(10)?;
-                let origin_kind: String = row.get_typed(11)?;
-                let started_at: Option<i64> = row.get_typed(12)?;
-
-                let created_at = msg_created_at.or(started_at);
-                let line_number = idx.map(|i| (i + 1) as usize);
-                let snippet = if field_mask.wants_snippet() {
-                    snippet_from_content(&content)
-                } else {
-                    String::new()
-                };
-                let content_hash = stable_hit_hash(&content, &source_path, line_number, created_at);
-
-                let hit = SearchHit {
-                    title: if field_mask.wants_title() {
-                        title.unwrap_or_else(|| "Untitled".to_string())
-                    } else {
-                        String::new()
-                    },
-                    snippet,
-                    content,
-                    content_hash,
-                    score: 0.0,
-                    source_path,
-                    agent,
-                    workspace: workspace.unwrap_or_default(),
-                    workspace_original: None,
-                    created_at,
-                    line_number,
-                    match_type: MatchType::Exact,
-                    source_id: source_id.unwrap_or_else(default_source_id),
-                    origin_kind,
-                    origin_host,
-                };
-
-                Ok((message_id as u64, hit))
-            })?;
-
-        let mut hits_by_id = HashMap::new();
-        for (id, hit) in rows {
-            hits_by_id.insert(id, hit);
-        }
-
-        let mut ordered = Vec::new();
-        for result in results {
-            if let Some(mut hit) = hits_by_id.remove(&result.message_id) {
-                hit.score = result.score;
-                ordered.push(hit);
-            }
-        }
-
-        Ok(ordered)
+        self.hydrate_semantic_hits_with_ids(results, field_mask)
+            .map(|rows| rows.into_iter().map(|(_, hit)| hit).collect())
     }
 
     /// Search with automatic wildcard fallback for sparse results.
@@ -2695,6 +3451,34 @@ impl SearchClient {
         field_mask: FieldMask,
         approximate: bool,
     ) -> Result<SearchResult> {
+        self.search_hybrid_with_tier(
+            lexical_query,
+            semantic_query,
+            filters,
+            limit,
+            offset,
+            sparse_threshold,
+            field_mask,
+            approximate,
+            SemanticTierMode::Single,
+        )
+    }
+
+    /// Hybrid search that fuses lexical + semantic results with optional
+    /// progressive two-tier semantic execution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_hybrid_with_tier(
+        &self,
+        lexical_query: &str,
+        semantic_query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        sparse_threshold: usize,
+        field_mask: FieldMask,
+        approximate: bool,
+        semantic_tier_mode: SemanticTierMode,
+    ) -> Result<SearchResult> {
         let requested_limit = limit;
         let total_docs = self.total_docs().max(1);
         let limit = if requested_limit == 0 {
@@ -2734,13 +3518,14 @@ impl SearchClient {
             sparse_threshold,
             field_mask,
         )?;
-        let (semantic_hits, semantic_ann_stats) = self.search_semantic(
+        let (semantic_hits, semantic_ann_stats) = self.search_semantic_with_tier(
             semantic_query,
             filters,
             budget.semantic_candidates,
             0,
             field_mask,
             approximate,
+            semantic_tier_mode,
         )?;
         let fused = rrf_fuse_hits(&lexical.hits, &semantic_hits, limit, offset);
         let suggestions = if fused.is_empty() {
@@ -2916,6 +3701,11 @@ impl SearchClient {
         for ranked_hit in top_docs.hits {
             let score = ranked_hit.bm25_score;
             let doc: TantivyDocument = fs_load_doc(&searcher, ranked_hit.doc_address)?;
+            let raw_content = doc
+                .get_first(fields.content)
+                .or_else(|| doc.get_first(fields.preview))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let title = if field_mask.wants_title() {
                 doc.get_first(fields.title)
                     .and_then(|v| v.as_str())
@@ -2925,11 +3715,7 @@ impl SearchClient {
                 String::new()
             };
             let content = if needs_content {
-                doc.get_first(fields.content)
-                    .or_else(|| doc.get_first(fields.preview))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
+                raw_content.to_string()
             } else {
                 String::new()
             };
@@ -2972,7 +3758,12 @@ impl SearchClient {
                 .get_first(fields.msg_idx)
                 .and_then(|v| v.as_u64())
                 .map(|i| (i + 1) as usize);
-            let content_hash = stable_hit_hash(&content, &source, line_number, created_at);
+            let hash_basis = if content.is_empty() {
+                raw_content
+            } else {
+                content.as_str()
+            };
+            let content_hash = stable_hit_hash(hash_basis, &source, line_number, created_at);
             // Provenance fields (P3.3)
             let source_id = doc
                 .get_first(fields.source_id)
@@ -3094,7 +3885,13 @@ impl SearchClient {
                 // idx is 0-indexed message index; convert to 1-indexed line number for JSONL files
                 let idx: Option<i64> = row.get_typed(8)?;
                 let line_number = idx.map(|i| (i + 1) as usize);
-                let content_hash = stable_hit_hash(&content, &source_path, line_number, created_at);
+                let hash_basis = if content.is_empty() {
+                    snippet.as_str()
+                } else {
+                    content.as_str()
+                };
+                let content_hash =
+                    stable_hit_hash(hash_basis, &source_path, line_number, created_at);
                 // SQLite FTS doesn't have provenance or workspace_original - use defaults
                 Ok(SearchHit {
                     title,
@@ -3129,10 +3926,11 @@ impl SearchClient {
         limit: usize,
         offset: usize,
         newest_first: bool,
+        field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
         let sqlite_guard = self.sqlite_guard()?;
         if let Some(conn) = sqlite_guard.as_ref() {
-            self.browse_by_date_sqlite(conn, filters, limit, offset, newest_first)
+            self.browse_by_date_sqlite(conn, filters, limit, offset, newest_first, field_mask)
         } else {
             Ok(Vec::new())
         }
@@ -3145,16 +3943,30 @@ impl SearchClient {
         limit: usize,
         offset: usize,
         newest_first: bool,
+        field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
         let order = if newest_first { "DESC" } else { "ASC" };
+        let content_expr = if field_mask.needs_content() {
+            "m.content"
+        } else if field_mask.wants_snippet() {
+            "substr(m.content, 1, 512)"
+        } else {
+            "''"
+        };
+        let title_expr = if field_mask.wants_title() {
+            "c.title"
+        } else {
+            "''"
+        };
         let mut sql =
-            "SELECT c.title, m.content, a.slug, w.path, c.source_path, m.created_at, m.idx
+            format!(
+                "SELECT {title_expr}, {content_expr}, a.slug, w.path, c.source_path, m.created_at, m.idx
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
              JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              WHERE 1=1"
-                .to_string();
+            );
         let mut params: Vec<ParamValue> = Vec::new();
 
         if !filters.agents.is_empty() {
@@ -3190,18 +4002,32 @@ impl SearchClient {
 
         let rows: Vec<SearchHit> =
             conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
-                let title: String = row.get_typed::<Option<String>>(0)?.unwrap_or_default();
-                let content: String = row.get_typed(1)?;
+                let title: String = if field_mask.wants_title() {
+                    row.get_typed::<Option<String>>(0)?.unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let raw_content: String = row.get_typed(1)?;
                 let agent: String = row.get_typed(2)?;
                 let workspace: Option<String> = row.get_typed(3)?;
                 let source_path: String = row.get_typed(4)?;
                 let created_at: Option<i64> = row.get_typed(5)?;
                 let idx: Option<i64> = row.get_typed(6)?;
                 let line_number = idx.map(|i| (i + 1) as usize);
+                let snippet = if field_mask.wants_snippet() {
+                    snippet_from_content(&raw_content)
+                } else {
+                    String::new()
+                };
+                let content = if field_mask.needs_content() {
+                    raw_content
+                } else {
+                    String::new()
+                };
                 let content_hash = stable_hit_hash(&content, &source_path, line_number, created_at);
                 Ok(SearchHit {
                     title,
-                    snippet: String::new(),
+                    snippet,
                     content,
                     content_hash,
                     score: 0.0,
@@ -3521,7 +4347,12 @@ fn maybe_spawn_warm_worker(
 }
 
 fn cached_hit_from(hit: &SearchHit) -> CachedHit {
-    let lc_content = hit.content.to_lowercase();
+    let cache_text = if hit.content.is_empty() {
+        hit.snippet.as_str()
+    } else {
+        hit.content.as_str()
+    };
+    let lc_content = cache_text.to_lowercase();
     let lc_title = (!hit.title.is_empty()).then(|| hit.title.to_lowercase());
     // Snippet is derived from content, so we don't index/bloom it separately
     let bloom64 = bloom_from_text(&lc_content, &lc_title);

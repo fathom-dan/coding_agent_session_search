@@ -900,7 +900,7 @@ use coding_agent_search::search::query::{MatchType, SearchHit};
 use coding_agent_search::sources::provenance::SourceFilter;
 use coding_agent_search::ui::app::{
     AnalyticsView, AppSurface, CassApp, CassMsg, DetailTab, DrilldownContext, FrameTimingStats,
-    InspectorTab, LayoutBreakpoint,
+    InspectorTab, LayoutBreakpoint, SearchPass,
 };
 use coding_agent_search::ui::components::palette::{
     AnalyticsTarget, PaletteResult, PaletteState, default_actions,
@@ -1717,6 +1717,8 @@ fn inline_analytics_badges_match_detail_modal_metrics() {
     ];
     let _ = app.update(CassMsg::SearchCompleted {
         generation: app.search_generation,
+        pass: SearchPass::Upgrade,
+        requested_limit: app.search_page_size.max(1),
         hits,
         elapsed_ms: 7,
         suggestions: vec![],
