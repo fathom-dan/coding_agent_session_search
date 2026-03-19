@@ -315,9 +315,10 @@ fn gate1_fts5_bulk_insert_performance() {
     for i in 0..1000 {
         conn.execute_with_params(
             "INSERT INTO perf_fts(content) VALUES (?1)",
-            &[SqliteValue::Text(format!(
-                "document number {i} with searchable content about rust programming"
-            ))],
+            &[SqliteValue::Text(
+                format!("document number {i} with searchable content about rust programming")
+                    .into(),
+            )],
         )
         .unwrap();
     }
@@ -415,7 +416,7 @@ fn gate2_file_compat_create_with_rusqlite_read_with_frankensqlite() {
     );
     assert_eq!(
         first.get(1).unwrap(),
-        &SqliteValue::Text("agent_0".to_string()),
+        &SqliteValue::Text("agent_0".into()),
         "GATE 2.3 FAIL: First row agent mismatch"
     );
 }
@@ -478,7 +479,7 @@ fn gate2_file_compat_wal_mode() {
     assert_eq!(rows.len(), 1, "GATE 2.5 FAIL: Expected 1 row from WAL DB");
     assert_eq!(
         rows[0].get(0).unwrap(),
-        &SqliteValue::Text("wal test".to_string()),
+        &SqliteValue::Text("wal test".into()),
         "GATE 2.5 FAIL: WAL data mismatch"
     );
 
@@ -524,7 +525,7 @@ fn gate2_file_compat_filtered_query() {
     let rows = conn
         .query_with_params(
             "SELECT id, content FROM msgs WHERE agent = ?1",
-            &[SqliteValue::Text("claude".to_string())],
+            &[SqliteValue::Text("claude".into())],
         )
         .expect("GATE 2.6 FAIL: Parameterized query on rusqlite DB failed");
 
@@ -558,7 +559,7 @@ fn gate2_file_compat_write_back() {
             "INSERT INTO t VALUES (?1, ?2)",
             &[
                 SqliteValue::Integer(2),
-                SqliteValue::Text("from frankensqlite".to_string()),
+                SqliteValue::Text("from frankensqlite".into()),
             ],
         )
         .expect("GATE 2.7 FAIL: Cannot write to rusqlite-created DB");
@@ -645,7 +646,7 @@ fn gate2_file_compat_cass_schema_simulation() {
     assert_eq!(convs.len(), 1);
     assert_eq!(
         convs[0].get(1).unwrap(),
-        &SqliteValue::Text("claude_code".to_string())
+        &SqliteValue::Text("claude_code".into())
     );
 
     // Read messages with join
@@ -655,10 +656,7 @@ fn gate2_file_compat_cass_schema_simulation() {
         )
         .expect("GATE 2.8 FAIL: JOIN query on cass schema failed");
     assert_eq!(msgs.len(), 2);
-    assert_eq!(
-        msgs[0].get(0).unwrap(),
-        &SqliteValue::Text("user".to_string())
-    );
+    assert_eq!(msgs[0].get(0).unwrap(), &SqliteValue::Text("user".into()));
 
     // Verify PRAGMA user_version
     let ver = conn.query("PRAGMA user_version").unwrap();
@@ -954,10 +952,7 @@ fn verify_group_by_and_order_by() {
         .unwrap();
 
     assert_eq!(rows.len(), 2);
-    assert_eq!(
-        rows[0].get(0).unwrap(),
-        &SqliteValue::Text("claude".to_string())
-    );
+    assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Text("claude".into()));
     assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Integer(2));
 }
 
@@ -1024,13 +1019,13 @@ fn verify_coalesce_and_ifnull() {
         .unwrap();
     assert_eq!(
         rows[0].get(0).unwrap(),
-        &SqliteValue::Text("fallback".to_string())
+        &SqliteValue::Text("fallback".into())
     );
 
     let rows = conn.query("SELECT IFNULL(NULL, 'default')").unwrap();
     assert_eq!(
         rows[0].get(0).unwrap(),
-        &SqliteValue::Text("default".to_string())
+        &SqliteValue::Text("default".into())
     );
 }
 
@@ -1049,7 +1044,7 @@ fn verify_begin_concurrent() {
     let rows = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
     assert_eq!(
         rows[0].get(0).unwrap(),
-        &SqliteValue::Text("concurrent".to_string()),
+        &SqliteValue::Text("concurrent".into()),
         "BEGIN CONCURRENT transaction should persist data"
     );
 }

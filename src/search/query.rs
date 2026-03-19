@@ -1030,6 +1030,17 @@ pub enum ProgressiveSearchEvent {
     },
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ProgressiveSearchRequest<'a> {
+    pub(crate) cx: &'a FsCx,
+    pub(crate) query: &'a str,
+    pub(crate) filters: SearchFilters,
+    pub(crate) limit: usize,
+    pub(crate) sparse_threshold: usize,
+    pub(crate) field_mask: FieldMask,
+    pub(crate) mode: SearchMode,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SearchHitKey {
     source_id: String,
@@ -1392,23 +1403,39 @@ struct SemanticSearchState {
 
 struct ProgressiveTwoTierContext {
     index: Arc<FsTwoTierIndex>,
-    fast_embedder: Arc<dyn Embedder>,
-    quality_embedder: Option<Arc<dyn Embedder>>,
+    fast_embedder: Arc<dyn frankensearch::Embedder>,
+    quality_embedder: Option<Arc<dyn frankensearch::Embedder>>,
 }
 
 struct SharedCassSyncEmbedder {
     inner: Arc<dyn Embedder>,
+    cache: Mutex<LruCache<String, Vec<f32>>>,
 }
 
 impl SharedCassSyncEmbedder {
     fn new(inner: Arc<dyn Embedder>) -> Self {
-        Self { inner }
+        let cache_capacity =
+            NonZeroUsize::new(PROGRESSIVE_EMBEDDING_CACHE_CAPACITY).expect("cache capacity > 0");
+        Self {
+            inner,
+            cache: Mutex::new(LruCache::new(cache_capacity)),
+        }
     }
 }
 
 impl Embedder for SharedCassSyncEmbedder {
     fn embed_sync(&self, text: &str) -> crate::search::embedder::EmbedderResult<Vec<f32>> {
-        self.inner.embed_sync(text)
+        if let Ok(mut cache) = self.cache.lock()
+            && let Some(embedding) = cache.get(text).cloned()
+        {
+            return Ok(embedding);
+        }
+
+        let embedding = self.inner.embed_sync(text)?;
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.put(text.to_owned(), embedding.clone());
+        }
+        Ok(embedding)
     }
 
     fn embed_batch_sync(
@@ -1520,6 +1547,9 @@ struct ResolvedSemanticDocId {
     message_id: u64,
     doc_id: String,
 }
+
+type ProgressiveLookupKey = (String, String, i64);
+type ResolvedSemanticLookupRow = Option<(ProgressiveLookupKey, ResolvedSemanticDocId)>;
 
 #[derive(Debug, Default, Clone)]
 struct ProgressiveLexicalCache {
@@ -2502,11 +2532,18 @@ impl SearchClient {
             fast_index.embedder_id(),
             fast_index.dimension(),
         )?;
+        let fast_embedder: Arc<dyn frankensearch::Embedder> = Arc::new(FsSyncEmbedderAdapter(
+            SharedCassSyncEmbedder::new(fast_embedder),
+        ));
         let quality_embedder = Some(self.load_embedder_for_progressive_id(
             state,
             quality_index.embedder_id(),
             quality_index.dimension(),
         )?);
+        let quality_embedder = quality_embedder.map(|embedder| {
+            Arc::new(FsSyncEmbedderAdapter(SharedCassSyncEmbedder::new(embedder)))
+                as Arc<dyn frankensearch::Embedder>
+        });
 
         let context = Arc::new(ProgressiveTwoTierContext {
             index,
@@ -2570,7 +2607,7 @@ impl SearchClient {
             return Ok(Vec::new());
         }
 
-        let lookup_keys: Vec<Option<(String, String, i64)>> = hits
+        let lookup_keys: Vec<Option<ProgressiveLookupKey>> = hits
             .iter()
             .map(|hit| {
                 let idx = hit
@@ -2584,7 +2621,7 @@ impl SearchClient {
             })
             .collect();
 
-        let unique_keys: Vec<(String, String, i64)> = {
+        let unique_keys: Vec<ProgressiveLookupKey> = {
             let mut seen = HashSet::new();
             let mut keys = Vec::new();
             for key in lookup_keys.iter().flatten() {
@@ -2621,8 +2658,8 @@ impl SearchClient {
             params.push(ParamValue::from(*line_idx));
         }
 
-        let rows: Vec<Option<((String, String, i64), ResolvedSemanticDocId)>> = conn
-            .query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+        let rows: Vec<ResolvedSemanticLookupRow> =
+            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
                 let source_id: String = row.get_typed(0)?;
                 let source_path: String = row.get_typed(1)?;
                 let idx: i64 = row.get_typed(2)?;
@@ -2914,17 +2951,20 @@ impl SearchClient {
         })
     }
 
-    pub async fn search_progressive_with_callback(
+    pub(crate) async fn search_progressive_with_callback(
         self: &Arc<Self>,
-        cx: &FsCx,
-        query: &str,
-        filters: SearchFilters,
-        limit: usize,
-        sparse_threshold: usize,
-        field_mask: FieldMask,
-        mode: SearchMode,
+        request: ProgressiveSearchRequest<'_>,
         mut on_event: impl FnMut(ProgressiveSearchEvent) + Send,
     ) -> Result<()> {
+        let ProgressiveSearchRequest {
+            cx,
+            query,
+            filters,
+            limit,
+            sparse_threshold,
+            field_mask,
+            mode,
+        } = request;
         let field_mask = effective_field_mask(field_mask);
         let limit = limit.max(1);
 
@@ -2982,21 +3022,14 @@ impl SearchClient {
             Some(loaded)
         };
 
-        let fast_embedder: Arc<dyn frankensearch::Embedder> = Arc::new(FsSyncEmbedderAdapter(
-            SharedCassSyncEmbedder::new(Arc::clone(&progressive_context.fast_embedder)),
-        ));
         let mut searcher = FsTwoTierSearcher::new(
             Arc::clone(&progressive_context.index),
-            fast_embedder,
+            Arc::clone(&progressive_context.fast_embedder),
             frankensearch_two_tier_config(),
-        )
-        .with_embedding_cache(PROGRESSIVE_EMBEDDING_CACHE_CAPACITY);
+        );
 
         if let Some(quality_embedder) = progressive_context.quality_embedder.as_ref() {
-            let quality: Arc<dyn frankensearch::Embedder> = Arc::new(FsSyncEmbedderAdapter(
-                SharedCassSyncEmbedder::new(Arc::clone(quality_embedder)),
-            ));
-            searcher = searcher.with_quality_embedder(quality);
+            searcher = searcher.with_quality_embedder(Arc::clone(quality_embedder));
         }
 
         if matches!(mode, SearchMode::Hybrid) {

@@ -12492,15 +12492,14 @@ fn run_export_html(
         let text = extract_text_content(msg);
 
         // Skip messages that would be dropped by skill filtering
-        if !include_skills {
-            if text.contains("Base directory for this skill:")
+        if !include_skills
+            && (text.contains("Base directory for this skill:")
                 || text.contains("<system-reminder>")
                 || text.contains("The following skills are available for use with the Skill tool:")
                 || (text.contains("skillInjection:") && text.contains("matchedSkills"))
-                || text.contains("<!-- skillInjection:")
-            {
-                continue;
-            }
+                || text.contains("<!-- skillInjection:"))
+        {
+            continue;
         }
 
         match role.as_str() {
@@ -12509,7 +12508,7 @@ fn run_export_html(
                 // Tool results have content as an array with tool_result type blocks.
                 let is_tool_result = msg
                     .get("message")
-                    .or_else(|| Some(msg))
+                    .or(Some(msg))
                     .and_then(|m| m.get("content"))
                     .and_then(|c| c.as_array())
                     .is_some_and(|arr| {
@@ -12526,7 +12525,7 @@ fn run_export_html(
                 // Count tool_use blocks within assistant messages
                 if let Some(content) = msg
                     .get("message")
-                    .or_else(|| Some(msg))
+                    .or(Some(msg))
                     .and_then(|m| m.get("content"))
                     .and_then(|c| c.as_array())
                 {
