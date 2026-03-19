@@ -144,7 +144,7 @@ impl TwoTierConfig {
         FsTwoTierConfig {
             quality_weight: f64::from(self.quality_weight),
             fast_only: self.fast_only,
-            ..FsTwoTierConfig::default()
+            ..FsTwoTierConfig::optimized().with_env_overrides()
         }
     }
 }

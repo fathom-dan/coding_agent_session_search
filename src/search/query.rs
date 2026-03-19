@@ -71,8 +71,8 @@ impl std::ops::Deref for SendConnection {
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use crate::search::embedder::Embedder;
 use crate::search::vector_index::{
-    ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER, SemanticDocId, SemanticFilter,
-    SemanticFilterMaps, VectorIndex, VectorSearchResult, parse_semantic_doc_id, role_code_from_str,
+    ROLE_USER, SemanticDocId, SemanticFilter, SemanticFilterMaps, VectorIndex, VectorSearchResult,
+    parse_semantic_doc_id, role_code_from_str,
 };
 
 use crate::sources::provenance::SourceFilter;
@@ -245,13 +245,14 @@ impl SemanticTierMode {
     }
 
     fn to_frankensearch_config(self) -> FsTwoTierConfig {
-        let mut config = FsTwoTierConfig::default();
+        let mut config = frankensearch_two_tier_config();
         match self {
             Self::Single | Self::Progressive => {}
             Self::FastOnly => {
                 config.fast_only = true;
             }
             Self::QualityOnly => {
+                config.fast_only = false;
                 config.quality_weight = 1.0;
             }
         }
@@ -259,9 +260,17 @@ impl SemanticTierMode {
     }
 }
 
+const PROGRESSIVE_EMBEDDING_CACHE_CAPACITY: usize = 64;
 const ANN_CANDIDATE_MULTIPLIER: usize = 4;
 const HYBRID_NO_LIMIT_PLANNING_WINDOW: usize = 64;
 const HYBRID_NO_LIMIT_SEMANTIC_CAP: usize = 2048;
+
+static FRANKENSEARCH_TWO_TIER_CONFIG: Lazy<FsTwoTierConfig> =
+    Lazy::new(|| FsTwoTierConfig::optimized().with_env_overrides());
+
+fn frankensearch_two_tier_config() -> FsTwoTierConfig {
+    FRANKENSEARCH_TWO_TIER_CONFIG.clone()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HybridCandidateBudget {
@@ -2484,7 +2493,7 @@ impl SearchClient {
         let quality_index = FsVectorIndex::open(&quality_path)
             .map_err(|err| anyhow!("open quality-tier index failed: {err}"))?;
         let index = Arc::new(
-            FsTwoTierIndex::open(&index_dir, FsTwoTierConfig::default())
+            FsTwoTierIndex::open(&index_dir, frankensearch_two_tier_config())
                 .map_err(|err| anyhow!("open progressive two-tier index failed: {err}"))?,
         );
 
@@ -2629,8 +2638,9 @@ impl SearchClient {
                     return Ok(None);
                 }
 
-                let message_id = u64::try_from(message_id_raw)
-                    .map_err(|_| anyhow!("message id out of range for progressive doc_id"))?;
+                let message_id = u64::try_from(message_id_raw).map_err(|_| {
+                    std::io::Error::other("message id out of range for progressive doc_id")
+                })?;
                 let agent_id = if agent_id_raw < 0 {
                     0
                 } else {
@@ -2978,8 +2988,9 @@ impl SearchClient {
         let mut searcher = FsTwoTierSearcher::new(
             Arc::clone(&progressive_context.index),
             fast_embedder,
-            FsTwoTierConfig::default(),
-        );
+            frankensearch_two_tier_config(),
+        )
+        .with_embedding_cache(PROGRESSIVE_EMBEDDING_CACHE_CAPACITY);
 
         if let Some(quality_embedder) = progressive_context.quality_embedder.as_ref() {
             let quality: Arc<dyn frankensearch::Embedder> = Arc::new(FsSyncEmbedderAdapter(
@@ -3002,7 +3013,6 @@ impl SearchClient {
         let phase_client = Arc::clone(self);
         let phase_filters = filters.clone();
         let phase_cache = Arc::clone(&lexical_cache);
-        let phase_cx = cx.clone();
         let mut phase_error: Option<anyhow::Error> = None;
 
         let search_result = searcher
@@ -3054,7 +3064,7 @@ impl SearchClient {
                     Ok(event) => on_event(event),
                     Err(err) => {
                         phase_error = Some(err);
-                        phase_cx.cancel_fast(asupersync::CancelKind::User);
+                        cx.set_cancel_requested(true);
                     }
                 }
             })
