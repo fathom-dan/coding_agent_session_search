@@ -4149,34 +4149,51 @@ fn state_meta_json(
     let mut message_count: i64 = 0;
     let mut last_indexed_at: Option<i64> = None;
     let mut db_opened = false;
+    let mut db_open_error: Option<String> = None;
 
     // Use LazyFrankenDb to get timing/logging for state snapshot DB access
     let lazy = crate::storage::sqlite::LazyFrankenDb::new(db_path.to_path_buf());
-    if allow_db_open
-        && db_exists
-        && let Ok(conn) = lazy.get("state-meta")
-    {
-        use frankensqlite::compat::{ConnectionExt, RowExt};
-        use frankensqlite::params;
-        db_opened = true;
-        conversation_count = conn
-            .query_row_map("SELECT COUNT(*) FROM conversations", params![], |r| {
-                r.get_typed(0)
-            })
-            .unwrap_or(0);
-        message_count = conn
-            .query_row_map("SELECT COUNT(*) FROM messages", params![], |r| {
-                r.get_typed(0)
-            })
-            .unwrap_or(0);
-        last_indexed_at = conn
-            .query_row_map(
-                "SELECT value FROM meta WHERE key = 'last_indexed_at'",
-                params![],
-                |r| r.get_typed::<String>(0),
-            )
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok());
+    if allow_db_open && db_exists {
+        match lazy.get("state-meta") {
+            Ok(conn) => {
+                use frankensqlite::compat::{ConnectionExt, RowExt};
+                use frankensqlite::params;
+                db_opened = true;
+                conversation_count = conn
+                    .query_row_map("SELECT COUNT(*) FROM conversations", params![], |r| {
+                        r.get_typed(0)
+                    })
+                    .unwrap_or(0);
+                message_count = conn
+                    .query_row_map("SELECT COUNT(*) FROM messages", params![], |r| {
+                        r.get_typed(0)
+                    })
+                    .unwrap_or(0);
+                last_indexed_at = conn
+                    .query_row_map(
+                        "SELECT value FROM meta WHERE key = 'last_indexed_at'",
+                        params![],
+                        |r| r.get_typed::<String>(0),
+                    )
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok());
+            }
+            Err(e) => {
+                // Capture the open error for structured reporting (e.g. WAL corruption).
+                // Do not panic — the health check must always return valid JSON.
+                let msg = e.to_string();
+                db_open_error = Some(if msg.contains("salt")
+                    || msg.contains("WAL")
+                    || msg.contains("wal")
+                    || msg.contains("corrupt")
+                    || msg.contains("Corrupt")
+                {
+                    format!("WAL frame salt mismatch - database may need recovery: {msg}")
+                } else {
+                    msg
+                });
+            }
+        }
     }
 
     if last_indexed_at.is_none() && index_exists {
@@ -4234,7 +4251,8 @@ fn state_meta_json(
             "exists": db_exists,
             "opened": db_opened,
             "conversations": conversation_count,
-            "messages": message_count
+            "messages": message_count,
+            "open_error": db_open_error
         },
         "pending": {
             "sessions": pending_sessions,
@@ -8153,6 +8171,9 @@ fn run_status(
 
 /// Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy.
 /// Designed for agent pre-flight checks before complex operations.
+///
+/// Invariant: when --json is requested, this function ALWAYS emits valid JSON
+/// to stdout before returning, even if the database is corrupt or WAL-damaged.
 fn run_health(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
@@ -8182,15 +8203,51 @@ fn run_health(
         .and_then(|d| d.get("exists"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let db_opened = state
+        .get("database")
+        .and_then(|d| d.get("opened"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // Extract any DB open error (e.g. WAL corruption) captured by state_meta_json.
+    let db_open_error: Option<String> = state
+        .get("database")
+        .and_then(|d| d.get("open_error"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let pending_sessions = state
         .get("pending")
         .and_then(|p| p.get("sessions"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    // Core operational health: can the tool be used at all?
-    // Freshness and pending sessions are informational (reported in state) but don't prevent searching
-    let healthy = db_exists && index_exists;
+    // Core operational health: the DB must exist AND be openable.
+    // A DB that exists on disk but cannot be opened (e.g. WAL corruption) is NOT healthy.
+    // Freshness and pending sessions are informational but don't block basic operation.
+    // If DB exists but couldn't be opened, it is degraded.
+    let db_degraded = db_exists && !db_opened;
+    let healthy = db_exists && db_opened && index_exists;
+
+    // Collect structured errors for the JSON response.
+    let mut errors: Vec<String> = Vec::new();
+    if let Some(ref err) = db_open_error {
+        errors.push(err.clone());
+    }
+    if !db_exists {
+        errors.push("database not found".to_string());
+    }
+    if !index_exists {
+        errors.push("index not found".to_string());
+    }
+
+    // Determine status string for structured output.
+    let status = if healthy {
+        "healthy"
+    } else if db_degraded {
+        "degraded"
+    } else {
+        "unhealthy"
+    };
+
     let latency_ms = start.elapsed().as_millis() as u64;
 
     let structured_format = if json {
@@ -8207,9 +8264,20 @@ fn run_health(
     });
 
     if let Some(fmt) = structured_format {
+        // Always emit valid JSON — even on WAL corruption or other DB errors.
+        // This is the core invariant for --json mode.
         let payload = serde_json::json!({
+            "status": status,
             "healthy": healthy,
+            "errors": errors,
             "latency_ms": latency_ms,
+            "db": {
+                "exists": db_exists,
+                "opened": db_opened,
+                "conversations": state.get("database").and_then(|d| d.get("conversations")).cloned().unwrap_or(serde_json::Value::Null),
+                "messages": state.get("database").and_then(|d| d.get("messages")).cloned().unwrap_or(serde_json::Value::Null),
+                "open_error": db_open_error
+            },
             "state": state
         });
         output_structured_value(payload, fmt)?;
@@ -8222,6 +8290,12 @@ fn run_health(
         if pending_sessions > 0 {
             println!("  Note: {pending_sessions} sessions pending reindex");
         }
+    } else if db_degraded {
+        println!("⚠ Degraded ({latency_ms}ms) - database exists but could not be opened");
+        for err in &errors {
+            println!("  - {err}");
+        }
+        println!("Run 'cass doctor --fix' or 'cass index --full' to attempt recovery.");
     } else {
         println!("✗ Unhealthy ({latency_ms}ms)");
         if !db_exists {
@@ -8235,6 +8309,21 @@ fn run_health(
 
     if healthy {
         Ok(())
+    } else if db_degraded {
+        Err(CliError {
+            code: 1,
+            kind: "health",
+            message: format!(
+                "Database degraded: {}",
+                db_open_error
+                    .as_deref()
+                    .unwrap_or("could not open database")
+            ),
+            hint: Some(
+                "Run 'cass doctor --fix' or 'cass index --full' to attempt recovery.".to_string(),
+            ),
+            retryable: false,
+        })
     } else {
         Err(CliError {
             code: 1,
