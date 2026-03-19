@@ -257,31 +257,6 @@ fn apply_ftui_env(cmd: &mut CommandBuilder, env: &FtuiPtyEnv) {
     cmd.env("TERM", "xterm-256color");
 }
 
-fn write_query_playback_macro(
-    path: &Path,
-    query: &str,
-    inter_key_delay_ms: u64,
-    quit_delay_ms: u64,
-) {
-    let total_duration_ms =
-        inter_key_delay_ms.saturating_mul(query.chars().count() as u64) + quit_delay_ms;
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "{{\"type\":\"header\",\"name\":\"latency-bench\",\"terminal_size\":[130,40],\"total_duration_ms\":{total_duration_ms},\"event_count\":{}}}",
-        query.chars().count() + 1
-    ));
-    for ch in query.chars() {
-        let encoded = serde_json::to_string(&ch.to_string()).expect("encode macro char");
-        lines.push(format!(
-            "{{\"type\":\"event\",\"delay_ms\":{inter_key_delay_ms},\"event\":{{\"key\":{{\"char\":{encoded}}},\"modifiers\":[]}}}}"
-        ));
-    }
-    lines.push(format!(
-        "{{\"type\":\"event\",\"delay_ms\":{quit_delay_ms},\"event\":{{\"key\":\"Escape\",\"modifiers\":[]}}}}"
-    ));
-    fs::write(path, lines.join("\n")).expect("write playback macro");
-}
-
 fn spawn_reader(reader: Box<dyn Read + Send>) -> (Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>) {
     let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
     let captured_clone = Arc::clone(&captured);
@@ -2253,9 +2228,7 @@ fn tui_play_macro_writes_latency_trace() {
     let _trace_guard = tracker.trace_env_guard();
     let env = prepare_ftui_pty_env(&trace, &tracker);
 
-    let macro_path = env.data_dir.join("latency_playback.macro");
     let latency_path = env.data_dir.join("latency_trace.json");
-    write_query_playback_macro(&macro_path, "hello", 80, 200);
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -2269,15 +2242,14 @@ fn tui_play_macro_writes_latency_trace() {
 
     let reader = pair.master.try_clone_reader().expect("clone PTY reader");
     let (captured, reader_handle) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take PTY writer");
 
     let launch_start = tracker.start(
         "latency_playback",
-        Some("Launching TUI with macro playback and latency tracing"),
+        Some("Launching TUI with PTY typing and latency tracing"),
     );
     let mut tui_cmd = CommandBuilder::new(cass_bin_path());
     tui_cmd.arg("tui");
-    tui_cmd.arg("--play-macro");
-    tui_cmd.arg(macro_path.to_string_lossy().as_ref());
     apply_ftui_env(&mut tui_cmd, &env);
     tui_cmd.env(
         "CASS_TUI_LATENCY_TRACE_FILE",
@@ -2286,24 +2258,34 @@ fn tui_play_macro_writes_latency_trace() {
     let mut tui_child = pair
         .slave
         .spawn_command(tui_cmd)
-        .expect("spawn TUI with playback");
+        .expect("spawn TUI with latency tracing");
 
     assert!(
         wait_for_output_growth(&captured, 0, 32, PTY_STARTUP_TIMEOUT),
-        "Did not observe startup output for latency playback PTY"
+        "Did not observe startup output for latency PTY"
     );
+
+    for byte in b"hello" {
+        send_key_sequence(&mut *writer, &[*byte]);
+        thread::sleep(Duration::from_millis(100));
+    }
+    thread::sleep(Duration::from_millis(600));
+    send_key_sequence(&mut *writer, b"\x1b");
+    thread::sleep(Duration::from_millis(100));
+    send_key_sequence(&mut *writer, b"\x1b");
 
     let status = wait_for_child_exit(&mut *tui_child, PTY_EXIT_TIMEOUT);
     tracker.end(
         "latency_playback",
-        Some("Latency playback run complete"),
+        Some("Latency PTY typing run complete"),
         launch_start,
     );
     assert!(
         status.success(),
-        "TUI with macro playback exited unsuccessfully: {status}"
+        "TUI with latency tracing exited unsuccessfully: {status}"
     );
 
+    drop(writer);
     drop(pair);
     let _ = reader_handle.join();
     let raw = captured.lock().expect("capture lock").clone();

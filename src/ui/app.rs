@@ -2033,6 +2033,18 @@ fn latency_trace_recorder_from_env() -> anyhow::Result<Option<Arc<Mutex<TuiLaten
     )))))
 }
 
+fn exit_after_macro_playback_from_env() -> bool {
+    dotenvy::var("CASS_TUI_EXIT_AFTER_PLAYBACK")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Runtime evidence snapshots (1mfw3.2.3)
 // ---------------------------------------------------------------------------
@@ -15025,9 +15037,7 @@ impl super::ftui_adapter::Model for CassApp {
                     params.limit,
                 );
                 self.search_dirty_since = None;
-                if let Some(service) = self.progressive_search_service.clone()
-                    && progressive
-                {
+                if self.progressive_search_service.is_some() && progressive {
                     self.search_generation = generation;
                     self.search_backend_offset = 0;
                     self.search_has_more = false;
@@ -17719,6 +17729,9 @@ impl super::ftui_adapter::Model for CassApp {
                                 "Macro playback complete",
                             ));
                         self.status = "Macro playback finished".to_string();
+                        if exit_after_macro_playback_from_env() {
+                            cmds.push(ftui::Cmd::quit());
+                        }
                     }
                 }
                 // Pick up screenshot buffer captured during view().
