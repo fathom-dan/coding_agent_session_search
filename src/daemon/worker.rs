@@ -80,8 +80,6 @@ impl EmbeddingWorkerHandle {
 pub struct EmbeddingWorker {
     receiver: Receiver<WorkerMessage>,
     cancel_flag: Arc<AtomicBool>,
-    /// db_path of the currently-running job (if any), used to scope cancellation.
-    current_job_db: std::sync::Mutex<Option<String>>,
 }
 
 fn message_id_from_db(raw: i64) -> Option<u64> {
@@ -137,7 +135,6 @@ impl EmbeddingWorker {
         let worker = Self {
             receiver,
             cancel_flag,
-            current_job_db: std::sync::Mutex::new(None),
         };
         (worker, handle)
     }
@@ -149,18 +146,10 @@ impl EmbeddingWorker {
             match msg {
                 WorkerMessage::Submit(config) => {
                     self.cancel_flag.store(false, Ordering::SeqCst);
-                    *self
-                        .current_job_db
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(config.db_path.clone());
                     info!(db_path = %config.db_path, two_tier = config.two_tier, "Processing embedding job");
                     if let Err(e) = self.process_job(&config) {
                         error!(db_path = %config.db_path, error = %e, "Embedding job failed");
                     }
-                    *self
-                        .current_job_db
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = None;
                 }
                 WorkerMessage::Cancel { db_path, model_id } => {
                     // The cancel_flag is already set by the handle (so the running

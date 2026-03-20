@@ -5276,7 +5276,25 @@ mod tests {
         quality_writer.finish()?;
         drop(storage);
 
-        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("db-backed client");
+        let reader = fs_cass_open_search_reader(dir.path(), ReloadPolicy::Manual).ok();
+        let client = SearchClient {
+            reader,
+            sqlite: Mutex::new(Some(SendConnection(Connection::open(
+                db_path.to_string_lossy().into_owned(),
+            )?))),
+            sqlite_path: Some(db_path.clone()),
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{}|schema:{}", CACHE_KEY_VERSION, FS_CASS_SCHEMA_HASH),
+            semantic: Mutex::new(None),
+        };
         let semantic_embedder: Arc<dyn Embedder> = fast_embedder;
         client.set_semantic_context(
             semantic_embedder,
