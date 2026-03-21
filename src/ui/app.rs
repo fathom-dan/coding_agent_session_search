@@ -112,7 +112,7 @@ use crate::model::types::MessageRole;
 use crate::search::model_manager::SemanticAvailability;
 use crate::search::query::{MatchType, QuerySuggestion, SearchFilters, SearchHit, SearchMode};
 use crate::sources::provenance::SourceFilter;
-use crate::storage::sqlite::SqliteStorage;
+use crate::storage::sqlite::FrankenStorage;
 use crate::ui::components::export_modal::{ExportField, ExportModalState, ExportProgress};
 use crate::ui::components::palette::{
     AnalyticsTarget, InputModeTarget, PaletteMatchMode, PaletteResult, PaletteState,
@@ -4648,7 +4648,7 @@ pub struct CassApp {
     /// SQLite database path used for indexing/search operations.
     pub db_path: PathBuf,
     /// Database reader (initialized on first use).
-    pub db_reader: Option<Arc<SqliteStorage>>,
+    pub db_reader: Option<Arc<FrankenStorage>>,
     /// Known workspace list (populated on first filter prompt).
     pub known_workspaces: Option<Vec<String>>,
     /// Search service for async query dispatch.
@@ -15845,7 +15845,7 @@ impl super::ftui_adapter::Model for CassApp {
             }
             CassMsg::DetailLoadRequested { source_path } => {
                 let loaded_path = source_path.clone();
-                match crate::storage::sqlite::SqliteStorage::open_readonly(&self.db_path) {
+                match crate::storage::sqlite::FrankenStorage::open_readonly(&self.db_path) {
                     Ok(db) => match load_conversation(&db, &source_path) {
                         Ok(Some(view)) => {
                             self.cached_detail = Some((loaded_path.clone(), view));
@@ -18315,9 +18315,8 @@ impl super::ftui_adapter::Model for CassApp {
 
                                 if should_auto_rebuild {
                                     tracing::info!("analytics auto-rebuild triggered");
-                                    // rebuild_analytics() requires rusqlite SqliteStorage
-                                    match crate::storage::sqlite::SqliteStorage::open(&db_path) {
-                                        Ok(mut db_rw) => match db_rw.rebuild_analytics() {
+                                    match crate::storage::sqlite::FrankenStorage::open(&db_path) {
+                                        Ok(db_rw) => match db_rw.rebuild_analytics() {
                                             Ok(_) => {
                                                 // Re-open with FrankenStorage to load refreshed data
                                                 match crate::storage::sqlite::FrankenStorage::open_readonly(&db_path) {
@@ -20477,11 +20476,11 @@ fn export_session_task(
     use crate::html_export::{
         ExportOptions as HtmlExportOptions, HtmlExporter, Message as HtmlMessage, TemplateMetadata,
     };
-    use crate::storage::sqlite::SqliteStorage;
+    use crate::storage::sqlite::FrankenStorage;
     use crate::ui::data::load_conversation_uncached;
     use chrono::DateTime;
 
-    let storage = match SqliteStorage::open_readonly(db_path) {
+    let storage = match FrankenStorage::open_readonly(db_path) {
         Ok(s) => s,
         Err(e) => return CassMsg::ExportFailed(format!("Failed to open database: {e}")),
     };
@@ -26758,25 +26757,24 @@ mod tests {
 
     #[test]
     fn export_session_html_task_preserves_existing_file_on_collision() {
-        use crate::storage::sqlite::SqliteStorage;
+        use crate::storage::sqlite::FrankenStorage;
         let tmp = tempfile::TempDir::new().expect("tempdir");
 
         // Setup mock DB
         let db_path = tmp.path().join("cass.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
+        let storage = FrankenStorage::open(&db_path).unwrap();
 
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)", []).unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)").unwrap();
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) 
              VALUES (1, 1, 'ext', 'Test', '/fake/session.jsonl', 'local', 10)",
-             []
         ).unwrap();
         conn.execute(
-            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'hello')", []
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'hello')"
         ).unwrap();
         conn.execute(
-            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 1, 1, 'assistant', 'hi')", []
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 1, 1, 'assistant', 'hi')"
         ).unwrap();
 
         let session_path = "/fake/session.jsonl";
@@ -27943,7 +27941,8 @@ mod tests {
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("analytics_loading.db");
-        let storage = SqliteStorage::open(&db_path).expect("open sqlite for analytics test");
+        let storage =
+            FrankenStorage::open(&db_path).expect("open frankensqlite for analytics test");
         app.db_reader = Some(Arc::new(storage));
 
         let cmd = app.schedule_analytics_reload();
@@ -28018,7 +28017,7 @@ mod tests {
     fn analytics_entered_sets_loading_context_when_cache_empty() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("analytics_enter.db");
-        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
+        let storage = FrankenStorage::open(&db_path).expect("open frankensqlite");
         let mut app = CassApp::default();
         app.db_reader = Some(Arc::new(storage));
         app.analytics_cache = None;

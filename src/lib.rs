@@ -3800,7 +3800,7 @@ fn run_analytics_rebuild(
     // Progress diagnostics go to stderr.
     eprintln!("Rebuilding analytics (Track A)...");
 
-    let mut storage = SqliteStorage::open(&db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
         code: 9,
         kind: "db-error",
         message: format!("Failed to open database: {e}"),
@@ -8496,7 +8496,7 @@ fn rebuild_tantivy_from_db(
     use crate::model::types::MessageRole;
     use crate::search::tantivy::TantivyIndex;
     use crate::sources::provenance::{LOCAL_SOURCE_ID, SourceKind};
-    use crate::storage::sqlite::SqliteStorage;
+    use crate::storage::sqlite::FrankenStorage;
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
 
@@ -11466,7 +11466,7 @@ fn try_load_indexed_conversation_from_db(
     if !db_path.exists() {
         return None;
     }
-    let storage = crate::storage::sqlite::SqliteStorage::open(db_path).ok()?;
+    let storage = crate::storage::sqlite::FrankenStorage::open(db_path).ok()?;
     crate::ui::data::load_conversation(&storage, &source_path.to_string_lossy()).ok()?
 }
 

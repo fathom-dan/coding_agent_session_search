@@ -130,7 +130,7 @@ pub fn key_add_password(
     let mut config = load_config(archive_dir)?;
 
     // Unlock with current password to get DEK
-    let mut dek = unwrap_dek_with_password(&config, current_password)?;
+    let mut dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, current_password)?);
 
     // Create new slot (use max ID + 1 since IDs are stable after revocation)
     // If no slots exist, start at 0; otherwise use max + 1
@@ -141,9 +141,6 @@ pub fn key_add_password(
         None => 0,
     };
     let new_slot = create_password_slot(new_password, &dek, &config.export_id, slot_id)?;
-
-    // Zeroize DEK before any potential early return
-    dek.zeroize();
 
     config.key_slots.push(new_slot);
 
@@ -167,7 +164,7 @@ pub fn key_add_recovery(
     let mut config = load_config(archive_dir)?;
 
     // Unlock with current password to get DEK
-    let mut dek = unwrap_dek_with_password(&config, current_password)?;
+    let mut dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, current_password)?);
 
     // Generate recovery secret
     let secret = RecoverySecret::generate();
@@ -181,9 +178,6 @@ pub fn key_add_recovery(
         None => 0,
     };
     let new_slot = create_recovery_slot(secret.as_bytes(), &dek, &config.export_id, slot_id)?;
-
-    // Zeroize DEK before any potential early return
-    dek.zeroize();
 
     config.key_slots.push(new_slot);
 
@@ -209,16 +203,14 @@ pub fn key_revoke(
 
     // Safety: Cannot revoke last slot
     if config.key_slots.len() <= 1 {
-        bail!("Cannot revoke the last remaining key slot");
+        anyhow::bail!("Cannot revoke the last remaining key slot. Add another key first.");
     }
 
     // Find which slot authenticates with this password
-    let (auth_slot_id, mut dek) = unwrap_dek_with_slot_id(&config, current_password)?;
+    let (auth_slot_id, dek) = unwrap_dek_with_slot_id(&config, current_password)?;
+    let mut _dek = zeroize::Zeroizing::new(dek); // Zeroize on drop
 
-    // Zeroize DEK immediately - we only needed to verify the password works
-    dek.zeroize();
-
-    // Safety: Cannot revoke slot used for authentication
+    // Verify they aren't trying to revoke the slot they are currently using
     if auth_slot_id == slot_id_to_revoke {
         bail!(
             "Cannot revoke slot {} used for authentication. Use a different password.",
@@ -260,15 +252,15 @@ pub fn key_rotate(
     let config = load_config(archive_dir)?;
 
     // 1. Decrypt payload with old password
-    let mut old_dek = unwrap_dek_with_password(&config, old_password)?;
-    let plaintext = decrypt_all_chunks(archive_dir, &old_dek, &config, |p| progress(p * 0.5))?;
+    let mut old_dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, old_password)?);
+    let plaintext = zeroize::Zeroizing::new(decrypt_all_chunks(archive_dir, &old_dek, &config, |p| progress(p * 0.5))?;
 
     // 2. Generate new DEK and export_id
-    let mut new_dek = [0u8; 32];
+    let mut new_dek = zeroize::Zeroizing::new([0u8; 32]);
     let mut new_export_id = [0u8; 16];
     let mut new_base_nonce = [0u8; 12];
     let mut rng = rand::rng();
-    rng.fill_bytes(&mut new_dek);
+    rng.fill_bytes(new_dek.as_mut());
     rng.fill_bytes(&mut new_export_id);
     rng.fill_bytes(&mut new_base_nonce);
 
@@ -328,14 +320,7 @@ pub fn key_rotate(
     // 6. Regenerate integrity.json
     regenerate_integrity_manifest(archive_dir)?;
 
-    // 7. Zeroize sensitive key material
-    old_dek.zeroize();
-    new_dek.zeroize();
-
-    info!("Key rotation complete");
     Ok(RotateResult {
-        new_dek_created_at: Utc::now(),
-        slot_count: new_slots.len(),
         recovery_secret: recovery_secret_encoded,
     })
 }
@@ -357,9 +342,8 @@ fn unwrap_dek_with_password(config: &EncryptionConfig, password: &str) -> Result
         let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
         let nonce = BASE64_STANDARD.decode(&slot.nonce)?;
 
-        if let Ok(mut kek) = derive_kek_argon2id(password, &salt) {
+        if let Ok(kek) = derive_kek_argon2id(password, &salt) {
             let result = unwrap_key(&kek, &wrapped_dek, &nonce, &export_id, slot.id);
-            kek.zeroize(); // Always zeroize KEK after use
             if let Ok(dek) = result {
                 return Ok(dek);
             }
@@ -382,9 +366,8 @@ fn unwrap_dek_with_slot_id(config: &EncryptionConfig, password: &str) -> Result<
         let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
         let nonce = BASE64_STANDARD.decode(&slot.nonce)?;
 
-        if let Ok(mut kek) = derive_kek_argon2id(password, &salt) {
+        if let Ok(kek) = derive_kek_argon2id(password, &salt) {
             let result = unwrap_key(&kek, &wrapped_dek, &nonce, &export_id, slot.id);
-            kek.zeroize(); // Always zeroize KEK after use
             if let Ok(dek) = result {
                 return Ok((slot.id, dek));
             }
@@ -395,7 +378,7 @@ fn unwrap_dek_with_slot_id(config: &EncryptionConfig, password: &str) -> Result<
 }
 
 /// Derive KEK from password using Argon2id
-fn derive_kek_argon2id(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
+fn derive_kek_argon2id(password: &str, salt: &[u8]) -> Result<zeroize::Zeroizing<[u8; 32]>> {
     let params = Params::new(
         ARGON2_MEMORY_KB,
         ARGON2_ITERATIONS,
@@ -406,19 +389,19 @@ fn derive_kek_argon2id(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
 
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
-    let mut kek = [0u8; 32];
+    let mut kek = zeroize::Zeroizing::new([0u8; 32]);
     argon2
-        .hash_password_into(password.as_bytes(), salt, &mut kek)
-        .map_err(|e| anyhow::anyhow!("Argon2id derivation failed: {}", e))?;
+        .hash_password_into(password.as_bytes(), salt, kek.as_mut())
+        .map_err(|e| anyhow::anyhow!("Argon2 derivation failed: {:?}", e))?;
 
     Ok(kek)
 }
 
 /// Derive KEK from recovery secret using HKDF-SHA256
-fn derive_kek_hkdf(secret: &[u8], salt: &[u8]) -> Result<[u8; 32]> {
+fn derive_kek_hkdf(secret: &[u8], salt: &[u8]) -> Result<zeroize::Zeroizing<[u8; 32]>> {
     let hkdf = Hkdf::<Sha256>::new(Some(salt), secret);
-    let mut kek = [0u8; 32];
-    hkdf.expand(b"cass-pages-kek-v2", &mut kek)
+    let mut kek = zeroize::Zeroizing::new([0u8; 32]);
+    hkdf.expand(b"cass-pages-kek-v2", kek.as_mut())
         .map_err(|_| anyhow::anyhow!("HKDF expansion failed"))?;
     Ok(kek)
 }
@@ -467,13 +450,10 @@ fn create_password_slot(
     rng.fill_bytes(&mut salt);
 
     // Derive KEK from password
-    let mut kek = derive_kek_argon2id(password, &salt)?;
+    let kek = derive_kek_argon2id(password, &salt)?;
 
     // Wrap DEK
     let result = wrap_key(&kek, dek, &export_id, slot_id);
-
-    // Zeroize KEK immediately after use
-    kek.zeroize();
 
     let (wrapped_dek, nonce) = result?;
 
@@ -503,13 +483,10 @@ fn create_recovery_slot(
     rng.fill_bytes(&mut salt);
 
     // Derive KEK from recovery secret
-    let mut kek = derive_kek_hkdf(secret, &salt)?;
+    let kek = derive_kek_hkdf(secret, &salt)?;
 
     // Wrap DEK
     let result = wrap_key(&kek, dek, &export_id, slot_id);
-
-    // Zeroize KEK immediately after use
-    kek.zeroize();
 
     let (wrapped_dek, nonce) = result?;
 

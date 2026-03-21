@@ -268,7 +268,7 @@ impl EmbeddingWorker {
     /// Generate embeddings for messages and save the vector index.
     fn generate_embeddings_and_save(
         &self,
-        storage: &SqliteStorage,
+        storage: &FrankenStorage,
         messages: &[crate::storage::sqlite::MessageForEmbedding],
         model_name: &str,
         use_semantic: bool,

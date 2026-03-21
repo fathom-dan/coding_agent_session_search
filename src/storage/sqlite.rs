@@ -4087,6 +4087,349 @@ fn franken_update_conversation_token_summaries_in_tx(
     Ok(())
 }
 
+impl FrankenStorage {
+    /// Rebuild analytics tables (message_metrics + rollups) from existing
+    /// messages in the database. Does NOT re-parse raw agent session files.
+    pub fn rebuild_analytics(&self) -> Result<AnalyticsRebuildResult> {
+        let start = Instant::now();
+
+        let total_messages: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
+        tracing::info!(
+            target: "cass::analytics",
+            total_messages,
+            "analytics_rebuild_start"
+        );
+
+        let mut tx = self.conn.transaction()?;
+
+        tx.execute("DELETE FROM message_metrics", [])?;
+        tx.execute("DELETE FROM usage_hourly", [])?;
+        tx.execute("DELETE FROM usage_daily", [])?;
+        tx.execute("DELETE FROM usage_models_daily", [])?;
+
+        const CHUNK_SIZE: i64 = 10_000;
+        let mut offset: i64 = 0;
+        let mut total_inserted: usize = 0;
+        let mut usage_hourly_rows: usize = 0;
+        let mut usage_daily_rows: usize = 0;
+        let mut usage_models_daily_rows: usize = 0;
+
+        loop {
+            #[allow(clippy::type_complexity)]
+            let rows: Vec<(
+                i64,
+                String,
+                String,
+                Option<serde_json::Value>,
+                Option<i64>,
+                Option<i64>,
+                String,
+                Option<i64>,
+                String,
+            )> = tx.query_map_collect(
+                "SELECT m.id, m.idx, m.role, m.content, m.extra_json, m.extra_bin,
+                        m.created_at,
+                        c.id AS conv_id, c.started_at AS conv_started_at,
+                        c.source_id, c.workspace_id,
+                        a.slug AS agent_slug
+                 FROM messages m
+                 JOIN conversations c ON m.conversation_id = c.id
+                 JOIN agents a ON c.agent_id = a.id
+                 ORDER BY m.id
+                 LIMIT ?1 OFFSET ?2",
+                fparams![CHUNK_SIZE, offset],
+                |row| {
+                    let msg_id: i64 = row.get_typed(0)?;
+                    let role: String = row.get_typed(2)?;
+                    let content: String = row.get_typed(3)?;
+                    let extra_json = row
+                        .get_typed::<Option<String>>(4)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .or_else(|| {
+                            row.get_typed::<Option<Vec<u8>>>(5)
+                                .ok()
+                                .flatten()
+                                .and_then(|b| rmp_serde::from_slice(&b).ok())
+                        });
+                    let msg_ts: Option<i64> = row.get_typed(6)?;
+                    let conv_started_at: Option<i64> = row.get_typed(8)?;
+                    let source_id: String = row.get_typed(9)?;
+                    let workspace_id: Option<i64> = row.get_typed(10)?;
+                    let agent_slug: String = row.get_typed(11)?;
+                    let effective_ts = msg_ts.or(conv_started_at).unwrap_or(0);
+
+                    Ok((
+                        msg_id,
+                        role,
+                        content,
+                        extra_json,
+                        Some(effective_ts),
+                        workspace_id,
+                        source_id,
+                        conv_started_at,
+                        agent_slug,
+                    ))
+                },
+            )?;
+
+            if rows.is_empty() {
+                break;
+            }
+
+            let chunk_len = rows.len();
+            let mut entries = Vec::with_capacity(chunk_len);
+            let mut rollup_agg = AnalyticsRollupAggregator::new();
+
+            for (
+                msg_id,
+                role,
+                content,
+                extra_json,
+                effective_ts,
+                workspace_id,
+                source_id,
+                _conv_started_at,
+                agent_slug,
+            ) in &rows
+            {
+                let ts = effective_ts.unwrap_or(0);
+                let day_id = Self::day_id_from_millis(ts);
+                let hour_id = Self::hour_id_from_millis(ts);
+                let content_chars = content.len() as i64;
+                let content_tokens_est = content_chars / 4;
+                let extra = extra_json
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let usage =
+                    crate::connectors::extract_tokens_for_agent(agent_slug, &extra, content, role);
+                let model_info = usage
+                    .model_name
+                    .as_deref()
+                    .map(crate::connectors::normalize_model);
+                let model_family = model_info
+                    .as_ref()
+                    .map(|i| i.family.clone())
+                    .unwrap_or_else(|| "unknown".into());
+                let model_tier = model_info
+                    .as_ref()
+                    .map(|i| i.tier.clone())
+                    .unwrap_or_else(|| "unknown".into());
+                let provider = usage
+                    .provider
+                    .clone()
+                    .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
+                    .unwrap_or_else(|| "unknown".into());
+
+                let entry = MessageMetricsEntry {
+                    message_id: *msg_id,
+                    created_at_ms: ts,
+                    hour_id,
+                    day_id,
+                    agent_slug: agent_slug.clone(),
+                    workspace_id: workspace_id.unwrap_or(0),
+                    source_id: source_id.clone(),
+                    role: role.clone(),
+                    content_chars,
+                    content_tokens_est,
+                    model_name: usage.model_name.clone(),
+                    model_family,
+                    model_tier,
+                    provider,
+                    api_input_tokens: usage.input_tokens,
+                    api_output_tokens: usage.output_tokens,
+                    api_cache_read_tokens: usage.cache_read_tokens,
+                    api_cache_creation_tokens: usage.cache_creation_tokens,
+                    api_thinking_tokens: usage.thinking_tokens,
+                    api_service_tier: usage.service_tier,
+                    api_data_source: usage.data_source.as_str().to_string(),
+                    tool_call_count: usage.tool_call_count as i64,
+                    has_tool_calls: usage.has_tool_calls,
+                    has_plan: has_plan_for_role(role, content),
+                };
+                rollup_agg.record(&entry);
+                entries.push(entry);
+            }
+
+            total_inserted += franken_insert_message_metrics_batched_in_tx(&tx, &entries)?;
+            let (hourly, daily, models_daily) =
+                franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
+            usage_hourly_rows += hourly;
+            usage_daily_rows += daily;
+            usage_models_daily_rows += models_daily;
+            offset += chunk_len as i64;
+
+            tracing::debug!(
+                target: "cass::analytics",
+                offset,
+                chunk = chunk_len,
+                inserted = entries.len(),
+                total = total_inserted,
+                "analytics_rebuild_chunk"
+            );
+
+            if (chunk_len as i64) < CHUNK_SIZE {
+                break;
+            }
+        }
+
+        tx.commit()?;
+
+        let elapsed = start.elapsed();
+        let elapsed_ms = elapsed.as_millis() as u64;
+        let msgs_per_sec = if elapsed_ms > 0 {
+            (total_inserted as f64) / (elapsed_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        tracing::info!(
+            target: "cass::analytics",
+            message_metrics_rows = total_inserted,
+            usage_hourly_rows,
+            usage_daily_rows,
+            usage_models_daily_rows,
+            elapsed_ms,
+            messages_per_sec = format!("{:.0}", msgs_per_sec),
+            "analytics_rebuild_complete"
+        );
+
+        Ok(AnalyticsRebuildResult {
+            message_metrics_rows: total_inserted,
+            usage_hourly_rows,
+            usage_daily_rows,
+            usage_models_daily_rows,
+            elapsed_ms,
+            messages_per_sec: msgs_per_sec,
+        })
+    }
+
+    /// Rebuild all daily stats from scratch.
+    pub fn rebuild_daily_stats(&self) -> Result<DailyStatsRebuildResult> {
+        let mut tx = self.conn.transaction()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+
+        tx.execute("DELETE FROM daily_stats", [])?;
+
+        tx.execute_compat(
+            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+              SELECT
+                  COALESCE(
+                  CASE
+                    WHEN (c.started_at / 1000 - 1577836800) >= 0 THEN (c.started_at / 1000 - 1577836800) / 86400
+                    ELSE (c.started_at / 1000 - 1577836800 - 86399) / 86400
+                  END,
+                0) as day_id,
+                  a.slug as agent_slug,
+                  c.source_id,
+                  COUNT(DISTINCT c.id) as session_count,
+                  COUNT(m.id) as message_count,
+                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
+                  ?1 as last_updated
+              FROM conversations c
+              JOIN agents a ON c.agent_id = a.id
+              LEFT JOIN messages m ON m.conversation_id = c.id
+              GROUP BY day_id, a.slug, c.source_id",
+            fparams![now],
+        )?;
+
+        tx.execute_compat(
+            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+              SELECT
+                  COALESCE(
+                  CASE
+                    WHEN (c.started_at / 1000 - 1577836800) >= 0 THEN (c.started_at / 1000 - 1577836800) / 86400
+                    ELSE (c.started_at / 1000 - 1577836800 - 86399) / 86400
+                  END,
+                0) as day_id,
+                  'all',
+                  c.source_id,
+                  COUNT(DISTINCT c.id) as session_count,
+                  COUNT(m.id) as message_count,
+                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
+                  ?1 as last_updated
+              FROM conversations c
+              LEFT JOIN messages m ON m.conversation_id = c.id
+              GROUP BY day_id, c.source_id",
+            fparams![now],
+        )?;
+
+        tx.execute_compat(
+            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+              SELECT
+                  COALESCE(
+                  CASE
+                    WHEN (c.started_at / 1000 - 1577836800) >= 0 THEN (c.started_at / 1000 - 1577836800) / 86400
+                    ELSE (c.started_at / 1000 - 1577836800 - 86399) / 86400
+                  END,
+                0) as day_id,
+                  a.slug,
+                  'all',
+                  COUNT(DISTINCT c.id) as session_count,
+                  COUNT(m.id) as message_count,
+                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
+                  ?1 as last_updated
+              FROM conversations c
+              JOIN agents a ON c.agent_id = a.id
+              LEFT JOIN messages m ON m.conversation_id = c.id
+              GROUP BY day_id, a.slug",
+            fparams![now],
+        )?;
+
+        tx.execute_compat(
+            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+              SELECT
+                  COALESCE(
+                  CASE
+                    WHEN (c.started_at / 1000 - 1577836800) >= 0 THEN (c.started_at / 1000 - 1577836800) / 86400
+                    ELSE (c.started_at / 1000 - 1577836800 - 86399) / 86400
+                  END,
+                0) as day_id,
+                  'all',
+                  'all',
+                  COUNT(DISTINCT c.id) as session_count,
+                  COUNT(m.id) as message_count,
+                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
+                  ?1 as last_updated
+              FROM conversations c
+              LEFT JOIN messages m ON m.conversation_id = c.id
+              GROUP BY day_id",
+            fparams![now],
+        )?;
+
+        let rows_created: i64 =
+            tx.query_row_map("SELECT COUNT(*) FROM daily_stats", fparams![], |row| {
+                row.get_typed(0)
+            })?;
+        let total_sessions: i64 = tx.query_row_map(
+            "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+
+        tx.commit()?;
+
+        tracing::info!(
+            target: "cass::perf::daily_stats",
+            rows_created,
+            total_sessions,
+            "Daily stats rebuilt from conversations"
+        );
+
+        Ok(DailyStatsRebuildResult {
+            rows_created,
+            total_sessions,
+        })
+    }
+}
+
 impl SqliteStorage {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -4109,7 +4452,7 @@ impl SqliteStorage {
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-            .with_context(|| format!("opening sqlite db readonly at {}", path.display()))?;
+        .with_context(|| format!("opening sqlite db readonly at {}", path.display()))?;
 
         apply_common_pragmas(&conn)?;
 
@@ -7152,7 +7495,10 @@ fn init_meta(conn: &mut Connection) -> Result<()> {
 
     if existing.is_none() {
         // Start at version 0 so migrate() applies full schema on first open.
-        conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', 0)", [])?;
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('schema_version', 0)",
+            [],
+        )?;
     }
 
     Ok(())
@@ -7666,7 +8012,7 @@ fn update_daily_stats_batched_in_tx(
             placeholders
         );
 
-        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 7);
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 7);
         for (day_id, agent, source, delta) in chunk {
             params_vec.push((*day_id).into());
             params_vec.push(agent.clone().into());
@@ -7677,7 +8023,7 @@ fn update_daily_stats_batched_in_tx(
             params_vec.push(now.into());
         }
 
-        total_affected += tx.execute_with_params(&sql, &param_slice_to_values(&params_vec))?;
+        total_affected += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
     }
 
     Ok(total_affected)
@@ -7719,7 +8065,7 @@ fn insert_token_usage_batched_in_tx(
             placeholders
         );
 
-        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 24);
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 24);
         for e in chunk {
             params_vec.push(e.message_id.into());
             params_vec.push(e.conversation_id.into());
@@ -7727,7 +8073,7 @@ fn insert_token_usage_batched_in_tx(
             params_vec.push(
                 e.workspace_id
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(e.source_id.clone().into());
             params_vec.push(e.timestamp_ms.into());
@@ -7736,66 +8082,66 @@ fn insert_token_usage_batched_in_tx(
                 e.model_name
                     .clone()
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.model_family
                     .clone()
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.model_tier
                     .clone()
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.service_tier
                     .clone()
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.provider
                     .clone()
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.input_tokens
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.output_tokens
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.cache_read_tokens
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.cache_creation_tokens
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.thinking_tokens
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.total_tokens
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.estimated_cost_usd
-                    .map(|v| ParamValue::from(v))
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .map(rusqlite::types::Value::Real)
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(e.role.clone().into());
             params_vec.push(e.content_chars.into());
@@ -7804,7 +8150,7 @@ fn insert_token_usage_batched_in_tx(
             params_vec.push(e.data_source.clone().into());
         }
 
-        total_inserted += tx.execute_with_params(&sql, &param_slice_to_values(&params_vec))?;
+        total_inserted += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
     }
 
     Ok(total_inserted)
@@ -7859,7 +8205,7 @@ fn update_token_daily_stats_batched_in_tx(
             placeholders
         );
 
-        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 19);
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 19);
         for (day_id, agent, source, model, delta) in chunk {
             params_vec.push((*day_id).into());
             params_vec.push(agent.clone().into());
@@ -7877,12 +8223,12 @@ fn update_token_daily_stats_batched_in_tx(
             params_vec.push(delta.grand_total_tokens.into());
             params_vec.push(delta.total_content_chars.into());
             params_vec.push(delta.total_tool_calls.into());
-            params_vec.push(ParamValue::from(delta.estimated_cost_usd));
+            params_vec.push(rusqlite::types::Value::Real(delta.estimated_cost_usd));
             params_vec.push(delta.session_count.into());
             params_vec.push(now.into());
         }
 
-        total_affected += tx.execute_with_params(&sql, &param_slice_to_values(&params_vec))?;
+        total_affected += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
     }
 
     Ok(total_affected)
@@ -7923,7 +8269,7 @@ fn insert_message_metrics_batched_in_tx(
             placeholders
         );
 
-        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 24);
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 24);
         for e in chunk {
             params_vec.push(e.message_id.into());
             params_vec.push(e.created_at_ms.into());
@@ -7939,7 +8285,7 @@ fn insert_message_metrics_batched_in_tx(
                 e.model_name
                     .clone()
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(e.model_family.clone().into());
             params_vec.push(e.model_tier.clone().into());
@@ -7947,33 +8293,33 @@ fn insert_message_metrics_batched_in_tx(
             params_vec.push(
                 e.api_input_tokens
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.api_output_tokens
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.api_cache_read_tokens
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.api_cache_creation_tokens
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.api_thinking_tokens
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(
                 e.api_service_tier
                     .clone()
                     .map(|v| v.into())
-                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
+                    .unwrap_or(rusqlite::types::Value::Null),
             );
             params_vec.push(e.api_data_source.clone().into());
             params_vec.push(e.tool_call_count.into());
@@ -7981,7 +8327,7 @@ fn insert_message_metrics_batched_in_tx(
             params_vec.push((e.has_plan as i64).into());
         }
 
-        total_inserted += tx.execute_with_params(&sql, &param_slice_to_values(&params_vec))?;
+        total_inserted += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
     }
 
     Ok(total_inserted)
@@ -8059,7 +8405,7 @@ fn flush_rollup_table(
                 last_updated = excluded.last_updated"
         );
 
-        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 22);
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 22);
         for &((bucket_id, agent, workspace_id, source), d) in chunk {
             params_vec.push((*bucket_id).into());
             params_vec.push(agent.clone().into());
@@ -8085,7 +8431,7 @@ fn flush_rollup_table(
             params_vec.push(now.into());
         }
 
-        total_affected += tx.execute_with_params(&sql, &param_slice_to_values(&params_vec))?;
+        total_affected += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
     }
 
     Ok(total_affected)
@@ -8142,7 +8488,7 @@ fn flush_model_daily_rollup_table(
                 last_updated = excluded.last_updated"
         );
 
-        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 22);
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 22);
         for &((day_id, agent, workspace_id, source, model_family, model_tier), d) in chunk {
             params_vec.push((*day_id).into());
             params_vec.push(agent.clone().into());
@@ -8168,7 +8514,7 @@ fn flush_model_daily_rollup_table(
             params_vec.push(now.into());
         }
 
-        total_affected += tx.execute_with_params(&sql, &param_slice_to_values(&params_vec))?;
+        total_affected += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
     }
 
     Ok(total_affected)

@@ -1,7 +1,9 @@
 use crate::model::types::{Conversation, Message, MessageRole, Workspace};
-use crate::storage::sqlite::SqliteStorage;
+use crate::storage::sqlite::FrankenStorage;
 use crate::ui::components::theme::ThemePalette;
 use anyhow::Result;
+use frankensqlite::Row;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -197,48 +199,59 @@ pub static CONVERSATION_CACHE: Lazy<ConversationCache> = Lazy::new(|| {
 /// Load a conversation from the database (bypassing cache).
 /// Use `load_conversation` for cached access.
 pub(crate) fn load_conversation_uncached(
-    storage: &SqliteStorage,
+    storage: &FrankenStorage,
     source_path: &str,
 ) -> Result<Option<ConversationView>> {
-    let mut stmt = storage.raw().prepare(
+    let rows = storage.raw().query_map_collect(
         "SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
-                c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host
+                c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
          FROM conversations c
          JOIN agents a ON c.agent_id = a.id
          LEFT JOIN workspaces w ON c.workspace_id = w.id
          WHERE c.source_path = ?1
          ORDER BY c.started_at DESC LIMIT 1",
-    )?;
-    let mut rows = stmt.query([source_path])?;
-    if let Some(row) = rows.next()? {
-        let convo_id: i64 = row.get(0)?;
-        let convo = Conversation {
-            id: Some(convo_id),
-            agent_slug: row.get(1)?,
-            workspace: row
-                .get::<_, Option<String>>(3)?
-                .map(std::path::PathBuf::from),
-            external_id: row.get(5)?,
-            title: row.get(6)?,
-            source_path: std::path::PathBuf::from(row.get::<_, String>(7)?),
-            started_at: row.get(8)?,
-            ended_at: row.get(9)?,
-            approx_tokens: row.get(10)?,
-            metadata_json: row
-                .get::<_, Option<String>>(11)?
+        frankensqlite::params![source_path],
+        |row: &Row| {
+            let convo_id: i64 = row.get_typed(0)?;
+            let workspace_path = row
+                .get_typed::<Option<String>>(3)?
+                .map(std::path::PathBuf::from);
+            let metadata_json = row
+                .get_typed::<Option<String>>(11)?
                 .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default(),
-            messages: Vec::new(),
-            source_id: row
-                .get::<_, String>(12)
-                .unwrap_or_else(|_| "local".to_string()),
-            origin_host: row.get(13)?,
-        };
-        let workspace = row.get::<_, Option<i64>>(2)?.map(|id| Workspace {
-            id: Some(id),
-            path: convo.workspace.clone().unwrap_or_default(),
-            display_name: row.get(4).ok().flatten(),
-        });
+                .or_else(|| {
+                    row.get_typed::<Option<Vec<u8>>>(14)
+                        .ok()
+                        .flatten()
+                        .and_then(|b| rmp_serde::from_slice(&b).ok())
+                })
+                .unwrap_or_default();
+            let convo = Conversation {
+                id: Some(convo_id),
+                agent_slug: row.get_typed(1)?,
+                workspace: workspace_path.clone(),
+                external_id: row.get_typed(5)?,
+                title: row.get_typed(6)?,
+                source_path: std::path::PathBuf::from(row.get_typed::<String>(7)?),
+                started_at: row.get_typed(8)?,
+                ended_at: row.get_typed(9)?,
+                approx_tokens: row.get_typed(10)?,
+                metadata_json,
+                messages: Vec::new(),
+                source_id: row
+                    .get_typed::<Option<String>>(12)?
+                    .unwrap_or_else(|| "local".to_string()),
+                origin_host: row.get_typed(13)?,
+            };
+            let workspace = row.get_typed::<Option<i64>>(2)?.map(|id| Workspace {
+                id: Some(id),
+                path: workspace_path.unwrap_or_default(),
+                display_name: row.get_typed(4).ok().flatten(),
+            });
+            Ok((convo_id, convo, workspace))
+        },
+    )?;
+    if let Some((convo_id, convo, workspace)) = rows.into_iter().next() {
         let messages = storage.fetch_messages(convo_id)?;
         return Ok(Some(ConversationView {
             convo,
@@ -263,7 +276,7 @@ pub(crate) fn load_conversation_uncached(
 /// via the CASS_CONV_CACHE_SIZE environment variable (default: 256 per shard,
 /// 4096 total entries across 16 shards).
 pub fn load_conversation(
-    storage: &SqliteStorage,
+    storage: &FrankenStorage,
     source_path: &str,
 ) -> Result<Option<ConversationView>> {
     // Fast path: check cache first
@@ -289,7 +302,7 @@ pub fn load_conversation(
 /// Use this variant when you need to hold the conversation view for
 /// an extended period without cloning.
 pub fn load_conversation_arc(
-    storage: &SqliteStorage,
+    storage: &FrankenStorage,
     source_path: &str,
 ) -> Result<Option<Arc<ConversationView>>> {
     // Fast path: check cache first

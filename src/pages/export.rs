@@ -2,8 +2,8 @@ use crate::ui::time_parser::parse_time_input;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
-use frankensqlite::{Connection, Row as FrankenRow, params};
 use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt, TransactionExt};
+use frankensqlite::{Connection, Row as FrankenRow, params};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -311,9 +311,7 @@ impl ExportEngine {
         }
 
         // Metadata
-        tx.execute(
-            "INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')",
-        )?;
+        tx.execute("INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')")?;
         let exported_at = Utc::now().to_rfc3339();
         tx.execute_compat(
             "INSERT INTO export_meta (key, value) VALUES ('exported_at', ?1)",
