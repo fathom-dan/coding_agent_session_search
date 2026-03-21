@@ -674,6 +674,7 @@ pub fn cleanup_old_backups(db_path: &Path, keep_count: usize) -> Result<(), std:
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
                 && is_backup_root_name(name, &prefix)
                 && let Ok(meta) = fs::metadata(&path)
+                && meta.is_file()
                 && let Ok(mtime) = meta.modified()
             {
                 backups.push((path, mtime));
@@ -5432,7 +5433,7 @@ mod tests {
             .filter(|e| e.file_name().to_str().unwrap_or("").contains("backup"))
             .collect();
 
-        assert!(backups.len() <= 3);
+        assert_eq!(backups.len(), 3);
     }
 
     #[test]
@@ -5478,6 +5479,48 @@ mod tests {
             shms.len(),
             2,
             "should keep SHM sidecars only for retained backups"
+        );
+    }
+
+    #[test]
+    fn cleanup_old_backups_ignores_backup_named_directories() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        for i in 0..3 {
+            let backup_name = format!("test.db.backup.{}", 1000 + i);
+            std::fs::write(dir.path().join(&backup_name), format!("backup {i}")).unwrap();
+        }
+        std::fs::create_dir(dir.path().join("test.db.backup.directory")).unwrap();
+
+        cleanup_old_backups(&db_path, 2).unwrap();
+
+        let mut backup_files = Vec::new();
+        let mut backup_dirs = Vec::new();
+        for entry in std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("test.db.backup.") {
+                continue;
+            }
+            if entry.path().is_dir() {
+                backup_dirs.push(name);
+            } else {
+                backup_files.push(name);
+            }
+        }
+
+        assert_eq!(
+            backup_files.len(),
+            2,
+            "only real backup files count toward retention"
+        );
+        assert_eq!(
+            backup_dirs.len(),
+            1,
+            "backup-named directories should be ignored"
         );
     }
 
