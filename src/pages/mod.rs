@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use frankensqlite::Connection;
+use frankensqlite::compat::OpenFlags;
 use std::path::Path;
 
 pub mod analytics;
@@ -33,6 +34,11 @@ pub(crate) fn open_existing_sqlite_db(path: &Path) -> Result<Connection> {
         bail!("database does not exist: {}", path.display());
     }
 
-    Connection::open(path.to_string_lossy().as_ref())
-        .with_context(|| format!("opening sqlite database at {}", path.display()))
+    // Open read-only to prevent accidental writes to the source database
+    // during export/scan operations.
+    frankensqlite::compat::open_with_flags(
+        path.to_string_lossy().as_ref(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .with_context(|| format!("opening sqlite database at {}", path.display()))
 }

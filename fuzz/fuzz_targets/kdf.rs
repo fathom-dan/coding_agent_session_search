@@ -29,7 +29,9 @@ fuzz_target!(|input: KdfInput| {
     // Clamp chunk size to reasonable range
     let chunk_size = input.chunk_size.clamp(1024, 8 * 1024 * 1024);
 
-    let mut engine = EncryptionEngine::new(chunk_size);
+    let Ok(mut engine) = EncryptionEngine::new(chunk_size) else {
+        return;
+    };
 
     // Test password slot addition - should never panic
     if input.test_password {
@@ -43,7 +45,9 @@ fuzz_target!(|input: KdfInput| {
 
     // Try adding multiple slots
     if input.test_password && input.test_recovery {
-        let mut engine2 = EncryptionEngine::new(chunk_size);
+        let Ok(mut engine2) = EncryptionEngine::new(chunk_size) else {
+            return;
+        };
         let _ = engine2.add_password_slot(&input.password);
         let _ = engine2.add_recovery_slot(&input.recovery_secret);
     }

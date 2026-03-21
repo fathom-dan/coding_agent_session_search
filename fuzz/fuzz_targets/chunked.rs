@@ -58,7 +58,9 @@ fuzz_target!(|input: ChunkedInput| {
     }
 
     // Create encryption engine
-    let mut engine = EncryptionEngine::new(chunk_size);
+    let Ok(mut engine) = EncryptionEngine::new(chunk_size) else {
+        return;
+    };
 
     // Add password slot
     if engine.add_password_slot(&input.password).is_err() {
