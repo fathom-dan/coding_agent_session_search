@@ -253,7 +253,10 @@ pub fn key_rotate(
 
     // 1. Decrypt payload with old password
     let mut old_dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, old_password)?);
-    let plaintext = zeroize::Zeroizing::new(decrypt_all_chunks(archive_dir, &old_dek, &config, |p| progress(p * 0.5))?);
+    let plaintext =
+        zeroize::Zeroizing::new(decrypt_all_chunks(archive_dir, &old_dek, &config, |p| {
+            progress(p * 0.5)
+        })?);
 
     // 2. Generate new DEK and export_id
     let mut new_dek = zeroize::Zeroizing::new([0u8; 32]);
@@ -321,6 +324,8 @@ pub fn key_rotate(
     regenerate_integrity_manifest(archive_dir)?;
 
     Ok(RotateResult {
+        new_dek_created_at: chrono::Utc::now(),
+        slot_count: new_slots.len(),
         recovery_secret: recovery_secret_encoded,
     })
 }

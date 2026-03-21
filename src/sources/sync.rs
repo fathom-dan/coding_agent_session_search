@@ -1682,6 +1682,77 @@ impl SyncStatus {
 }
 
 fn unique_atomic_temp_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "tmp", "sync_status.json")
+}
+
+fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), std::io::Error> {
+    #[cfg(windows)]
+    {
+        match std::fs::rename(temp_path, final_path) {
+            Ok(()) => Ok(()),
+            Err(first_err)
+                if final_path.exists()
+                    && matches!(
+                        first_err.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                let backup_path = unique_replace_backup_path(final_path);
+                std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
+                    std::io::Error::other(format!(
+                        "failed preparing backup {} before replacing {}: first error: {}; backup error: {}",
+                        backup_path.display(),
+                        final_path.display(),
+                        first_err,
+                        backup_err
+                    ))
+                })?;
+                match std::fs::rename(temp_path, final_path) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&backup_path);
+                        Ok(())
+                    }
+                    Err(second_err) => {
+                        let restore_result = std::fs::rename(&backup_path, final_path);
+                        match restore_result {
+                            Ok(()) => Err(std::io::Error::new(
+                                second_err.kind(),
+                                format!(
+                                    "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
+                                    final_path.display(),
+                                    temp_path.display(),
+                                    first_err,
+                                    second_err
+                                ),
+                            )),
+                            Err(restore_err) => Err(std::io::Error::other(format!(
+                                "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}",
+                                final_path.display(),
+                                temp_path.display(),
+                                first_err,
+                                second_err,
+                                restore_err
+                            ))),
+                        }
+                    }
+                }
+            }
+            Err(rename_err) => Err(rename_err),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(temp_path, final_path)
+    }
+}
+
+#[cfg(windows)]
+fn unique_replace_backup_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "bak", "sync_status.json")
+}
+
+fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> PathBuf {
     static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     let timestamp = std::time::SystemTime::now()
@@ -1692,33 +1763,14 @@ fn unique_atomic_temp_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("sync_status.json");
+        .unwrap_or(fallback_name);
 
     path.with_file_name(format!(
-        ".{file_name}.{}.{}.{}.tmp",
+        ".{file_name}.{suffix}.{}.{}.{}",
         std::process::id(),
         timestamp,
         nonce
     ))
-}
-
-fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), std::io::Error> {
-    #[cfg(windows)]
-    {
-        match std::fs::rename(temp_path, final_path) {
-            Ok(()) => Ok(()),
-            Err(rename_err) if final_path.exists() => {
-                std::fs::remove_file(final_path)?;
-                std::fs::rename(temp_path, final_path).map_err(|_| rename_err)
-            }
-            Err(rename_err) => Err(rename_err),
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        std::fs::rename(temp_path, final_path)
-    }
 }
 
 #[cfg(test)]

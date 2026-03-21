@@ -13302,11 +13302,49 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
     {
         match std::fs::rename(temp_path, final_path) {
             Ok(()) => Ok(()),
-            Err(rename_err) if final_path.exists() => {
-                std::fs::remove_file(final_path)
-                    .map_err(|e| format!("failed removing {}: {e}", final_path.display()))?;
-                std::fs::rename(temp_path, final_path)
-                    .map_err(|_| format!("failed replacing {}: {rename_err}", final_path.display()))
+            Err(first_err)
+                if final_path.exists()
+                    && matches!(
+                        first_err.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                let backup_path = unique_replace_backup_path(final_path);
+                std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
+                    format!(
+                        "failed preparing backup {} before replacing {}: first error: {}; backup error: {}",
+                        backup_path.display(),
+                        final_path.display(),
+                        first_err,
+                        backup_err
+                    )
+                })?;
+                match std::fs::rename(temp_path, final_path) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&backup_path);
+                        Ok(())
+                    }
+                    Err(second_err) => {
+                        let restore_result = std::fs::rename(&backup_path, final_path);
+                        match restore_result {
+                            Ok(()) => Err(format!(
+                                "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
+                                final_path.display(),
+                                temp_path.display(),
+                                first_err,
+                                second_err
+                            )),
+                            Err(restore_err) => Err(format!(
+                                "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}",
+                                final_path.display(),
+                                temp_path.display(),
+                                first_err,
+                                second_err,
+                                restore_err
+                            )),
+                        }
+                    }
+                }
             }
             Err(rename_err) => Err(format!(
                 "failed replacing {}: {rename_err}",
@@ -13322,12 +13360,42 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
     }
 }
 
+fn unique_atomic_temp_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "tmp", "tui_state.json")
+}
+
+#[cfg(windows)]
+fn unique_replace_backup_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "bak", "tui_state.json")
+}
+
+fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> PathBuf {
+    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_name);
+
+    path.with_file_name(format!(
+        ".{file_name}.{suffix}.{}.{}.{}",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
+}
+
 fn save_persisted_state_to_path(path: &Path, state: &PersistedState) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed creating {}: {e}", parent.display()))?;
     }
-    let tmp_path = path.with_extension("json.tmp");
+    let tmp_path = unique_atomic_temp_path(path);
     let payload = serde_json::to_vec_pretty(&persisted_state_file_from_state(state))
         .map_err(|e| format!("failed serializing state: {e}"))?;
     std::fs::write(&tmp_path, payload)
@@ -22258,6 +22326,17 @@ mod tests {
             loaded.query_history.front().map(String::as_str),
             Some("second")
         );
+    }
+
+    #[test]
+    fn persisted_state_temp_paths_are_unique() {
+        let final_path = Path::new("/tmp/tui_state.json");
+        let first = unique_atomic_temp_path(final_path);
+        let second = unique_atomic_temp_path(final_path);
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), final_path.parent());
+        assert_eq!(second.parent(), final_path.parent());
     }
 
     #[test]

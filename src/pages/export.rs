@@ -78,7 +78,7 @@ impl ExportEngine {
         let mut dest =
             Connection::open(&output_path).context("Failed to create output database")?;
 
-        let tx = dest.transaction()?;
+        let mut tx = dest.transaction()?;
 
         // 3. Create Schema (Split into individual statements)
         tx.execute(

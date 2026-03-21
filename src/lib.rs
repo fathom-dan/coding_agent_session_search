@@ -4531,13 +4531,6 @@ fn lazy_db_to_cli_error(e: crate::storage::sqlite::LazyDbError) -> CliError {
             hint: Some("Run 'cass index --full' to create the database.".into()),
             retryable: true,
         },
-        LazyDbError::OpenFailed { path, source } => CliError {
-            code: 9,
-            kind: "db-open",
-            message: format!("Failed to open database at {}: {source}", path.display()),
-            hint: None,
-            retryable: false,
-        },
         LazyDbError::FrankenOpenFailed { path, source } => CliError {
             code: 9,
             kind: "db-open",
@@ -9006,9 +8999,9 @@ fn run_doctor(
                 use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
 
                 // Fix #115: Register the FTS5 virtual table so FrankenSQLite
-                // can see it.  Without this, databases created by stock
-                // rusqlite have rootpage=0 for virtual tables and
-                // FrankenSQLite's sqlite_master parsing silently skips them.
+                // can see it.  Without this, databases created by C SQLite
+                // have rootpage=0 for virtual tables and FrankenSQLite's
+                // sqlite_master parsing silently skips them.
                 if let Err(e) = crate::storage::sqlite::register_fts5_on_connection(&conn) {
                     tracing::debug!(
                         error = %e,

@@ -1430,7 +1430,7 @@ fn open_storage_for_index(db_path: &Path) -> Result<(FrankenStorage, bool)> {
                 db_path = %db_path.display(),
                 reason = %reason,
                 backup_path = ?backup_path.as_ref().map(|p| p.display().to_string()),
-                "sqlite schema incompatible; rebuilt database before indexing"
+                "storage schema incompatible; rebuilt database before indexing"
             );
             let storage = FrankenStorage::open(db_path)?;
             Ok((storage, true))
@@ -1548,7 +1548,7 @@ impl ConnectorKind {
     }
 }
 
-fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send + 'static>(
+fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
     watch_once_paths: Option<Vec<PathBuf>>,
     roots: Vec<(ConnectorKind, ScanRoot)>,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
@@ -1907,9 +1907,49 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
     {
         match fs::rename(temp_path, final_path) {
             Ok(()) => Ok(()),
-            Err(rename_err) if final_path.exists() => {
-                fs::remove_file(final_path)?;
-                fs::rename(temp_path, final_path).map_err(|_| rename_err.into())
+            Err(first_err)
+                if final_path.exists()
+                    && matches!(
+                        first_err.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                let backup_path = unique_replace_backup_path(final_path);
+                fs::rename(final_path, &backup_path).map_err(|backup_err| {
+                    anyhow::anyhow!(
+                        "failed preparing backup {} before replacing {}: first error: {}; backup error: {}",
+                        backup_path.display(),
+                        final_path.display(),
+                        first_err,
+                        backup_err
+                    )
+                })?;
+                match fs::rename(temp_path, final_path) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&backup_path);
+                        Ok(())
+                    }
+                    Err(second_err) => {
+                        let restore_result = fs::rename(&backup_path, final_path);
+                        match restore_result {
+                            Ok(()) => Err(anyhow::anyhow!(
+                                "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
+                                final_path.display(),
+                                temp_path.display(),
+                                first_err,
+                                second_err
+                            )),
+                            Err(restore_err) => Err(anyhow::anyhow!(
+                                "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}",
+                                final_path.display(),
+                                temp_path.display(),
+                                first_err,
+                                second_err,
+                                restore_err
+                            )),
+                        }
+                    }
+                }
             }
             Err(rename_err) => Err(rename_err.into()),
         }
@@ -1920,6 +1960,36 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
         fs::rename(temp_path, final_path)?;
         Ok(())
     }
+}
+
+fn unique_atomic_temp_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "tmp", "watch_state.json")
+}
+
+#[cfg(windows)]
+fn unique_replace_backup_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "bak", "watch_state.json")
+}
+
+fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> PathBuf {
+    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_name);
+
+    path.with_file_name(format!(
+        ".{file_name}.{suffix}.{}.{}.{}",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
 }
 
 fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Result<()> {
@@ -1934,7 +2004,7 @@ fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Res
     let json = serde_json::to_vec(&watch_state)?;
     // Atomic write: write to temp file then rename, so a crash mid-write
     // cannot leave a truncated/corrupt watch_state.json.
-    let tmp_path = path.with_extension("json.tmp");
+    let tmp_path = unique_atomic_temp_path(&path);
     fs::write(&tmp_path, json)?;
     replace_file_from_temp(&tmp_path, &path)?;
     Ok(())
@@ -2638,7 +2708,7 @@ pub mod persist {
         if begin_concurrent_writes_enabled() {
             let db_path = storage
                 .database_path()
-                .with_context(|| "resolving sqlite path for begin-concurrent write mode")?;
+                .with_context(|| "resolving database path for begin-concurrent write mode")?;
             tracing::info!(
                 conversations = convs.len(),
                 "using begin-concurrent write path for indexing"
@@ -3353,6 +3423,17 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.get(&ConnectorKind::Amp), Some(&222));
         assert!(!loaded.contains_key(&ConnectorKind::Codex));
+    }
+
+    #[test]
+    fn watch_state_temp_paths_are_unique() {
+        let final_path = Path::new("/tmp/watch_state.json");
+        let first = unique_atomic_temp_path(final_path);
+        let second = unique_atomic_temp_path(final_path);
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), final_path.parent());
+        assert_eq!(second.parent(), final_path.parent());
     }
 
     #[test]

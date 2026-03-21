@@ -32,9 +32,6 @@ which = "*"
 shell-words = "*"
 dotenvy = "*"
 notify = "*"
-rusqlite = { version = "*", features = ["bundled", "modern_sqlite"] }
-# FrankenSQLite foundation for staged storage migration (bead 300hj).
-# Keep rusqlite side-by-side during transition; migration code opts in explicitly.
 frankensqlite = { path = "../frankensqlite/crates/fsqlite", package = "fsqlite", features = ["fts5"] }
 rayon = "*"
 crossbeam-channel = "*"
@@ -120,6 +117,9 @@ backtrace = []
 vergen = { version = "*", default-features = false, features = ["build", "cargo"] }
 
 [dev-dependencies]
+# rusqlite retained ONLY for test code: compat gate tests (C SQLite interop),
+# parity tests, and legacy migration safety tests. Zero production usage.
+rusqlite = { version = "*", features = ["bundled", "modern_sqlite"] }
 assert_cmd = "*"
 predicates = "*"
 insta = { version = "*", features = ["yaml", "json"] }

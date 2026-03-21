@@ -575,7 +575,6 @@ fn parse_ssh_config(content: &str) -> Vec<DiscoveredHost> {
 
 use std::collections::HashSet;
 
-use chrono::Utc;
 use colored::Colorize;
 
 use super::probe::HostProbeResult;
@@ -853,7 +852,7 @@ impl Default for SourceConfigGenerator {
 impl SourcesConfig {
     /// Write configuration with backup.
     ///
-    /// Creates a timestamped backup of the existing config (if any)
+    /// Creates a uniquely named backup of the existing config (if any)
     /// before writing the new configuration atomically.
     pub fn write_with_backup(&self) -> Result<BackupInfo, ConfigError> {
         let config_path = Self::config_path()?;
@@ -865,8 +864,7 @@ impl SourcesConfig {
 
         // Create backup if file exists
         let backup_path = if config_path.exists() {
-            let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
-            let backup = config_path.with_extension(format!("toml.backup.{}", timestamp));
+            let backup = unique_backup_path(&config_path);
             std::fs::copy(&config_path, &backup)?;
             Some(backup)
         } else {
@@ -878,7 +876,7 @@ impl SourcesConfig {
         let _: SourcesConfig = toml::from_str(&toml_str)?; // Round-trip validation
 
         // Write atomically (temp file + rename)
-        let temp_path = config_path.with_extension("toml.tmp");
+        let temp_path = unique_atomic_temp_path(&config_path);
         std::fs::write(&temp_path, &toml_str)?;
         replace_file_from_temp(&temp_path, &config_path)?;
 
@@ -937,9 +935,52 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), std
     {
         match std::fs::rename(temp_path, final_path) {
             Ok(()) => Ok(()),
-            Err(rename_err) if final_path.exists() => {
-                std::fs::remove_file(final_path)?;
-                std::fs::rename(temp_path, final_path).map_err(|_| rename_err)
+            Err(first_err)
+                if final_path.exists()
+                    && matches!(
+                        first_err.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                let backup_path = unique_replace_backup_path(final_path);
+                std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
+                    std::io::Error::other(format!(
+                        "failed preparing backup {} before replacing {}: first error: {}; backup error: {}",
+                        backup_path.display(),
+                        final_path.display(),
+                        first_err,
+                        backup_err
+                    ))
+                })?;
+                match std::fs::rename(temp_path, final_path) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&backup_path);
+                        Ok(())
+                    }
+                    Err(second_err) => {
+                        let restore_result = std::fs::rename(&backup_path, final_path);
+                        match restore_result {
+                            Ok(()) => Err(std::io::Error::new(
+                                second_err.kind(),
+                                format!(
+                                    "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
+                                    final_path.display(),
+                                    temp_path.display(),
+                                    first_err,
+                                    second_err
+                                ),
+                            )),
+                            Err(restore_err) => Err(std::io::Error::other(format!(
+                                "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}",
+                                final_path.display(),
+                                temp_path.display(),
+                                first_err,
+                                second_err,
+                                restore_err
+                            ))),
+                        }
+                    }
+                }
             }
             Err(rename_err) => Err(rename_err),
         }
@@ -949,6 +990,57 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), std
     {
         std::fs::rename(temp_path, final_path)
     }
+}
+
+fn unique_atomic_temp_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "tmp", "sources.toml")
+}
+
+fn unique_backup_path(path: &Path) -> PathBuf {
+    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sources.toml");
+
+    path.with_file_name(format!(
+        "{file_name}.backup.{}.{}.{}",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
+}
+
+#[cfg(windows)]
+fn unique_replace_backup_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "bak", "sources.toml")
+}
+
+fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> PathBuf {
+    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_name);
+
+    path.with_file_name(format!(
+        ".{file_name}.{suffix}.{}.{}.{}",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
 }
 
 #[cfg(test)]
@@ -981,6 +1073,28 @@ mod tests {
             std::fs::read_to_string(&final_path).expect("read second final"),
             "second = true\n"
         );
+    }
+
+    #[test]
+    fn test_unique_atomic_temp_path_changes_each_call() {
+        let final_path = Path::new("/tmp/sources.toml");
+        let first = unique_atomic_temp_path(final_path);
+        let second = unique_atomic_temp_path(final_path);
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), final_path.parent());
+        assert_eq!(second.parent(), final_path.parent());
+    }
+
+    #[test]
+    fn test_unique_backup_path_changes_each_call() {
+        let final_path = Path::new("/tmp/sources.toml");
+        let first = unique_backup_path(final_path);
+        let second = unique_backup_path(final_path);
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), final_path.parent());
+        assert_eq!(second.parent(), final_path.parent());
     }
 
     #[test]

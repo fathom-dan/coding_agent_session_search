@@ -13,10 +13,9 @@ use frankensqlite::{
     },
     migrate::MigrationRunner,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use std::fs;
 
-/// Frankensqlite parameter list builder (avoids name conflict with rusqlite `fparams!`).
+/// Frankensqlite parameter list builder.
 macro_rules! fparams {
     () => {
         &[] as &[ParamValue]
@@ -31,7 +30,7 @@ use thiserror::Error;
 use tracing::info;
 
 // -------------------------------------------------------------------------
-// Lazy SQLite Connection (bd-1ueu)
+// Lazy FrankenSQLite Connection (bd-1ueu)
 // -------------------------------------------------------------------------
 // Defers opening the database until first use, cutting startup cost for
 // commands that may not need the DB at all.  Thread-safe via parking_lot
@@ -42,102 +41,11 @@ use tracing::info;
 pub enum LazyDbError {
     #[error("Database not found at {0}")]
     NotFound(PathBuf),
-    #[error("Failed to open database at {path}: {source}")]
-    OpenFailed {
-        path: PathBuf,
-        source: rusqlite::Error,
-    },
     #[error("Failed to open FrankenSQLite database at {path}: {source}")]
     FrankenOpenFailed {
         path: PathBuf,
         source: frankensqlite::FrankenError,
     },
-}
-
-/// A lazily-initialized, thread-safe SQLite connection handle.
-///
-/// Constructing a `LazyDb` is cheap (no I/O).  The underlying
-/// `rusqlite::Connection` is opened on the first call to [`get`].
-/// Subsequent calls return the cached connection.
-pub struct LazyDb {
-    path: PathBuf,
-    conn: parking_lot::Mutex<Option<Connection>>,
-}
-
-/// RAII guard that dereferences to the inner `Connection`.
-pub struct LazyDbGuard<'a>(parking_lot::MutexGuard<'a, Option<Connection>>);
-
-impl std::fmt::Debug for LazyDbGuard<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("LazyDbGuard")
-            .field(&self.0.is_some())
-            .finish()
-    }
-}
-
-impl std::ops::Deref for LazyDbGuard<'_> {
-    type Target = Connection;
-    fn deref(&self) -> &Connection {
-        self.0
-            .as_ref()
-            .expect("LazyDb connection must be initialized before access")
-    }
-}
-
-impl LazyDb {
-    /// Create a lazy handle pointing at `path`.  No I/O is performed.
-    pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            conn: parking_lot::Mutex::new(None),
-        }
-    }
-
-    /// Resolve path from optional CLI overrides.
-    ///
-    /// Uses `data_dir / agent_search.db` as fallback.
-    pub fn from_overrides(data_dir: &Option<PathBuf>, db_override: Option<PathBuf>) -> Self {
-        let data_dir = data_dir.clone().unwrap_or_else(crate::default_data_dir);
-        let path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-        Self::new(path)
-    }
-
-    /// Get the connection, opening the database on first access.
-    ///
-    /// `reason` is logged alongside the open duration so callers can
-    /// identify which command triggered the open.
-    pub fn get(&self, reason: &str) -> std::result::Result<LazyDbGuard<'_>, LazyDbError> {
-        let mut guard = self.conn.lock();
-        if guard.is_none() {
-            if !self.path.exists() {
-                return Err(LazyDbError::NotFound(self.path.clone()));
-            }
-            let start = Instant::now();
-            let conn = Connection::open(&self.path).map_err(|e| LazyDbError::OpenFailed {
-                path: self.path.clone(),
-                source: e,
-            })?;
-            let elapsed_ms = start.elapsed().as_millis();
-            info!(
-                path = %self.path.display(),
-                elapsed_ms = elapsed_ms,
-                reason = reason,
-                "lazily opened SQLite database"
-            );
-            *guard = Some(conn);
-        }
-        Ok(LazyDbGuard(guard))
-    }
-
-    /// Path to the database file (even if not yet opened).
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Whether the connection has been opened.
-    pub fn is_open(&self) -> bool {
-        self.conn.lock().is_some()
-    }
 }
 
 // -------------------------------------------------------------------------
@@ -535,29 +443,6 @@ fn deserialize_msgpack_to_json(bytes: &[u8]) -> serde_json::Value {
     })
 }
 
-/// Read metadata from row, preferring binary column, falling back to JSON.
-/// This provides backward compatibility during migration.
-fn read_metadata_compat(
-    row: &rusqlite::Row<'_>,
-    json_idx: usize,
-    bin_idx: usize,
-) -> serde_json::Value {
-    // Try binary column first (new format)
-    if let Ok(Some(bytes)) = row.get::<_, Option<Vec<u8>>>(bin_idx)
-        && !bytes.is_empty()
-    {
-        return deserialize_msgpack_to_json(&bytes);
-    }
-
-    // Fall back to JSON column (old format or migration in progress)
-    if let Ok(Some(json_str)) = row.get::<_, Option<String>>(json_idx) {
-        return serde_json::from_str(&json_str)
-            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
-    }
-
-    serde_json::Value::Object(serde_json::Map::new())
-}
-
 /// Read metadata from a frankensqlite Row, preferring binary (msgpack) over JSON.
 fn franken_read_metadata_compat(
     row: &FrankenRow,
@@ -596,7 +481,7 @@ pub enum MigrationError {
 
     /// A database error occurred during migration.
     #[error("Database error: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] frankensqlite::FrankenError),
 
     /// An I/O error occurred during backup.
     #[error("I/O error: {0}")]
@@ -840,24 +725,28 @@ pub enum SchemaCheck {
 /// Check schema compatibility without modifying the database.
 ///
 /// Opens the database read-only and checks the schema version.
-fn check_schema_compatibility(path: &Path) -> std::result::Result<SchemaCheck, rusqlite::Error> {
-    let conn = Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+fn check_schema_compatibility(
+    path: &Path,
+) -> std::result::Result<SchemaCheck, frankensqlite::FrankenError> {
+    let conn = open_franken_with_flags(
+        &path.to_string_lossy(),
+        FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
 
     // Check if meta table exists
     let meta_exists: i32 = conn.query_row_map(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'", &[],
-        |row| row.get_typed(0),
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
+        fparams![],
+        |row| Ok(row.get_typed(0)?),
     )?;
 
     if meta_exists == 0 {
         // No meta table - could be empty or very old schema, needs rebuild
         // But first check if there are any tables at all
         let table_count: i32 = conn.query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'", &[],
-            |row| row.get_typed(0),
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+            fparams![],
+            |row| Ok(row.get_typed(0)?),
         )?;
 
         if table_count == 0 {
@@ -874,8 +763,9 @@ fn check_schema_compatibility(path: &Path) -> std::result::Result<SchemaCheck, r
     // Get the schema version
     let version: Option<i64> = conn
         .query_row_map(
-            "SELECT value FROM meta WHERE key = 'schema_version'", &[],
-            |row| row.get_typed::<String>(0).map(|s| s.parse().ok()),
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            fparams![],
+            |row| Ok(row.get_typed::<String>(0)?.parse().ok()),
         )
         .ok()
         .flatten();
@@ -1495,13 +1385,10 @@ pub struct EmbeddingJobRow {
     pub completed_at: Option<String>,
 }
 
-/// SqliteStorage is now a type alias for FrankenStorage (rusqlite extirpated).
+/// Compatibility alias retained while call sites finish converging on `FrankenStorage`.
 pub type SqliteStorage = FrankenStorage;
 
-/// Migration foundation for the future frankensqlite-backed storage backend.
-///
-/// This intentionally coexists with `SqliteStorage` during the staged migration.
-/// Full CRUD parity is tracked in follow-on beads.
+/// Primary frankensqlite-backed storage backend.
 pub struct FrankenStorage {
     conn: FrankenConnection,
 }
@@ -1573,7 +1460,7 @@ impl FrankenStorage {
     pub fn apply_config(&self) -> Result<()> {
         // journal_mode: frankensqlite defaults to WAL, same as cass.
         // synchronous: frankensqlite defaults to NORMAL, same as cass.
-        // Both are set explicitly for clarity and to match rusqlite behavior.
+        // Both are set explicitly for clarity.
         self.conn
             .execute("PRAGMA journal_mode = WAL;")
             .with_context(|| "setting journal_mode")?;
@@ -1712,15 +1599,13 @@ impl FrankenStorage {
     }
 
     /// Open database with migration, backing up if schema is incompatible.
-    ///
-    /// Mirrors `SqliteStorage::open_or_rebuild` but uses frankensqlite.
     pub fn open_or_rebuild(path: &Path) -> std::result::Result<Self, MigrationError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
         if path.exists() {
-            let check_result = franken_check_schema_compatibility(path);
+            let check_result = check_schema_compatibility(path);
             match check_result {
                 Ok(SchemaCheck::Compatible) | Ok(SchemaCheck::NeedsMigration) => {
                     // Continue with normal open
@@ -1748,53 +1633,6 @@ impl FrankenStorage {
 
         let storage = Self::open(path).map_err(|e| MigrationError::Other(e.to_string()))?;
         Ok(storage)
-    }
-}
-
-/// Check schema compatibility without modifying the database (frankensqlite version).
-fn franken_check_schema_compatibility(path: &Path) -> Result<SchemaCheck> {
-    let path_str = path.to_string_lossy().to_string();
-    let conn = FrankenConnection::open(&path_str)
-        .with_context(|| format!("opening db for schema check at {}", path.display()))?;
-
-    let meta_rows =
-        conn.query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'")?;
-    let meta_exists: i64 = meta_rows
-        .first()
-        .and_then(|r| r.get_typed::<i64>(0).ok())
-        .unwrap_or(0);
-
-    if meta_exists == 0 {
-        let table_rows = conn.query("SELECT COUNT(*) FROM sqlite_master WHERE type='table'")?;
-        let table_count: i64 = table_rows
-            .first()
-            .and_then(|r| r.get_typed::<i64>(0).ok())
-            .unwrap_or(0);
-
-        if table_count == 0 {
-            return Ok(SchemaCheck::NeedsMigration);
-        }
-        return Ok(SchemaCheck::NeedsRebuild(
-            "Database missing schema version metadata".to_string(),
-        ));
-    }
-
-    let version_rows = conn.query("SELECT value FROM meta WHERE key = 'schema_version'")?;
-    let version: Option<i64> = version_rows
-        .first()
-        .and_then(|r| r.get_typed::<String>(0).ok())
-        .and_then(|s| s.parse().ok());
-
-    match version {
-        Some(v) if v == SCHEMA_VERSION => Ok(SchemaCheck::Compatible),
-        Some(v) if v < SCHEMA_VERSION => Ok(SchemaCheck::NeedsMigration),
-        Some(v) => Ok(SchemaCheck::NeedsRebuild(format!(
-            "Schema version {} is newer than supported version {}",
-            v, SCHEMA_VERSION
-        ))),
-        None => Ok(SchemaCheck::NeedsRebuild(
-            "Schema version not found or invalid".to_string(),
-        )),
     }
 }
 
@@ -3654,7 +3492,7 @@ fn franken_update_daily_stats_in_tx(
 }
 
 // -------------------------------------------------------------------------
-// Frankensqlite batch helpers (migration from rusqlite `_in_tx` functions)
+// Frankensqlite batch helpers
 // -------------------------------------------------------------------------
 
 /// Batch upsert daily_stats within a frankensqlite transaction.
@@ -4532,15 +4370,7 @@ impl IndexingCacheStorage for FrankenStorage {
     }
 }
 
-impl IndexingCacheStorage for SqliteStorage {
-    fn ensure_indexing_agent(&self, agent: &Agent) -> Result<i64> {
-        self.ensure_agent(agent)
-    }
-
-    fn ensure_indexing_workspace(&self, path: &Path, display_name: Option<&str>) -> Result<i64> {
-        self.ensure_workspace(path, display_name)
-    }
-}
+// IndexingCacheStorage for SqliteStorage removed: SqliteStorage is a type alias for FrankenStorage.
 
 impl IndexingCache {
     /// Create a new empty cache.
@@ -4586,7 +4416,7 @@ impl IndexingCache {
     /// and caches the result.
     pub fn get_or_insert_workspace(
         &mut self,
-        storage: &impl IndexingCacheStorage,
+        storage: &(impl IndexingCacheStorage + ?Sized),
         path: &Path,
         display_name: Option<&str>,
     ) -> Result<i64> {
@@ -5314,38 +5144,8 @@ pub struct PricingTable {
 
 impl PricingTable {
     /// Load all pricing entries from the database.
-    pub fn load(conn: &rusqlite::Connection) -> Result<Self> {
-        let mut stmt = conn.prepare(
-            "SELECT model_pattern, provider, input_cost_per_mtok, output_cost_per_mtok,
-                    cache_read_cost_per_mtok, cache_creation_cost_per_mtok, effective_date
-             FROM model_pricing
-             ORDER BY effective_date DESC",
-        )?;
-        let entries = stmt
-            .query_map([], |row| {
-                let effective_date: String = row.get_typed(6)?;
-                let effective_day_id = date_str_to_day_id(&effective_date).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        6,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            e.to_string(),
-                        )),
-                    )
-                })?;
-                Ok(PricingEntry {
-                    model_pattern: row.get_typed(0)?,
-                    provider: row.get_typed(1)?,
-                    input_cost_per_mtok: row.get_typed(2)?,
-                    output_cost_per_mtok: row.get_typed(3)?,
-                    cache_read_cost_per_mtok: row.get_typed(4)?,
-                    cache_creation_cost_per_mtok: row.get_typed(5)?,
-                    effective_day_id,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(Self { entries })
+    pub fn load(conn: &FrankenConnection) -> Result<Self> {
+        Self::franken_load(conn)
     }
 
     /// Load all pricing entries from a frankensqlite connection.
@@ -5526,11 +5326,9 @@ fn sql_like_match_bytes(val: &[u8], pat: &[u8]) -> bool {
     }
 }
 
-
 // Second SqliteStorage impl block removed: SqliteStorage is now a type alias for FrankenStorage.
 // All methods (insert_conversation_tree, list_agents, list_conversations, etc.) are
 // available through FrankenStorage.
-
 
 /// Daily count data for histogram display.
 #[derive(Debug, Clone)]
@@ -5570,21 +5368,13 @@ pub struct DailyStatsHealth {
     pub drift: i64,
 }
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
 // -------------------------------------------------------------------------
 // FTS5 Batch Insert (P2 Opt 2.1)
@@ -5626,25 +5416,15 @@ impl FtsEntry {
     }
 }
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
-// [removed: dead rusqlite helper function]
 
 fn path_to_string<P: AsRef<Path>>(p: P) -> String {
     p.as_ref().to_string_lossy().into_owned()
@@ -5887,7 +5667,7 @@ mod tests {
         let conn = storage.raw();
 
         // Helper: collect column names from PRAGMA table_info
-        fn col_names(conn: &Connection, table: &str) -> Vec<String> {
+        fn col_names(conn: &FrankenConnection, table: &str) -> Vec<String> {
             let mut stmt = conn
                 .prepare(&format!("PRAGMA table_info({})", table))
                 .unwrap();
@@ -5898,7 +5678,7 @@ mod tests {
         }
 
         // Helper: collect index names from PRAGMA index_list
-        fn idx_names(conn: &Connection, table: &str) -> Vec<String> {
+        fn idx_names(conn: &FrankenConnection, table: &str) -> Vec<String> {
             let mut stmt = conn
                 .prepare(&format!("PRAGMA index_list({})", table))
                 .unwrap();
@@ -6062,7 +5842,7 @@ mod tests {
 
         // Open at v10 first by faking it
         {
-            let mut conn = Connection::open(&db_path).unwrap();
+            let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
             conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);",
@@ -6344,7 +6124,8 @@ mod tests {
         // Verify rollups match summed message_metrics
         let mm_total_content_est: i64 = conn
             .query_row_map(
-                "SELECT SUM(content_tokens_est) FROM message_metrics WHERE day_id = ?", fparams![expected_day],
+                "SELECT SUM(content_tokens_est) FROM message_metrics WHERE day_id = ?",
+                fparams![expected_day],
                 |row| row.get_typed::<i64>(0),
             )
             .unwrap();
@@ -6365,7 +6146,8 @@ mod tests {
             .unwrap();
         let ud_content_est: i64 = conn
             .query_row_map(
-                "SELECT content_tokens_est_total FROM usage_daily WHERE day_id = ?", fparams![expected_day],
+                "SELECT content_tokens_est_total FROM usage_daily WHERE day_id = ?",
+                fparams![expected_day],
                 |row| row.get_typed::<i64>(0),
             )
             .unwrap();
@@ -6414,7 +6196,8 @@ mod tests {
         let unknown_msg: i64 = conn
             .query_row_map(
                 "SELECT message_count FROM usage_models_daily
-                 WHERE day_id = ? AND model_family = 'unknown' AND model_tier = 'unknown'", fparams![expected_day],
+                 WHERE day_id = ? AND model_family = 'unknown' AND model_tier = 'unknown'",
+                fparams![expected_day],
                 |row| row.get_typed(0),
             )
             .unwrap();
@@ -6665,13 +6448,19 @@ mod tests {
         // Save original analytics state
         let conn = storage.raw();
         let orig_mm: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM message_metrics", &[], |row| row.get_typed(0))
+            .query_row_map("SELECT COUNT(*) FROM message_metrics", &[], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         let orig_hourly: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM usage_hourly", &[], |row| row.get_typed(0))
+            .query_row_map("SELECT COUNT(*) FROM usage_hourly", &[], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         let orig_daily: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM usage_daily", &[], |row| row.get_typed(0))
+            .query_row_map("SELECT COUNT(*) FROM usage_daily", &[], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         let orig_models_daily: i64 = conn
             .query_row_map("SELECT COUNT(*) FROM usage_models_daily", &[], |row| {
@@ -6699,7 +6488,9 @@ mod tests {
 
         // Verify they're empty
         let zero: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM message_metrics", &[], |row| row.get_typed(0))
+            .query_row_map("SELECT COUNT(*) FROM message_metrics", &[], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         assert_eq!(zero, 0);
 
@@ -6718,7 +6509,9 @@ mod tests {
         // Verify rebuilt data matches
         let conn = storage.raw();
         let rebuilt_mm: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM message_metrics", &[], |row| row.get_typed(0))
+            .query_row_map("SELECT COUNT(*) FROM message_metrics", &[], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         assert_eq!(
             rebuilt_mm, orig_mm,
@@ -6726,7 +6519,9 @@ mod tests {
         );
 
         let rebuilt_hourly: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM usage_hourly", &[], |row| row.get_typed(0))
+            .query_row_map("SELECT COUNT(*) FROM usage_hourly", &[], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         assert_eq!(
             rebuilt_hourly, orig_hourly,
@@ -6734,7 +6529,9 @@ mod tests {
         );
 
         let rebuilt_daily: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM usage_daily", &[], |row| row.get_typed(0))
+            .query_row_map("SELECT COUNT(*) FROM usage_daily", &[], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         assert_eq!(rebuilt_daily, orig_daily, "Rebuilt daily rows should match");
 
@@ -6796,7 +6593,8 @@ mod tests {
 
         let ud_msg: i64 = conn
             .query_row_map(
-                "SELECT message_count FROM usage_daily WHERE day_id = ?", fparams![expected_day],
+                "SELECT message_count FROM usage_daily WHERE day_id = ?",
+                fparams![expected_day],
                 |row| row.get_typed(0),
             )
             .unwrap();
@@ -7162,7 +6960,8 @@ mod tests {
         let has_extra_bin: bool = storage
             .raw()
             .query_row_map(
-                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'extra_bin'", &[],
+                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'extra_bin'",
+                &[],
                 |r| r.get::<_, i64>(0).map(|c| c > 0),
             )
             .unwrap();
@@ -7240,23 +7039,26 @@ mod tests {
     }
 
     // =========================================================================
-    // LazyDb tests (bd-1ueu)
+    // LazyFrankenDb tests (bd-1ueu)
     // =========================================================================
 
     #[test]
-    fn lazy_db_not_open_before_get() {
+    fn lazy_franken_db_not_open_before_get() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("lazy_test.db");
 
         // Create a real DB so the path exists
         let _storage = SqliteStorage::open(&db_path).unwrap();
 
-        let lazy = LazyDb::new(db_path);
-        assert!(!lazy.is_open(), "LazyDb must not open on construction");
+        let lazy = LazyFrankenDb::new(db_path);
+        assert!(
+            !lazy.is_open(),
+            "LazyFrankenDb must not open on construction"
+        );
     }
 
     #[test]
-    fn lazy_db_opens_on_first_get() {
+    fn lazy_franken_db_opens_on_first_get() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("lazy_test.db");
 
@@ -7264,27 +7066,29 @@ mod tests {
         let _storage = SqliteStorage::open(&db_path).unwrap();
         drop(_storage);
 
-        let lazy = LazyDb::new(db_path);
+        let lazy = LazyFrankenDb::new(db_path);
         assert!(!lazy.is_open());
 
         let conn = lazy.get("test").expect("should open successfully");
         let count: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM conversations", &[], |r| r.get(0))
+            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |r| {
+                r.get_typed(0)
+            })
             .unwrap();
         assert_eq!(count, 0);
         drop(conn);
 
-        assert!(lazy.is_open(), "LazyDb must be open after get()");
+        assert!(lazy.is_open(), "LazyFrankenDb must be open after get()");
     }
 
     #[test]
-    fn lazy_db_reuses_connection() {
+    fn lazy_franken_db_reuses_connection() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("lazy_test.db");
         let _storage = SqliteStorage::open(&db_path).unwrap();
         drop(_storage);
 
-        let lazy = LazyDb::new(db_path);
+        let lazy = LazyFrankenDb::new(db_path);
 
         // First access opens
         {
@@ -7297,18 +7101,20 @@ mod tests {
         {
             let conn = lazy.get("second").unwrap();
             let count: i64 = conn
-                .query_row_map("SELECT COUNT(*) FROM test_tbl", &[], |r| r.get(0))
+                .query_row_map("SELECT COUNT(*) FROM test_tbl", fparams![], |r| {
+                    r.get_typed(0)
+                })
                 .unwrap();
             assert_eq!(count, 0);
         }
     }
 
     #[test]
-    fn lazy_db_not_found_error() {
+    fn lazy_franken_db_not_found_error() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("nonexistent.db");
 
-        let lazy = LazyDb::new(db_path);
+        let lazy = LazyFrankenDb::new(db_path);
         let result = lazy.get("test");
         assert!(result.is_err());
         assert!(
@@ -7318,9 +7124,9 @@ mod tests {
     }
 
     #[test]
-    fn lazy_db_path_accessor() {
+    fn lazy_franken_db_path_accessor() {
         let path = PathBuf::from("/tmp/test_lazy.db");
-        let lazy = LazyDb::new(path.clone());
+        let lazy = LazyFrankenDb::new(path.clone());
         assert_eq!(lazy.path(), path.as_path());
     }
 
