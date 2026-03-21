@@ -3777,7 +3777,7 @@ fn run_analytics_rebuild(
     _force: bool,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
-    use crate::storage::sqlite::SqliteStorage;
+    use crate::storage::sqlite::FrankenStorage;
 
     let data_dir = common.data_dir.clone().unwrap_or_else(default_data_dir);
     let db_path = db_path_override
@@ -4234,17 +4234,14 @@ fn state_meta_json(
                     || msg.contains("corrupt")
                     || msg.contains("Corrupt");
 
-                // Auto-repair: checkpoint the WAL via rusqlite to clear corruption,
-                // then retry the frankensqlite open.
+                // Auto-repair: attempt a frankensqlite checkpoint, then retry the open.
                 if is_wal_corruption {
                     tracing::warn!(
                         "WAL corruption detected, attempting auto-repair via checkpoint"
                     );
                     let repaired = (|| -> Result<(), Box<dyn std::error::Error>> {
-                        let repair_conn = rusqlite::Connection::open_with_flags(
-                            db_path,
-                            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-                        )?;
+                        let repair_path = db_path.to_string_lossy().to_string();
+                        let repair_conn = frankensqlite::Connection::open(&repair_path)?;
                         repair_conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
                         drop(repair_conn);
                         Ok(())
@@ -8503,7 +8500,7 @@ fn rebuild_tantivy_from_db(
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
 
-    let storage = SqliteStorage::open_readonly(db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open_readonly(db_path).map_err(|e| CliError {
         code: 5,
         kind: "doctor",
         message: format!("failed to open database for rebuild: {e}"),

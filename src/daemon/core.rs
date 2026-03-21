@@ -513,7 +513,7 @@ impl ModelDaemon {
             }
 
             Request::EmbeddingJobStatus { db_path } => {
-                match crate::storage::sqlite::SqliteStorage::open(std::path::Path::new(&db_path)) {
+                match crate::storage::sqlite::FrankenStorage::open(std::path::Path::new(&db_path)) {
                     Ok(storage) => match storage.get_embedding_jobs(&db_path) {
                         Ok(rows) => {
                             let jobs = rows
@@ -553,7 +553,7 @@ impl ModelDaemon {
                 }
 
                 // Also cancel in database
-                match crate::storage::sqlite::SqliteStorage::open(std::path::Path::new(&db_path)) {
+                match crate::storage::sqlite::FrankenStorage::open(std::path::Path::new(&db_path)) {
                     Ok(storage) => {
                         match storage.cancel_embedding_jobs(&db_path, model_id.as_deref()) {
                             Ok(count) => Response::JobCancelled {

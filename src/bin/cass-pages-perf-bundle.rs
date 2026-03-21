@@ -6,7 +6,7 @@ use coding_agent_search::model::types::{
 use coding_agent_search::pages::bundle::{BundleBuilder, BundleConfig};
 use coding_agent_search::pages::encrypt::EncryptionEngine;
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
-use coding_agent_search::storage::sqlite::SqliteStorage;
+use coding_agent_search::storage::sqlite::FrankenStorage;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -194,7 +194,7 @@ fn generate_db(
     remainder: usize,
     message_len: usize,
 ) -> Result<()> {
-    let mut storage = SqliteStorage::open(db_path).context("open sqlite storage")?;
+    let storage = FrankenStorage::open(db_path).context("open frankensqlite storage")?;
 
     let agent = Agent {
         id: None,

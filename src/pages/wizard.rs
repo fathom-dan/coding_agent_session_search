@@ -26,7 +26,7 @@ use crate::pages::size::{BundleVerifier, SizeEstimate, SizeLimitResult};
 use crate::pages::summary::{
     ExclusionSet, PrePublishSummary, SummaryFilters, SummaryGenerator, format_size,
 };
-use crate::storage::sqlite::SqliteStorage;
+use crate::storage::sqlite::FrankenStorage;
 use frankensqlite::Connection;
 
 /// Deployment target for the export
@@ -343,7 +343,7 @@ impl PagesWizard {
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
 
         // Load agents dynamically from database
-        let storage = SqliteStorage::open_readonly(&self.state.db_path)
+        let storage = FrankenStorage::open_readonly(&self.state.db_path)
             .context("Failed to open database. Run 'cass index' first.")?;
         let db_agents = storage.list_agents()?;
         let db_workspaces = storage.list_workspaces()?;

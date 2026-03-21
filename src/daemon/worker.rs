@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use crate::indexer::semantic::{EmbeddingInput, SemanticIndexer};
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use crate::search::vector_index::{VectorIndex, role_code_from_str, vector_index_path};
-use crate::storage::sqlite::SqliteStorage;
+use crate::storage::sqlite::FrankenStorage;
 
 /// Configuration for a single embedding job.
 #[derive(Debug, Clone)]
@@ -171,7 +171,7 @@ impl EmbeddingWorker {
 
     /// Cancel jobs in the database.
     fn cancel_in_db(db_path: &str, model_id: Option<&str>) -> anyhow::Result<()> {
-        let storage = SqliteStorage::open(Path::new(db_path))?;
+        let storage = FrankenStorage::open(Path::new(db_path))?;
         storage.cancel_embedding_jobs(db_path, model_id)?;
         Ok(())
     }
@@ -182,7 +182,7 @@ impl EmbeddingWorker {
         let index_path = Path::new(&config.index_path);
 
         // Open storage and fetch messages
-        let storage = SqliteStorage::open(db_path)?;
+        let storage = FrankenStorage::open(db_path)?;
         let messages = storage.fetch_messages_for_embedding()?;
         let total_docs = i64::try_from(messages.len()).unwrap_or(i64::MAX);
 
