@@ -813,6 +813,7 @@ fn check_schema_compatibility(
 
 const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
 
+#[cfg(test)]
 const MIGRATION_V1: &str = r"
 PRAGMA foreign_keys = ON;
 
@@ -894,6 +895,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_created
     ON messages(created_at);
 ";
 
+#[cfg(test)]
 const MIGRATION_V2: &str = r"
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
     content,
@@ -920,6 +922,7 @@ JOIN agents a ON c.agent_id = a.id
 LEFT JOIN workspaces w ON c.workspace_id = w.id;
 ";
 
+#[cfg(test)]
 const MIGRATION_V3: &str = r"
 DROP TABLE IF EXISTS fts_messages;
 CREATE VIRTUAL TABLE fts_messages USING fts5(
@@ -947,6 +950,7 @@ JOIN agents a ON c.agent_id = a.id
 LEFT JOIN workspaces w ON c.workspace_id = w.id;
 ";
 
+#[cfg(test)]
 const MIGRATION_V4: &str = r"
 -- Sources table for tracking where conversations come from
 CREATE TABLE IF NOT EXISTS sources (
@@ -965,6 +969,7 @@ INSERT OR IGNORE INTO sources (id, kind, host_label, created_at, updated_at)
 VALUES ('local', 'local', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000);
 ";
 
+#[cfg(test)]
 const MIGRATION_V5: &str = r"
 -- Add provenance columns to conversations table
 -- SQLite cannot alter unique constraints, so we need to recreate the table
@@ -1002,11 +1007,13 @@ CREATE INDEX IF NOT EXISTS idx_conversations_agent_started ON conversations(agen
 CREATE INDEX IF NOT EXISTS idx_conversations_source_id ON conversations(source_id);
 ";
 
+#[cfg(test)]
 const MIGRATION_V6: &str = r"
 -- Optimize lookup by source_path (used by TUI detail view)
 CREATE INDEX IF NOT EXISTS idx_conversations_source_path ON conversations(source_path);
 ";
 
+#[cfg(test)]
 const MIGRATION_V7: &str = r"
 -- Add binary columns for MessagePack serialization (Opt 3.1)
 -- Binary format is 50-70% smaller than JSON and faster to parse
@@ -1014,6 +1021,7 @@ ALTER TABLE conversations ADD COLUMN metadata_bin BLOB;
 ALTER TABLE messages ADD COLUMN extra_bin BLOB;
 ";
 
+#[cfg(test)]
 const MIGRATION_V8: &str = r"
 -- Opt 3.2: Daily stats materialized table for O(1) time-range histograms
 -- Provides fast aggregated queries for stats/dashboard without full table scans
@@ -1033,6 +1041,7 @@ CREATE INDEX IF NOT EXISTS idx_daily_stats_agent ON daily_stats(agent_slug, day_
 CREATE INDEX IF NOT EXISTS idx_daily_stats_source ON daily_stats(source_id, day_id);
 ";
 
+#[cfg(test)]
 const MIGRATION_V9: &str = r"
 -- Background embedding jobs tracking table
 CREATE TABLE IF NOT EXISTS embedding_jobs (
@@ -1055,6 +1064,7 @@ ON embedding_jobs(db_path, model_id)
 WHERE status IN ('pending', 'running');
 ";
 
+#[cfg(test)]
 const MIGRATION_V10: &str = r"
 -- Token analytics: per-message token usage ledger
 CREATE TABLE IF NOT EXISTS token_usage (
