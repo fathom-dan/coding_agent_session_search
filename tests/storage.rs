@@ -70,7 +70,7 @@ fn schema_version_created_on_open() {
 fn rebuild_fts_repopulates_rows() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("fts.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -116,7 +116,7 @@ fn rebuild_fts_repopulates_rows() {
 fn transaction_rolls_back_on_duplicate_idx() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("rollback.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
 
@@ -143,7 +143,7 @@ fn transaction_rolls_back_on_duplicate_idx() {
 fn insert_conversation_tree_rolls_back_when_fts_insert_fails() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("fts_tree_rollback.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     storage
@@ -175,7 +175,7 @@ fn insert_conversation_tree_rolls_back_when_fts_insert_fails() {
 fn insert_conversations_batched_rolls_back_when_fts_insert_fails() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("fts_batch_rollback.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let convs = [
@@ -213,7 +213,7 @@ fn insert_conversations_batched_rolls_back_when_fts_insert_fails() {
 fn append_only_updates_existing_conversation() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("append.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
 
@@ -253,7 +253,7 @@ fn append_only_updates_existing_conversation() {
 fn large_batch_insert_keeps_fts_in_sync() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("batch.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
 
@@ -299,7 +299,7 @@ fn large_batch_insert_keeps_fts_in_sync() {
 fn last_scan_ts_roundtrip() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("scan.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     // Initially None
     assert_eq!(storage.get_last_scan_ts().unwrap(), None);
@@ -317,7 +317,7 @@ fn last_scan_ts_roundtrip() {
 fn last_scan_ts_overwrite() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("scan_over.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     storage.set_last_scan_ts(10).expect("set ts 10");
     storage.set_last_scan_ts(20).expect("set ts 20");
@@ -1472,7 +1472,7 @@ fn sample_conv_with_source(
 fn timeline_source_filter_local_only() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("timeline.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     // Setup: Create agent
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
@@ -1537,7 +1537,7 @@ fn timeline_source_filter_local_only() {
 fn timeline_source_filter_remote_only() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("timeline_remote.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -1602,7 +1602,7 @@ fn timeline_source_filter_remote_only() {
 fn timeline_source_filter_specific_source() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("timeline_specific.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -1684,7 +1684,7 @@ fn timeline_json_includes_source_id_field() {
     // P7.10: Verify timeline SQL returns source_id field
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("timeline_json.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -1725,7 +1725,7 @@ fn timeline_json_includes_origin_kind_field() {
     // P7.10: Verify timeline SQL returns origin_kind from sources table
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("timeline_kind.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -1803,7 +1803,7 @@ fn timeline_json_includes_origin_host_field() {
     // P7.10: Verify timeline SQL returns origin_host for remote sessions
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("timeline_host.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -1881,7 +1881,7 @@ fn timeline_json_grouped_output_includes_provenance() {
     // P7.10: Verify provenance fields are present when timeline is grouped
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("timeline_grouped.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -2007,7 +2007,7 @@ fn daily_stats_day_id_conversion() {
 fn daily_stats_rebuild_from_conversations() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("daily_rebuild.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     // Insert some conversations
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
@@ -2056,7 +2056,7 @@ fn daily_stats_rebuild_from_conversations() {
 fn daily_stats_count_sessions_in_range() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("daily_count.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     // Insert conversations
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
@@ -2108,7 +2108,7 @@ fn daily_stats_count_sessions_in_range() {
 fn daily_stats_histogram() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("daily_hist.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let base_ts = 1704067200000_i64;
@@ -2188,7 +2188,7 @@ fn daily_stats_histogram() {
 fn daily_stats_uses_materialized_after_insert() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("daily_materialized.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let base_ts = 1704067200000_i64;
@@ -2226,7 +2226,7 @@ fn daily_stats_uses_materialized_after_insert() {
 fn daily_stats_health_no_drift_after_inserts() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("daily_health.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let base_ts = 1704067200000_i64;
@@ -2303,7 +2303,7 @@ fn daily_stats_null_timestamp_consistency() {
     // Both should map NULL -> day_id=0 (not a large negative number).
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("daily_null_ts.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
 
@@ -2360,7 +2360,7 @@ fn daily_stats_null_timestamp_consistency() {
 fn daily_stats_batched_insert_no_drift() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("batched_stats.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let ws_id = storage
@@ -2422,7 +2422,7 @@ fn daily_stats_batched_insert_no_drift() {
 fn daily_stats_tree_insert_no_drift() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("tree_stats.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open");
+    let storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     let base_ts = 1704067200000_i64;

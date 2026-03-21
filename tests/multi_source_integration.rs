@@ -119,7 +119,7 @@ fn norm_msg(
 fn index_local_and_remote_sources_preserves_provenance() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("multi_source.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    let storage = SqliteStorage::open(&db_path).expect("open db");
 
     // Setup sources
     storage
@@ -354,7 +354,7 @@ fn persist_conversation_extracts_provenance_from_metadata() {
 fn filter_conversations_local_only() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("filter_local.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    let storage = SqliteStorage::open(&db_path).expect("open db");
 
     storage
         .upsert_source(&Source::local())
@@ -441,7 +441,7 @@ fn filter_conversations_local_only() {
 fn filter_conversations_remote_only() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("filter_remote.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    let storage = SqliteStorage::open(&db_path).expect("open db");
 
     storage
         .upsert_source(&Source::local())
@@ -528,7 +528,7 @@ fn filter_conversations_remote_only() {
 fn filter_conversations_specific_source() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("filter_specific.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    let storage = SqliteStorage::open(&db_path).expect("open db");
 
     storage
         .upsert_source(&Source::local())
@@ -824,7 +824,7 @@ fn incremental_append_to_remote_conversation() {
 fn stats_reflect_source_distribution() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("stats.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    let storage = SqliteStorage::open(&db_path).expect("open db");
 
     // Setup multiple sources
     storage
@@ -942,7 +942,7 @@ fn stats_reflect_source_distribution() {
 fn source_kind_available_via_join() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("kind_join.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    let storage = SqliteStorage::open(&db_path).expect("open db");
 
     storage
         .upsert_source(&Source::local())
@@ -1088,7 +1088,7 @@ fn resync_same_conversation_updates_not_duplicates() {
 fn same_id_different_sources_are_distinct() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("collision.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    let storage = SqliteStorage::open(&db_path).expect("open db");
 
     storage
         .upsert_source(&Source::local())
@@ -1260,7 +1260,7 @@ fn dedup_within_source_not_across() {
 fn composite_key_unique_constraint() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("unique.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    let storage = SqliteStorage::open(&db_path).expect("open db");
 
     storage
         .upsert_source(&Source::local())

@@ -1916,6 +1916,7 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
             {
                 let backup_path = unique_replace_backup_path(final_path);
                 fs::rename(final_path, &backup_path).map_err(|backup_err| {
+                    let _ = fs::remove_file(temp_path);
                     anyhow::anyhow!(
                         "failed preparing backup {} before replacing {}: first error: {}; backup error: {}",
                         backup_path.display(),
@@ -1932,20 +1933,24 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
                     Err(second_err) => {
                         let restore_result = fs::rename(&backup_path, final_path);
                         match restore_result {
-                            Ok(()) => Err(anyhow::anyhow!(
-                                "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
-                                final_path.display(),
-                                temp_path.display(),
-                                first_err,
-                                second_err
-                            )),
+                            Ok(()) => {
+                                let _ = fs::remove_file(temp_path);
+                                Err(anyhow::anyhow!(
+                                    "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
+                                    final_path.display(),
+                                    temp_path.display(),
+                                    first_err,
+                                    second_err
+                                ))
+                            }
                             Err(restore_err) => Err(anyhow::anyhow!(
-                                "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}",
+                                "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}; temp file retained at {}",
                                 final_path.display(),
                                 temp_path.display(),
                                 first_err,
                                 second_err,
-                                restore_err
+                                restore_err,
+                                temp_path.display()
                             )),
                         }
                     }
