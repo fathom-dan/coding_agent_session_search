@@ -1,21 +1,20 @@
 //! Cloudflare Pages deployment module.
 //!
-//! Deploys encrypted archives to Cloudflare Pages using the wrangler CLI.
+//! Deploys encrypted archives to Cloudflare Pages using wrangler or direct API calls.
 //! Supports native COOP/COEP headers, no file size limits, and private repos.
 
 use anyhow::{Context, Result, bail};
 use base64::prelude::*;
 use blake3::Hasher;
 use mime_guess::MimeGuess;
-use reqwest::StatusCode;
-use reqwest::blocking::Client;
-use reqwest::blocking::multipart::{Form, Part};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::TryRecvError;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
@@ -25,6 +24,9 @@ const MAX_RETRIES: u32 = 3;
 
 /// Base delay for exponential backoff (milliseconds)
 const BASE_DELAY_MS: u64 = 1000;
+
+/// Timeout for direct Cloudflare API calls.
+const API_TIMEOUT_SECS: u64 = 30;
 
 /// Prerequisites for Cloudflare Pages deployment
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,18 +48,24 @@ pub struct Prerequisites {
 impl Prerequisites {
     /// Check if all prerequisites are met.
     ///
-    /// Wrangler CLI must be installed, and at least one auth method
-    /// (interactive login or API credentials) must be available.
+    /// Either wrangler must be installed and authenticated, or direct API
+    /// credentials must be present.
     pub fn is_ready(&self) -> bool {
-        self.wrangler_version.is_some()
-            && (self.api_credentials_present || self.wrangler_authenticated)
+        self.api_credentials_present
+            || (self.wrangler_version.is_some() && self.wrangler_authenticated)
     }
 
     /// Get a list of missing prerequisites
     pub fn missing(&self) -> Vec<&'static str> {
+        if self.is_ready() {
+            return Vec::new();
+        }
+
         let mut missing = Vec::new();
-        if self.wrangler_version.is_none() {
-            missing.push("wrangler CLI not installed — run `npm install -g wrangler` to install");
+        if self.wrangler_version.is_none() && !self.api_credentials_present {
+            missing.push(
+                "wrangler CLI not installed — run `npm install -g wrangler` or set CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN for direct API deploys",
+            );
         }
         if !self.wrangler_authenticated && !self.api_credentials_present {
             missing.push(
@@ -278,7 +286,7 @@ impl CloudflareDeployer {
         // Step 2: Copy bundle to temp directory and add Cloudflare files
         progress("prepare", "Preparing deployment...");
         let temp_dir = create_temp_dir()?;
-        let deploy_dir = temp_dir.join("site");
+        let deploy_dir = temp_dir.path().join("site");
         copy_dir_recursive(bundle_dir, &deploy_dir)?;
 
         // Step 3: Generate Cloudflare-specific files
@@ -353,9 +361,6 @@ impl CloudflareDeployer {
 
         progress("complete", "Deployment complete!");
 
-        // Clean up temp directory
-        let _ = std::fs::remove_dir_all(&temp_dir);
-
         Ok(DeployResult {
             project_name: self.config.project_name.clone(),
             pages_url,
@@ -368,8 +373,24 @@ impl CloudflareDeployer {
 
 // Helper functions
 
+struct TempDeployDir {
+    path: PathBuf,
+}
+
+impl TempDeployDir {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDeployDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Create a temporary directory
-fn create_temp_dir() -> Result<PathBuf> {
+fn create_temp_dir() -> Result<TempDeployDir> {
     let temp_base = std::env::temp_dir();
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -379,7 +400,7 @@ fn create_temp_dir() -> Result<PathBuf> {
     let dir_name = format!("cass-cf-deploy-{}-{}", pid, timestamp);
     let temp_dir = temp_base.join(dir_name);
     std::fs::create_dir_all(&temp_dir)?;
-    Ok(temp_dir)
+    Ok(TempDeployDir { path: temp_dir })
 }
 
 fn apply_api_credentials(cmd: &mut Command, account_id: Option<&str>, api_token: Option<&str>) {
@@ -689,14 +710,125 @@ fn api_base_url() -> String {
         .unwrap_or_else(|_| "https://api.cloudflare.com/client/v4".to_string())
 }
 
+fn run_cloudflare_with_cx<T, F, Fut>(f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(asupersync::Cx) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T>> + Send + 'static,
+{
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .context("building Cloudflare API runtime")?;
+
+    runtime.block_on(async move {
+        let handle = asupersync::runtime::Runtime::current_handle()
+            .ok_or_else(|| anyhow::anyhow!("Cloudflare API runtime handle unavailable"))?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        handle
+            .try_spawn_with_cx(move |cx| async move {
+                let _ = tx.send(f(cx).await);
+            })
+            .map_err(|e| anyhow::anyhow!("spawning Cloudflare API task: {e}"))?;
+
+        loop {
+            match rx.try_recv() {
+                Ok(result) => return result,
+                Err(TryRecvError::Empty) => asupersync::runtime::yield_now().await,
+                Err(TryRecvError::Disconnected) => {
+                    bail!("Cloudflare API task exited before returning a result");
+                }
+            }
+        }
+    })
+}
+
+fn cloudflare_api_headers(
+    bearer_token: String,
+    mut extra_headers: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut headers = vec![
+        (
+            "Authorization".to_string(),
+            format!("Bearer {bearer_token}"),
+        ),
+        ("Accept".to_string(), "application/json".to_string()),
+    ];
+    headers.append(&mut extra_headers);
+    headers
+}
+
+fn execute_cloudflare_request(
+    method: asupersync::http::h1::Method,
+    url: String,
+    bearer_token: String,
+    extra_headers: Vec<(String, String)>,
+    body: Vec<u8>,
+) -> Result<asupersync::http::h1::Response> {
+    run_cloudflare_with_cx(move |cx| async move {
+        let client = asupersync::http::h1::HttpClient::builder()
+            .user_agent(concat!(
+                "cass/",
+                env!("CARGO_PKG_VERSION"),
+                " (cloudflare-pages)"
+            ))
+            .build();
+        asupersync::time::timeout(
+            cx.now(),
+            Duration::from_secs(API_TIMEOUT_SECS),
+            client.request(
+                &cx,
+                method,
+                &url,
+                cloudflare_api_headers(bearer_token, extra_headers),
+                body,
+            ),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Cloudflare API request timed out: {e}"))?
+        .context("Failed to contact Cloudflare API")
+    })
+}
+
+fn execute_cloudflare_multipart_request(
+    url: String,
+    bearer_token: String,
+    extra_headers: Vec<(String, String)>,
+    form: asupersync::http::h1::MultipartForm,
+) -> Result<asupersync::http::h1::Response> {
+    run_cloudflare_with_cx(move |cx| async move {
+        let client = asupersync::http::h1::HttpClient::builder()
+            .user_agent(concat!(
+                "cass/",
+                env!("CARGO_PKG_VERSION"),
+                " (cloudflare-pages)"
+            ))
+            .build();
+        asupersync::time::timeout(
+            cx.now(),
+            Duration::from_secs(API_TIMEOUT_SECS),
+            client.request_multipart(
+                &cx,
+                asupersync::http::h1::Method::Post,
+                &url,
+                cloudflare_api_headers(bearer_token, extra_headers),
+                &form,
+            ),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Cloudflare multipart request timed out: {e}"))?
+        .context("Failed to contact Cloudflare API")
+    })
+}
+
 fn parse_api_response<T: DeserializeOwned>(
-    response: reqwest::blocking::Response,
+    response: asupersync::http::h1::Response,
     context_label: &str,
 ) -> Result<T> {
-    let status = response.status();
-    let body = response
-        .text()
-        .context("Failed to read Cloudflare API response body")?;
+    let status = response.status;
+    let body = response.text().map_or_else(
+        |_| String::from_utf8_lossy(response.bytes()).into_owned(),
+        str::to_owned,
+    );
     let envelope: ApiEnvelope<T> = serde_json::from_str(&body).with_context(|| {
         format!(
             "Failed to parse Cloudflare API response for {} (status {})",
@@ -727,19 +859,20 @@ fn parse_api_response<T: DeserializeOwned>(
 }
 
 fn check_project_exists_api(project_name: &str, account_id: &str, api_token: &str) -> Result<bool> {
-    let client = Client::new();
     let url = format!(
         "{}/accounts/{}/pages/projects/{}",
         api_base_url(),
         account_id,
         project_name
     );
-    let response = client
-        .get(url)
-        .bearer_auth(api_token)
-        .send()
-        .context("Failed to query Cloudflare Pages project")?;
-    if response.status() == StatusCode::NOT_FOUND {
+    let response = execute_cloudflare_request(
+        asupersync::http::h1::Method::Get,
+        url,
+        api_token.to_string(),
+        Vec::new(),
+        Vec::new(),
+    )?;
+    if response.status == 404 {
         return Ok(false);
     }
     parse_api_response::<serde_json::Value>(response, "project lookup")?;
@@ -752,7 +885,6 @@ fn create_project_api(
     account_id: &str,
     api_token: &str,
 ) -> Result<()> {
-    let client = Client::new();
     let url = format!("{}/accounts/{}/pages/projects", api_base_url(), account_id);
     let body = json!({
         "name": project_name,
@@ -762,12 +894,13 @@ fn create_project_api(
             "preview": {}
         }
     });
-    let response = client
-        .post(url)
-        .bearer_auth(api_token)
-        .json(&body)
-        .send()
-        .context("Failed to create Cloudflare Pages project")?;
+    let response = execute_cloudflare_request(
+        asupersync::http::h1::Method::Post,
+        url,
+        api_token.to_string(),
+        vec![("Content-Type".to_string(), "application/json".to_string())],
+        serde_json::to_vec(&body).context("Failed to serialize project create body")?,
+    )?;
     parse_api_response::<serde_json::Value>(response, "project create")?;
     Ok(())
 }
@@ -780,42 +913,40 @@ fn deploy_with_api(
     api_token: &str,
     progress: &mut impl FnMut(&str, &str),
 ) -> Result<(String, String)> {
-    let client = Client::new();
     let base_url = api_base_url();
 
     progress("api-token", "Requesting Pages upload token...");
-    let upload_jwt = fetch_upload_token(&client, &base_url, account_id, project_name, api_token)?;
+    let upload_jwt = fetch_upload_token(&base_url, account_id, project_name, api_token)?;
     let max_file_count = jwt_max_file_count(&upload_jwt).unwrap_or(MAX_ASSET_COUNT_DEFAULT);
 
     progress("scan", "Scanning static assets...");
     let file_map = collect_asset_files(deploy_dir, max_file_count)?;
 
     progress("upload", "Uploading Pages assets via API...");
-    upload_assets(&client, &base_url, &upload_jwt, &file_map, false)?;
+    upload_assets(&base_url, &upload_jwt, &file_map, false)?;
 
     progress("deploy", "Creating Pages deployment via API...");
     let manifest = build_manifest(&file_map);
     let manifest_json =
         serde_json::to_string(&manifest).context("Failed to serialize Pages asset manifest")?;
 
-    let mut form = Form::new().text("manifest", manifest_json);
+    let mut form = asupersync::http::h1::MultipartForm::new().text("manifest", manifest_json);
     if !branch.is_empty() {
         form = form.text("branch", branch.to_string());
     }
     let headers_path = deploy_dir.join("_headers");
     if headers_path.exists() {
         let bytes = std::fs::read(&headers_path).context("Failed to read _headers")?;
-        form = form.part(
-            "_headers",
-            Part::bytes(bytes).file_name("_headers".to_string()),
-        );
+        form = form.file("_headers", "_headers", "text/plain; charset=utf-8", bytes);
     }
     let redirects_path = deploy_dir.join("_redirects");
     if redirects_path.exists() {
         let bytes = std::fs::read(&redirects_path).context("Failed to read _redirects")?;
-        form = form.part(
+        form = form.file(
             "_redirects",
-            Part::bytes(bytes).file_name("_redirects".to_string()),
+            "_redirects",
+            "text/plain; charset=utf-8",
+            bytes,
         );
     }
 
@@ -823,12 +954,8 @@ fn deploy_with_api(
         "{}/accounts/{}/pages/projects/{}/deployments",
         base_url, account_id, project_name
     );
-    let response = client
-        .post(deploy_url)
-        .bearer_auth(api_token)
-        .multipart(form)
-        .send()
-        .context("Failed to create Pages deployment via API")?;
+    let response =
+        execute_cloudflare_multipart_request(deploy_url, api_token.to_string(), Vec::new(), form)?;
     let deployment = parse_api_response::<DeploymentResult>(response, "deployment create")?;
 
     let pages_url = deployment
@@ -840,7 +967,6 @@ fn deploy_with_api(
 }
 
 fn fetch_upload_token(
-    client: &Client,
     base_url: &str,
     account_id: &str,
     project_name: &str,
@@ -850,11 +976,13 @@ fn fetch_upload_token(
         "{}/accounts/{}/pages/projects/{}/upload-token",
         base_url, account_id, project_name
     );
-    let response = client
-        .get(url)
-        .bearer_auth(api_token)
-        .send()
-        .context("Failed to request Pages upload token")?;
+    let response = execute_cloudflare_request(
+        asupersync::http::h1::Method::Get,
+        url,
+        api_token.to_string(),
+        Vec::new(),
+        Vec::new(),
+    )?;
     let result = parse_api_response::<UploadTokenResult>(response, "upload token")?;
     Ok(result.jwt)
 }
@@ -981,7 +1109,6 @@ fn build_manifest(file_map: &HashMap<String, AssetFile>) -> HashMap<String, Stri
 }
 
 fn upload_assets(
-    client: &Client,
     base_url: &str,
     jwt: &str,
     file_map: &HashMap<String, AssetFile>,
@@ -993,33 +1120,30 @@ fn upload_assets(
     let missing_hashes = if skip_caching {
         hashes.clone()
     } else {
-        check_missing_hashes(client, base_url, jwt, &hashes)?
+        check_missing_hashes(base_url, jwt, &hashes)?
     };
     let mut missing_files = select_missing_files(file_map, &missing_hashes);
     missing_files.sort_by_key(|file| std::cmp::Reverse(file.size_bytes));
 
     let buckets = build_upload_buckets(&missing_files);
     for bucket in buckets {
-        upload_bucket(client, base_url, jwt, &bucket)?;
+        upload_bucket(base_url, jwt, &bucket)?;
     }
 
-    upsert_hashes(client, base_url, jwt, &hashes)?;
+    upsert_hashes(base_url, jwt, &hashes)?;
     Ok(())
 }
 
-fn check_missing_hashes(
-    client: &Client,
-    base_url: &str,
-    jwt: &str,
-    hashes: &[String],
-) -> Result<Vec<String>> {
+fn check_missing_hashes(base_url: &str, jwt: &str, hashes: &[String]) -> Result<Vec<String>> {
     let url = format!("{}/pages/assets/check-missing", base_url);
-    let response = client
-        .post(url)
-        .bearer_auth(jwt)
-        .json(&json!({ "hashes": hashes }))
-        .send()
-        .context("Failed to check missing Pages assets")?;
+    let response = execute_cloudflare_request(
+        asupersync::http::h1::Method::Post,
+        url,
+        jwt.to_string(),
+        vec![("Content-Type".to_string(), "application/json".to_string())],
+        serde_json::to_vec(&json!({ "hashes": hashes }))
+            .context("Failed to serialize missing-hashes request")?,
+    )?;
     parse_api_response::<Vec<String>>(response, "asset check-missing")
 }
 
@@ -1084,7 +1208,7 @@ fn select_missing_files<'a>(
     by_hash.into_values().collect()
 }
 
-fn upload_bucket(client: &Client, base_url: &str, jwt: &str, bucket: &[&AssetFile]) -> Result<()> {
+fn upload_bucket(base_url: &str, jwt: &str, bucket: &[&AssetFile]) -> Result<()> {
     if bucket.is_empty() {
         return Ok(());
     }
@@ -1102,24 +1226,27 @@ fn upload_bucket(client: &Client, base_url: &str, jwt: &str, bucket: &[&AssetFil
         .collect::<Result<Vec<_>>>()?;
 
     let url = format!("{}/pages/assets/upload", base_url);
-    let response = client
-        .post(url)
-        .bearer_auth(jwt)
-        .json(&payload)
-        .send()
-        .context("Failed to upload Pages asset bucket")?;
+    let response = execute_cloudflare_request(
+        asupersync::http::h1::Method::Post,
+        url,
+        jwt.to_string(),
+        vec![("Content-Type".to_string(), "application/json".to_string())],
+        serde_json::to_vec(&payload).context("Failed to serialize asset upload bucket")?,
+    )?;
     parse_api_response::<serde_json::Value>(response, "asset upload")?;
     Ok(())
 }
 
-fn upsert_hashes(client: &Client, base_url: &str, jwt: &str, hashes: &[String]) -> Result<()> {
+fn upsert_hashes(base_url: &str, jwt: &str, hashes: &[String]) -> Result<()> {
     let url = format!("{}/pages/assets/upsert-hashes", base_url);
-    let response = client
-        .post(url)
-        .bearer_auth(jwt)
-        .json(&json!({ "hashes": hashes }))
-        .send()
-        .context("Failed to upsert Pages asset hashes")?;
+    let response = execute_cloudflare_request(
+        asupersync::http::h1::Method::Post,
+        url,
+        jwt.to_string(),
+        vec![("Content-Type".to_string(), "application/json".to_string())],
+        serde_json::to_vec(&json!({ "hashes": hashes }))
+            .context("Failed to serialize asset hash upsert body")?,
+    )?;
     parse_api_response::<serde_json::Value>(response, "asset upsert-hashes")?;
     Ok(())
 }
@@ -1236,6 +1363,21 @@ mod tests {
     }
 
     #[test]
+    fn test_prerequisites_ready_with_api_only() {
+        let prereqs = Prerequisites {
+            wrangler_version: None,
+            wrangler_authenticated: false,
+            account_email: None,
+            api_credentials_present: true,
+            account_id: Some("abc123".to_string()),
+            disk_space_mb: 1000,
+        };
+
+        assert!(prereqs.is_ready());
+        assert!(prereqs.missing().is_empty());
+    }
+
+    #[test]
     fn test_config_default() {
         let config = CloudflareConfig::default();
         assert_eq!(config.project_name, "cass-archive");
@@ -1333,6 +1475,19 @@ mod tests {
         assert!(dst.path().join("root.txt").exists());
         assert!(!dst.path().join("linked-file.txt").exists());
         assert!(!dst.path().join("linked-dir").exists());
+    }
+
+    #[test]
+    fn test_temp_deploy_dir_cleans_up_on_drop() {
+        let temp_path = {
+            let temp = create_temp_dir().unwrap();
+            let marker = temp.path().join("marker.txt");
+            std::fs::write(&marker, "cleanup").unwrap();
+            assert!(marker.exists());
+            temp.path().to_path_buf()
+        };
+
+        assert!(!temp_path.exists());
     }
 
     #[test]
