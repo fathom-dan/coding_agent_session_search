@@ -341,7 +341,7 @@ fn parity_delete_local_source_fails() {
 #[test]
 #[ignore = "frankensqlite: ORDER BY expression not in SELECT list (list_conversations)"]
 fn parity_insert_and_list_conversations() {
-    let (_dir, mut sql, frank) = open_both();
+    let (_dir, sql, frank) = open_both();
 
     let agent = make_agent("claude", "Claude");
     let sql_agent_id = sql.ensure_agent(&agent).unwrap();
@@ -381,7 +381,7 @@ fn parity_insert_and_list_conversations() {
 /// Verify insert + fetch_messages parity without list_conversations (avoids ORDER BY issue).
 #[test]
 fn parity_insert_and_fetch_messages() {
-    let (_dir, mut sql, frank) = open_both();
+    let (_dir, sql, frank) = open_both();
 
     let agent = make_agent("claude", "Claude");
     let sql_agent_id = sql.ensure_agent(&agent).unwrap();
@@ -425,7 +425,7 @@ fn parity_insert_and_fetch_messages() {
 
 #[test]
 fn parity_fetch_messages_four_msgs() {
-    let (_dir, mut sql, frank) = open_both();
+    let (_dir, sql, frank) = open_both();
 
     let agent = make_agent("claude", "Claude");
     let sql_agent_id = sql.ensure_agent(&agent).unwrap();
@@ -464,7 +464,7 @@ fn parity_fetch_messages_four_msgs() {
 
 #[test]
 fn parity_insert_with_snippets() {
-    let (_dir, mut sql, frank) = open_both();
+    let (_dir, sql, frank) = open_both();
 
     let agent = make_agent("claude", "Claude");
     let sql_agent_id = sql.ensure_agent(&agent).unwrap();
@@ -499,7 +499,7 @@ fn parity_insert_with_snippets() {
 #[test]
 #[ignore = "frankensqlite: Placeholder in subquery (dedup SELECT with ?1 in WHERE clause)"]
 fn parity_conversation_dedup_by_external_id() {
-    let (_dir, mut sql, frank) = open_both();
+    let (_dir, sql, frank) = open_both();
 
     let agent = make_agent("claude", "Claude");
     let sql_agent_id = sql.ensure_agent(&agent).unwrap();
@@ -547,7 +547,7 @@ fn parity_conversation_dedup_by_external_id() {
 #[test]
 #[ignore = "frankensqlite: ORDER BY expression not in SELECT list (list_conversations)"]
 fn parity_list_conversations_pagination() {
-    let (_dir, mut sql, frank) = open_both();
+    let (_dir, sql, frank) = open_both();
 
     let agent = make_agent("claude", "Claude");
     let sql_agent_id = sql.ensure_agent(&agent).unwrap();
@@ -589,7 +589,7 @@ fn parity_list_conversations_pagination() {
 
 #[test]
 fn parity_scan_timestamp_roundtrip() {
-    let (_dir, mut sql, frank) = open_both();
+    let (_dir, sql, frank) = open_both();
 
     assert_eq!(sql.get_last_scan_ts().unwrap(), None);
     assert_eq!(frank.get_last_scan_ts().unwrap(), None);
@@ -608,7 +608,7 @@ fn parity_scan_timestamp_roundtrip() {
 
 #[test]
 fn parity_rebuild_fts_and_query() {
-    let (_dir, mut sql, frank) = open_both();
+    let (_dir, sql, frank) = open_both();
 
     let agent = make_agent("claude", "Claude");
     let sql_agent_id = sql.ensure_agent(&agent).unwrap();
@@ -665,7 +665,7 @@ fn parity_empty_database_conversations() {
 
 #[test]
 fn parity_unicode_content() {
-    let (_dir, mut sql, frank) = open_both();
+    let (_dir, sql, frank) = open_both();
 
     let agent = make_agent("claude", "Claude");
     let sql_agent_id = sql.ensure_agent(&agent).unwrap();
@@ -695,7 +695,7 @@ fn parity_unicode_content() {
 
 #[test]
 fn parity_null_handling() {
-    let (_dir, mut sql, frank) = open_both();
+    let (_dir, sql, frank) = open_both();
 
     let agent = make_agent("claude", "Claude");
     let sql_agent_id = sql.ensure_agent(&agent).unwrap();
@@ -744,7 +744,7 @@ fn parity_null_handling() {
 
 #[test]
 fn parity_large_content() {
-    let (_dir, mut sql, frank) = open_both();
+    let (_dir, sql, frank) = open_both();
 
     let agent = make_agent("claude", "Claude");
     let sql_agent_id = sql.ensure_agent(&agent).unwrap();
@@ -779,7 +779,7 @@ fn parity_large_content() {
 #[test]
 #[ignore = "frankensqlite: daily_stats UNIQUE constraint + ORDER BY expression not in SELECT list"]
 fn parity_multiple_agents_multiple_conversations() {
-    let (_dir, mut sql, frank) = open_both();
+    let (_dir, sql, frank) = open_both();
 
     let agents = [
         make_agent("claude", "Claude"),
@@ -999,7 +999,7 @@ fn transition_rusqlite_db_readable_by_frankenstorage_basic() {
 
     // Create and populate with SqliteStorage
     {
-        let mut sql = SqliteStorage::open(&db_path).unwrap();
+        let sql = SqliteStorage::open(&db_path).unwrap();
         let agent_id = sql.ensure_agent(&make_agent("claude", "Claude")).unwrap();
 
         let conv = make_conversation(
@@ -1037,7 +1037,7 @@ fn transition_rusqlite_db_conversations_readable() {
     let db_path = dir.path().join("transition_conv.db");
 
     {
-        let mut sql = SqliteStorage::open(&db_path).unwrap();
+        let sql = SqliteStorage::open(&db_path).unwrap();
         let agent_id = sql.ensure_agent(&make_agent("claude", "Claude")).unwrap();
 
         let conv = make_conversation(
@@ -1103,7 +1103,7 @@ fn transition_frankenstorage_data_readable_by_rusqlite() {
 #[test]
 #[ignore = "frankensqlite: mixed aggregate and non-aggregate columns without GROUP BY"]
 fn parity_count_sessions_in_range() {
-    let (_dir, mut sql, frank) = open_both();
+    let (_dir, sql, frank) = open_both();
 
     let agent = make_agent("claude", "Claude");
     let sql_agent_id = sql.ensure_agent(&agent).unwrap();

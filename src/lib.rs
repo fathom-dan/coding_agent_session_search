@@ -13805,7 +13805,7 @@ mod indexed_conversation_fallback_tests {
     fn db_fallback_loads_virtual_source_path_and_converts_messages() {
         let tmp = TempDir::new().expect("temp dir");
         let db_path = tmp.path().join("agent_search.db");
-        let mut storage = SqliteStorage::open(&db_path).expect("open sqlite");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
 
         let agent = Agent {
             id: None,

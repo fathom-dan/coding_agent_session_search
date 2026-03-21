@@ -210,7 +210,7 @@ fn build_pipeline(config: &E2EConfig) -> PipelineArtifacts {
 /// Setup test database with conversation fixtures.
 fn setup_test_db(data_dir: &Path, config: &E2EConfig) -> std::path::PathBuf {
     let db_path = data_dir.join("agent_search.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("Failed to open storage");
+    let storage = SqliteStorage::open(&db_path).expect("Failed to open storage");
 
     // Create agent
     let agent = Agent {
@@ -689,7 +689,7 @@ fn test_export_with_filters() {
 
     // Create DB with multiple agents
     let db_path = data_dir.join("agent_search.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("Failed to open storage");
+    let storage = SqliteStorage::open(&db_path).expect("Failed to open storage");
 
     // Create two agents
     let claude_agent = Agent {

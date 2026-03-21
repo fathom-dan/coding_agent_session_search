@@ -329,7 +329,7 @@ fn setup_db_internal(data_dir: &Path, include_secret: bool) {
     }
 
     // Initialize DB with schema
-    let mut storage = SqliteStorage::open(&db_path).expect("Failed to open storage");
+    let storage = SqliteStorage::open(&db_path).expect("Failed to open storage");
 
     // Create Agent
     let agent = Agent {

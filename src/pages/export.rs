@@ -75,7 +75,7 @@ impl ExportEngine {
                 .context("Failed to remove existing output file")?;
         }
         let output_path = self.output_path.to_string_lossy().to_string();
-        let mut dest =
+        let dest =
             Connection::open(&output_path).context("Failed to create output database")?;
 
         let mut tx = dest.transaction()?;

@@ -442,7 +442,7 @@ fn test_fts_rebuild() {
     }
 
     // Open and rebuild FTS
-    let mut storage = SqliteStorage::open(&db_path).unwrap();
+    let storage = SqliteStorage::open(&db_path).unwrap();
     let result = storage.rebuild_fts();
 
     assert!(

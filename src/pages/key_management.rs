@@ -36,7 +36,6 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use tracing::info;
-use zeroize::Zeroize;
 
 /// Argon2id default parameters
 const ARGON2_MEMORY_KB: u32 = 65536; // 64 MB
@@ -130,7 +129,7 @@ pub fn key_add_password(
     let mut config = load_config(archive_dir)?;
 
     // Unlock with current password to get DEK
-    let mut dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, current_password)?);
+    let dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, current_password)?);
 
     // Create new slot (use max ID + 1 since IDs are stable after revocation)
     // If no slots exist, start at 0; otherwise use max + 1
@@ -164,7 +163,7 @@ pub fn key_add_recovery(
     let mut config = load_config(archive_dir)?;
 
     // Unlock with current password to get DEK
-    let mut dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, current_password)?);
+    let dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, current_password)?);
 
     // Generate recovery secret
     let secret = RecoverySecret::generate();
@@ -252,7 +251,7 @@ pub fn key_rotate(
     let config = load_config(archive_dir)?;
 
     // 1. Decrypt payload with old password
-    let mut old_dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, old_password)?);
+    let old_dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, old_password)?);
     let plaintext =
         zeroize::Zeroizing::new(decrypt_all_chunks(archive_dir, &old_dek, &config, |p| {
             progress(p * 0.5)

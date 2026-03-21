@@ -44,7 +44,7 @@ fn tracker_for(test_name: &str) -> PhaseTracker {
 
 /// Create a minimal test database with conversations for recovery testing.
 fn create_test_database(db_path: &Path, conversation_count: usize) -> anyhow::Result<()> {
-    let mut storage = SqliteStorage::open(db_path)?;
+    let storage = SqliteStorage::open(db_path)?;
 
     let agent = Agent {
         id: None,

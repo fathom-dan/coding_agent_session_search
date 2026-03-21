@@ -3747,8 +3747,8 @@ mod tests {
             vec![amp_file],
             &[(ConnectorKind::Amp, ScanRoot::local(amp_dir))],
             state.clone(),
-            storage,
-            t_index,
+            storage.clone(),
+            t_index.clone(),
             false,
         )
         .unwrap();

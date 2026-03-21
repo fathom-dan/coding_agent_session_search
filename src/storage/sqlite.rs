@@ -5725,24 +5725,22 @@ mod tests {
 
         // Helper: collect column names from PRAGMA table_info
         fn col_names(conn: &FrankenConnection, table: &str) -> Vec<String> {
-            let mut stmt = conn
-                .prepare(&format!("PRAGMA table_info({})", table))
-                .unwrap();
-            stmt.query_map([], |row| row.get_typed::<String>(1))
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect()
+            conn.query_map_collect(
+                &format!("PRAGMA table_info({})", table),
+                fparams![],
+                |row: &FrankenRow| row.get_typed(1),
+            )
+            .unwrap()
         }
 
         // Helper: collect index names from PRAGMA index_list
         fn idx_names(conn: &FrankenConnection, table: &str) -> Vec<String> {
-            let mut stmt = conn
-                .prepare(&format!("PRAGMA index_list({})", table))
-                .unwrap();
-            stmt.query_map([], |row| row.get_typed::<String>(1))
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect()
+            conn.query_map_collect(
+                &format!("PRAGMA index_list({})", table),
+                fparams![],
+                |row: &FrankenRow| row.get_typed(1),
+            )
+            .unwrap()
         }
 
         // Verify message_metrics table exists with expected columns
@@ -5907,11 +5905,10 @@ mod tests {
             .unwrap();
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '10')",
-                [],
             )
             .unwrap();
             // Apply V1-V10 so schema is correct
-            let tx = conn.transaction().unwrap();
+            let mut tx = conn.transaction().unwrap();
             tx.execute_batch(MIGRATION_V1).unwrap();
             tx.execute_batch(MIGRATION_V2).unwrap();
             tx.execute_batch(MIGRATION_V3).unwrap();
@@ -5924,7 +5921,6 @@ mod tests {
             tx.execute_batch(MIGRATION_V10).unwrap();
             tx.execute(
                 "UPDATE meta SET value = '10' WHERE key = 'schema_version'",
-                [],
             )
             .unwrap();
             tx.commit().unwrap();
@@ -5941,10 +5937,10 @@ mod tests {
         // Verify new tables exist
         let count: i64 = storage
             .raw()
-            .query_row(
+            .query_row_map(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('message_metrics', 'usage_hourly', 'usage_daily', 'usage_models_daily')",
-                [],
-                |row| row.get_typed::<i64>(0),
+                &[],
+                |row: &FrankenRow| row.get_typed::<i64>(0),
             )
             .unwrap();
         assert_eq!(count, 4, "All 4 analytics tables should exist");
@@ -6057,27 +6053,26 @@ mod tests {
         assert_eq!(mm_count, 3, "Should have 3 message_metrics rows");
 
         // Verify hour_id and day_id are correct
-        let mut stmt = conn
-            .prepare("SELECT hour_id, day_id, role, content_tokens_est, has_plan, api_data_source, model_family, model_tier, provider FROM message_metrics ORDER BY message_id")
-            .unwrap();
         #[allow(clippy::type_complexity)]
-        let rows: Vec<(i64, i64, String, i64, i64, String, String, String, String)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get_typed(0)?,
-                    row.get_typed(1)?,
-                    row.get_typed(2)?,
-                    row.get_typed(3)?,
-                    row.get_typed(4)?,
-                    row.get_typed(5)?,
-                    row.get_typed(6)?,
-                    row.get_typed(7)?,
-                    row.get_typed(8)?,
-                ))
-            })
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
+        let rows: Vec<(i64, i64, String, i64, i64, String, String, String, String)> = conn
+            .query_map_collect(
+                "SELECT hour_id, day_id, role, content_tokens_est, has_plan, api_data_source, model_family, model_tier, provider FROM message_metrics ORDER BY message_id",
+                fparams![],
+                |row: &FrankenRow| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                        row.get_typed(5)?,
+                        row.get_typed(6)?,
+                        row.get_typed(7)?,
+                        row.get_typed(8)?,
+                    ))
+                },
+            )
+            .unwrap();
 
         assert_eq!(rows.len(), 3);
         // All messages in the same hour/day
@@ -6116,12 +6111,12 @@ mod tests {
             i64,
             i64,
         ) = conn
-            .query_row(
+            .query_row_map(
                 "SELECT message_count, user_message_count, assistant_message_count, plan_message_count,
                         plan_content_tokens_est_total, plan_api_tokens_total, api_coverage_message_count
                  FROM usage_hourly WHERE hour_id = ?",
                 fparams![expected_hour],
-                |row| {
+                |row: &FrankenRow| {
                     Ok((
                         row.get_typed(0)?,
                         row.get_typed(1)?,
@@ -6153,10 +6148,10 @@ mod tests {
 
         // Verify usage_daily rollup matches hourly (same day)
         let (ud_msg, ud_api_cov): (i64, i64) = conn
-            .query_row(
+            .query_row_map(
                 "SELECT message_count, api_coverage_message_count FROM usage_daily WHERE day_id = ?",
                 fparams![expected_day],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                |row: &FrankenRow| Ok((row.get_typed(0)?, row.get_typed(1)?)),
             )
             .unwrap();
         assert_eq!(ud_msg, 3, "Daily rollup should match hourly");
@@ -6167,10 +6162,10 @@ mod tests {
 
         // Verify the API input tokens from message_metrics (only API-sourced)
         let api_only_input: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COALESCE(SUM(api_input_tokens), 0) FROM message_metrics WHERE day_id = ? AND api_data_source = 'api'",
                 fparams![expected_day],
-                |row| row.get_typed::<i64>(0),
+                |row: &FrankenRow| row.get_typed::<i64>(0),
             )
             .unwrap();
         assert_eq!(
@@ -6187,18 +6182,18 @@ mod tests {
             )
             .unwrap();
         let mm_plan_content_est: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COALESCE(SUM(content_tokens_est), 0) FROM message_metrics WHERE day_id = ? AND has_plan = 1",
                 fparams![expected_day],
-                |row| row.get_typed::<i64>(0),
+                |row: &FrankenRow| row.get_typed::<i64>(0),
             )
             .unwrap();
         let mm_plan_api_total: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COALESCE(SUM(COALESCE(api_input_tokens, 0) + COALESCE(api_output_tokens, 0) + COALESCE(api_cache_read_tokens, 0) + COALESCE(api_cache_creation_tokens, 0) + COALESCE(api_thinking_tokens, 0)), 0)
                  FROM message_metrics WHERE day_id = ? AND has_plan = 1 AND api_data_source = 'api'",
                 fparams![expected_day],
-                |row| row.get_typed::<i64>(0),
+                |row: &FrankenRow| row.get_typed::<i64>(0),
             )
             .unwrap();
         let ud_content_est: i64 = conn
@@ -6209,10 +6204,10 @@ mod tests {
             )
             .unwrap();
         let (ud_plan_content_est, ud_plan_api_total): (i64, i64) = conn
-            .query_row(
+            .query_row_map(
                 "SELECT plan_content_tokens_est_total, plan_api_tokens_total FROM usage_daily WHERE day_id = ?",
                 fparams![expected_day],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                |row: &FrankenRow| Ok((row.get_typed(0)?, row.get_typed(1)?)),
             )
             .unwrap();
         assert_eq!(
@@ -6236,12 +6231,12 @@ mod tests {
             i64,
             i64,
         ) = conn
-            .query_row(
+            .query_row_map(
                 "SELECT message_count, user_message_count, assistant_message_count, api_tokens_total, api_coverage_message_count
                  FROM usage_models_daily
                  WHERE day_id = ? AND model_family = 'claude' AND model_tier = 'opus'",
                 fparams![expected_day],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?, row.get_typed(4)?)),
+                |row: &FrankenRow| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?, row.get_typed(4)?)),
             )
             .unwrap();
         assert_eq!(claude_msg, 1);
@@ -6525,10 +6520,10 @@ mod tests {
             })
             .unwrap();
         let orig_api_input: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COALESCE(SUM(api_input_tokens), 0) FROM message_metrics WHERE api_data_source = 'api'",
-                [],
-                |row| row.get_typed(0),
+                &[],
+                |row: &FrankenRow| row.get_typed(0),
             )
             .unwrap();
 
@@ -6604,10 +6599,10 @@ mod tests {
 
         // Verify API token data preserved through rebuild
         let rebuilt_api_input: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COALESCE(SUM(api_input_tokens), 0) FROM message_metrics WHERE api_data_source = 'api'",
-                [],
-                |row| row.get_typed(0),
+                &[],
+                |row: &FrankenRow| row.get_typed(0),
             )
             .unwrap();
         assert_eq!(
@@ -6624,12 +6619,12 @@ mod tests {
             i64,
             i64,
         ) = conn
-            .query_row(
+            .query_row_map(
                 "SELECT message_count, user_message_count, assistant_message_count, plan_message_count,
                         plan_content_tokens_est_total, plan_api_tokens_total
                  FROM usage_hourly WHERE hour_id = ?",
                 fparams![expected_hour],
-                |row| {
+                |row: &FrankenRow| {
                     Ok((
                         row.get_typed(0)?,
                         row.get_typed(1)?,
@@ -7005,7 +7000,7 @@ mod tests {
             .raw()
             .query_row_map(
                 "SELECT COUNT(*) FROM pragma_table_info('conversations') WHERE name = 'metadata_bin'", &[],
-                |r| r.get::<_, i64>(0).map(|c| c > 0),
+                |r: &FrankenRow| Ok(r.get_typed::<i64>(0)? > 0),
             )
             .unwrap();
         assert!(
@@ -7019,7 +7014,7 @@ mod tests {
             .query_row_map(
                 "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'extra_bin'",
                 &[],
-                |r| r.get::<_, i64>(0).map(|c| c > 0),
+                |r: &FrankenRow| Ok(r.get_typed::<i64>(0)? > 0),
             )
             .unwrap();
         assert!(has_extra_bin, "messages should have extra_bin column");
