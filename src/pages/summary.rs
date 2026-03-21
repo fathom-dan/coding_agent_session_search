@@ -1007,7 +1007,6 @@ impl PrePublishSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankensqlite::compat::BatchExt;
     use tempfile::TempDir;
 
     fn create_test_db() -> (TempDir, Connection) {

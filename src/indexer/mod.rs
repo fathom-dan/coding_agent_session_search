@@ -1682,7 +1682,7 @@ fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
          DELETE FROM daily_stats;
          DELETE FROM message_metrics;
          DELETE FROM token_usage;
-         DELETE FROM fts_messages;
+         INSERT INTO fts_messages(fts_messages) VALUES('delete-all');
          DELETE FROM snippets;
          DELETE FROM messages;
          DELETE FROM conversations;

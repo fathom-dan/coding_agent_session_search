@@ -1539,6 +1539,9 @@ impl FrankenStorage {
         let path_str = path.to_string_lossy().to_string();
         let conn = FrankenConnection::open(&path_str)
             .with_context(|| format!("opening frankensqlite writer at {}", path.display()))?;
+        // FrankenSQLite skips virtual-table entries (rootpage=0); re-register
+        // FTS5 so INSERT into fts_messages works on writer connections.
+        let _ = conn.execute(FTS5_REGISTER_SQL);
         let storage = Self { conn };
         storage.apply_config()?;
         Ok(storage)

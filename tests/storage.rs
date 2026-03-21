@@ -93,7 +93,10 @@ fn rebuild_fts_repopulates_rows() {
 
     storage
         .raw()
-        .execute("DELETE FROM fts_messages", [])
+        .execute(
+            "INSERT INTO fts_messages(fts_messages) VALUES('delete-all')",
+            [],
+        )
         .unwrap();
     fts_count = storage
         .raw()
@@ -175,7 +178,7 @@ fn insert_conversations_batched_rolls_back_when_fts_insert_fails() {
     let mut storage = SqliteStorage::open(&db_path).expect("open");
 
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
-    let convs = vec![
+    let convs = [
         sample_conv(Some("batch-rollback-1"), vec![msg(0, 1)]),
         sample_conv(Some("batch-rollback-2"), vec![msg(0, 2)]),
     ];

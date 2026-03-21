@@ -1026,7 +1026,6 @@ pub fn perf_breakdown_guardrail(conn: &Connection) -> PerfMeasurement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankensqlite::compat::BatchExt;
 
     // -- Fixture helpers --
 

@@ -3265,7 +3265,7 @@ fn format_number(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankensqlite::compat::{BatchExt, ConnectionExt};
+    use frankensqlite::compat::ConnectionExt;
     use frankensqlite::params;
 
     #[test]

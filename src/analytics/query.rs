@@ -1554,8 +1554,6 @@ mod tests {
     // Integration tests with in-memory SQLite
     // -----------------------------------------------------------------------
 
-    use frankensqlite::compat::BatchExt;
-
     /// Create an in-memory database with the usage_daily schema and seed data.
     fn setup_usage_daily_db() -> Connection {
         let conn = Connection::open(":memory:").unwrap();

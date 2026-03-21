@@ -785,7 +785,6 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_db() -> (TempDir, Connection) {
-        use frankensqlite::compat::BatchExt;
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();

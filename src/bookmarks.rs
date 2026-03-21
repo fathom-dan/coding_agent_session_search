@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use frankensqlite::Connection;
-use frankensqlite::compat::{BatchExt, ConnectionExt, OptionalExtension, RowExt, TransactionExt};
+use frankensqlite::compat::{ConnectionExt, OptionalExtension, RowExt, TransactionExt};
 use frankensqlite::params;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

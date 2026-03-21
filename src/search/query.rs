@@ -1954,24 +1954,29 @@ impl CacheShards {
         while self.total_cost > self.total_cap
             || (self.byte_cap > 0 && self.total_bytes > self.byte_cap)
         {
-            let mut evicted = false;
-            for shard in self.shards.values_mut() {
-                if let Some((_k, v)) = shard.pop_lru() {
+            // Find the shard with the most cached items. This distributes
+            // evictions fairly and prevents the first shard in HashMap
+            // iteration order from absorbing all evictions.
+            let mut largest_shard_key = None;
+            let mut max_len = 0;
+            for (k, v) in self.shards.iter() {
+                if v.len() > max_len {
+                    max_len = v.len();
+                    largest_shard_key = Some(k.clone());
+                }
+            }
+
+            if let Some(key) = largest_shard_key {
+                if let Some(shard) = self.shards.get_mut(&key)
+                    && let Some((_k, v)) = shard.pop_lru()
+                {
                     let evicted_bytes: usize = v.iter().map(CachedHit::approx_bytes).sum();
                     self.total_cost = self.total_cost.saturating_sub(v.len());
                     self.total_bytes = self.total_bytes.saturating_sub(evicted_bytes);
                     self.eviction_count += 1;
-                    evicted = true;
-                    // Check if we're back within both caps
-                    let within_cost = self.total_cost <= self.total_cap;
-                    let within_bytes = self.byte_cap == 0 || self.total_bytes <= self.byte_cap;
-                    if within_cost && within_bytes {
-                        break;
-                    }
                 }
-            }
-            if !evicted {
-                break;
+            } else {
+                break; // All shards are empty
             }
         }
     }
