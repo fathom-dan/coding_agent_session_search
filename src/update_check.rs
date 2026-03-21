@@ -7,10 +7,10 @@
 //! - Hourly check cadence (configurable)
 
 use anyhow::{Context, Result};
-use reqwest::Client;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
@@ -162,10 +162,9 @@ struct GitHubRelease {
 /// Check for updates asynchronously
 ///
 /// Returns None if:
-/// - Not enough time since last check
+/// - Not enough time since last successful check
 /// - Network error (offline-friendly)
 /// - Parse error
-/// - Already on latest
 pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
     // Escape hatch for CI/CD or restricted environments
     if updates_disabled() {
@@ -180,13 +179,6 @@ pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
         return None;
     }
 
-    // Mark that we're checking (even if it fails)
-    state.mark_checked();
-    if let Err(e) = state.save_async().await {
-        warn!("update check: failed to save state: {e}");
-    }
-
-    // Fetch latest release
     let release = match fetch_latest_release().await {
         Ok(r) => r,
         Err(e) => {
@@ -215,6 +207,13 @@ pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
 
     let is_newer = latest > current;
     let is_skipped = state.is_skipped(latest_str);
+
+    // Persist cadence only after a successful fetch + parse so transient
+    // network or server errors do not suppress future checks for an hour.
+    state.mark_checked();
+    if let Err(e) = state.save_async().await {
+        warn!("update check: failed to save state: {e}");
+    }
 
     Some(UpdateInfo {
         latest_version: latest_str.to_string(),
@@ -337,33 +336,6 @@ fn release_api_base_url() -> String {
         .unwrap_or_else(|_| format!("https://api.github.com/repos/{GITHUB_REPO}"))
 }
 
-/// Fetch latest release from GitHub API
-async fn fetch_latest_release() -> Result<GitHubRelease> {
-    let url = format!("{}/releases/latest", release_api_base_url());
-
-    let client = Client::builder()
-        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .user_agent(concat!("cass/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building http client")?;
-
-    let response = client
-        .get(&url)
-        .header("Accept", "application/vnd.github.v3+json")
-        .send()
-        .await
-        .context("fetching release")?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("GitHub API returned {}", response.status());
-    }
-
-    response
-        .json::<GitHubRelease>()
-        .await
-        .context("parsing release JSON")
-}
-
 /// Get path to update state file
 fn state_path() -> PathBuf {
     crate::default_data_dir().join("update_state.json")
@@ -392,7 +364,7 @@ fn now_unix() -> i64 {
 // ============================================================================
 
 /// Synchronous version of `check_for_updates` for use in sync TUI code.
-/// Uses reqwest blocking client with short timeout.
+/// Uses a short-lived asupersync runtime and native HTTP client.
 pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
     if updates_disabled() {
         return None;
@@ -404,12 +376,6 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
     if !state.should_check() {
         debug!("update check: skipping, checked recently");
         return None;
-    }
-
-    // Mark that we're checking (even if it fails)
-    state.mark_checked();
-    if let Err(e) = state.save() {
-        warn!("update check: failed to save state: {e}");
     }
 
     // Fetch latest release (blocking)
@@ -442,6 +408,13 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
     let is_newer = latest > current;
     let is_skipped = state.is_skipped(latest_str);
 
+    // Persist cadence only after a successful fetch + parse so transient
+    // network or server errors do not suppress future checks for an hour.
+    state.mark_checked();
+    if let Err(e) = state.save() {
+        warn!("update check: failed to save state: {e}");
+    }
+
     Some(UpdateInfo {
         latest_version: latest_str.to_string(),
         tag_name: release.tag_name,
@@ -452,29 +425,71 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
     })
 }
 
-/// Fetch latest release using blocking HTTP client
-fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
+/// Fetch latest release using the native asupersync HTTP client.
+async fn fetch_latest_release() -> Result<GitHubRelease> {
+    if let Some(cx) = asupersync::Cx::current() {
+        return fetch_latest_release_with_cx(&cx).await;
+    }
+
+    let handle = asupersync::runtime::Runtime::current_handle()
+        .context("update check requires an active asupersync runtime")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    handle
+        .try_spawn_with_cx(move |cx| async move {
+            let _ = tx.send(fetch_latest_release_with_cx(&cx).await);
+        })
+        .context("spawning update check task")?;
+
+    loop {
+        match rx.try_recv() {
+            Ok(result) => return result,
+            Err(TryRecvError::Empty) => asupersync::runtime::yield_now().await,
+            Err(TryRecvError::Disconnected) => {
+                anyhow::bail!("update check task exited before returning a result");
+            }
+        }
+    }
+}
+
+async fn fetch_latest_release_with_cx(cx: &asupersync::Cx) -> Result<GitHubRelease> {
     let url = format!("{}/releases/latest", release_api_base_url());
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+    let client = asupersync::http::h1::HttpClient::builder()
         .user_agent(concat!("cass/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building http client")?;
+        .build();
+    let response = asupersync::time::timeout(
+        cx.now(),
+        Duration::from_secs(HTTP_TIMEOUT_SECS),
+        client.request(
+            cx,
+            asupersync::http::h1::Method::Get,
+            &url,
+            vec![(
+                "Accept".to_string(),
+                "application/vnd.github.v3+json".to_string(),
+            )],
+            Vec::new(),
+        ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("timed out fetching release: {e}"))?
+    .context("fetching release")?;
 
-    let response = client
-        .get(&url)
-        .header("Accept", "application/vnd.github.v3+json")
-        .send()
-        .context("fetching release")?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("GitHub API returned {}", response.status());
+    if !response.is_success() {
+        anyhow::bail!("GitHub API returned {}", response.status);
     }
 
     response
         .json::<GitHubRelease>()
         .context("parsing release JSON")
+}
+
+/// Fetch latest release using a dedicated synchronous runtime.
+fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .context("building update-check runtime")?
+        .block_on(fetch_latest_release())
 }
 
 /// Start a background thread to check for updates.
@@ -987,10 +1002,67 @@ mod tests {
 
     #[test]
     #[serial]
+    fn integration_failed_sync_check_does_not_throttle_future_checks() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_file = temp_dir.path().join("update_state.json");
+        unsafe {
+            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", "http://127.0.0.1:1");
+            std::env::remove_var("CASS_SKIP_UPDATE");
+            std::env::remove_var("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT");
+            std::env::remove_var("TUI_HEADLESS");
+            std::env::remove_var("CI");
+        }
+
+        let result = check_for_updates_sync("0.1.0");
+        assert!(result.is_none(), "offline sync check should fail quietly");
+
+        assert!(
+            !state_file.exists(),
+            "failed sync checks must not persist cadence state"
+        );
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+            std::env::remove_var("CASS_DATA_DIR");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn integration_failed_async_check_does_not_throttle_future_checks() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_file = temp_dir.path().join("update_state.json");
+        unsafe {
+            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", "http://127.0.0.1:1");
+            std::env::remove_var("CASS_SKIP_UPDATE");
+            std::env::remove_var("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT");
+            std::env::remove_var("TUI_HEADLESS");
+            std::env::remove_var("CI");
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let result = runtime.block_on(check_for_updates("0.1.0"));
+        assert!(result.is_none(), "offline async check should fail quietly");
+
+        assert!(
+            !state_file.exists(),
+            "failed async checks must not persist cadence state"
+        );
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+            std::env::remove_var("CASS_DATA_DIR");
+        }
+    }
+
+    #[test]
+    #[serial]
     fn integration_blocking_fetch_release_success_v1() {
-        // Validates the blocking HTTP client path with a v1.0.0 tag.
-        // (The async reqwest client requires a tokio reactor, so we test
-        // the blocking path which is what the production TUI uses.)
+        // Validates the synchronous wrapper over the native HTTP client.
         let release_json = r#"{
             "tag_name": "v1.0.0",
             "html_url": "https://github.com/test/repo/releases/tag/v1.0.0"

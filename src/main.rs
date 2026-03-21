@@ -3,6 +3,30 @@ fn is_robot_mode_args() -> bool {
         .any(|arg| arg == "--json" || arg == "--robot" || arg == "-json" || arg == "-robot")
 }
 
+fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
+    // If the message looks like JSON, output it directly (it's a pre-formatted robot error).
+    // Also enforce JSON if robot mode flags were detected in raw args.
+    if err.message.trim().starts_with('{') {
+        eprintln!("{}", err.message);
+    } else if is_robot_mode_args() {
+        // Wrap unstructured error for robot
+        let payload = serde_json::json!({
+            "error": {
+                "code": err.code,
+                "kind": err.kind,
+                "message": err.message,
+                "hint": err.hint,
+                "retryable": err.retryable,
+            }
+        });
+        eprintln!("{payload}");
+    } else {
+        // Human-readable output
+        eprintln!("{}", err.message);
+    }
+    std::process::exit(err.code);
+}
+
 fn main() -> anyhow::Result<()> {
     // Check for AVX support before anything else. ONNX Runtime requires AVX
     // instructions and will crash with SIGILL on CPUs that lack them.
@@ -29,29 +53,7 @@ fn main() -> anyhow::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     let parsed = match coding_agent_search::parse_cli(raw_args) {
         Ok(parsed) => parsed,
-        Err(err) => {
-            // If the message looks like JSON, output it directly (it's a pre-formatted robot error).
-            // Also enforce JSON if robot mode flags were detected in raw args.
-            if err.message.trim().starts_with('{') {
-                eprintln!("{}", err.message);
-            } else if is_robot_mode_args() {
-                // Wrap unstructured error for robot
-                let payload = serde_json::json!({
-                    "error": {
-                        "code": err.code,
-                        "kind": err.kind,
-                        "message": err.message,
-                        "hint": err.hint,
-                        "retryable": err.retryable,
-                    }
-                });
-                eprintln!("{payload}");
-            } else {
-                // Human-readable output
-                eprintln!("{}", err.message);
-            }
-            std::process::exit(err.code);
-        }
+        Err(err) => handle_fatal_error(err),
     };
 
     let use_current_thread = matches!(
@@ -66,27 +68,6 @@ fn main() -> anyhow::Result<()> {
 
     match runtime.block_on(coding_agent_search::run_with_parsed(parsed)) {
         Ok(()) => Ok(()),
-        Err(err) => {
-            // If the message looks like JSON, output it directly (it's a pre-formatted robot error).
-            if err.message.trim().starts_with('{') {
-                eprintln!("{}", err.message);
-            } else if is_robot_mode_args() {
-                // Wrap unstructured error for robot
-                let payload = serde_json::json!({
-                    "error": {
-                        "code": err.code,
-                        "kind": err.kind,
-                        "message": err.message,
-                        "hint": err.hint,
-                        "retryable": err.retryable,
-                    }
-                });
-                eprintln!("{payload}");
-            } else {
-                // Human-readable output
-                eprintln!("{}", err.message);
-            }
-            std::process::exit(err.code);
-        }
+        Err(err) => handle_fatal_error(err),
     }
 }
