@@ -4351,8 +4351,8 @@ fn state_meta_json(
         "database": {
             "exists": db_exists,
             "opened": db_opened,
-            "conversations": conversation_count,
-            "messages": message_count,
+            "conversations": state_db_count_json(conversation_count, counts_skipped),
+            "messages": state_db_count_json(message_count, counts_skipped),
             "open_error": db_open_error,
             "counts_skipped": counts_skipped
         },
@@ -4380,6 +4380,14 @@ fn state_index_freshness(state: &serde_json::Value) -> Option<serde_json::Value>
         "stale_threshold_seconds": index.get("stale_threshold_seconds"),
         "pending_sessions": pending.and_then(|p| p.get("sessions"))
     }))
+}
+
+fn state_db_count_json(count: i64, counts_skipped: bool) -> serde_json::Value {
+    if counts_skipped {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::from(count)
+    }
 }
 
 fn warn_tui_terminal_profile(stderr_is_tty: bool) {
@@ -8195,8 +8203,8 @@ fn run_status(
             "database": {
                 "exists": db_exists,
                 "opened": db_opened,
-                "conversations": conversation_count,
-                "messages": message_count,
+                "conversations": state_db_count_json(conversation_count, counts_skipped),
+                "messages": state_db_count_json(message_count, counts_skipped),
                 "path": db_path.display().to_string(),
                 "open_error": db_open_error,
                 "counts_skipped": counts_skipped,

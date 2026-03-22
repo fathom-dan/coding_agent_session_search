@@ -213,6 +213,15 @@ impl LazyFrankenDb {
     }
 }
 
+impl Drop for LazyFrankenDb {
+    fn drop(&mut self) {
+        let Some(mut conn) = self.conn.get_mut().take() else {
+            return;
+        };
+        conn.0.close_best_effort_in_place();
+    }
+}
+
 // -------------------------------------------------------------------------
 // FrankenSQLite Connection Manager (bead 3rlf8)
 // -------------------------------------------------------------------------
