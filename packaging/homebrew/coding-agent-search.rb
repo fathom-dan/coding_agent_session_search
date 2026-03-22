@@ -1,24 +1,24 @@
 class Cass < Formula
   desc "Cross-agent session search for AI coding conversations"
   homepage "https://github.com/Dicklesworthstone/coding_agent_session_search"
-  version "0.2.2"
+  version "0.2.3"
   license "MIT"
 
   on_macos do
     on_arm do
       url "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v#{version}/cass-darwin-arm64.tar.gz"
-      sha256 "7fa79cb08052b54143bd50efd803f3045f13b71fe6d34a64525856dd2c21a832"
+      sha256 "c06b52ad2687042480b38ce9d37b1e2637368ec201f273315f6f2c08d1e3593a"
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v#{version}/cass-linux-amd64.tar.gz"
-      sha256 "71e489eaa4d21a78649a0ccfc3bf892caa1492756a9e96c6ce31a47d08794033"
+      sha256 "da0941756bcb3c0eef2bb929d990a0475b4f5ecb56bd25f140690188c5e573ef"
     end
     on_arm do
       url "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v#{version}/cass-linux-arm64.tar.gz"
-      sha256 "a29f12eb6170fd303ffc8f08093e947297f937a9bfed9a8dd63448a9825d46ad"
+      sha256 "203af42e3604af097e1e50e31b298ac57bf7c65e7eb5c11282d05cd043470bd4"
     end
   end
 

@@ -205,7 +205,7 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
 fi
 
 if [ "$FROM_SOURCE" -eq 1 ]; then
-  info "Building from source (requires git, rust nightly)"
+  info "Building from source (requires git and a working Rust stable toolchain)"
   ensure_rust
   git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
   (cd "$TMP/src" && cargo build --release)

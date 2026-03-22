@@ -7,6 +7,13 @@ fn fixture(path: &str) -> PathBuf {
     fs::canonicalize(PathBuf::from(path)).expect("fixture path")
 }
 
+fn isolated_home() -> tempfile::TempDir {
+    let home = tempfile::TempDir::new().unwrap();
+    fs::write(home.path().join(".bashrc"), "").unwrap();
+    fs::write(home.path().join(".zshrc"), "").unwrap();
+    home
+}
+
 #[test]
 #[serial]
 #[cfg_attr(not(target_os = "linux"), ignore)]
@@ -21,6 +28,7 @@ fn install_sh_succeeds_with_valid_checksum() {
     .trim()
     .to_string();
     let dest = tempfile::TempDir::new().unwrap();
+    let home = isolated_home();
 
     let status = Command::new("bash")
         .arg("install.sh")
@@ -29,6 +37,7 @@ fn install_sh_succeeds_with_valid_checksum() {
         .arg("--dest")
         .arg(dest.path())
         .arg("--easy-mode")
+        .env("HOME", home.path())
         .env("ARTIFACT_URL", format!("file://{}", tar.display()))
         .env("CHECKSUM", checksum)
         .status()
@@ -50,6 +59,7 @@ fn install_sh_fails_with_bad_checksum() {
     let _ = std::fs::remove_dir_all("/tmp/coding-agent-search-install.lock.d");
     let tar = fixture("tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz");
     let dest = tempfile::TempDir::new().unwrap();
+    let home = isolated_home();
 
     let status = Command::new("bash")
         .arg("install.sh")
@@ -58,6 +68,7 @@ fn install_sh_fails_with_bad_checksum() {
         .arg("--dest")
         .arg(dest.path())
         .arg("--easy-mode")
+        .env("HOME", home.path())
         .env("ARTIFACT_URL", format!("file://{}", tar.display()))
         .env("CHECKSUM", "deadbeef")
         .status()
@@ -193,6 +204,7 @@ fn upgrade_replaces_existing_binary() {
     .trim()
     .to_string();
     let dest = tempfile::TempDir::new().unwrap();
+    let home = isolated_home();
 
     // Step 1: Create a test "old" binary to simulate an existing installation
     let bin_path = dest.path().join("cass");
@@ -221,6 +233,7 @@ fn upgrade_replaces_existing_binary() {
         .arg("--dest")
         .arg(dest.path())
         .arg("--easy-mode")
+        .env("HOME", home.path())
         .env("ARTIFACT_URL", format!("file://{}", tar.display()))
         .env("CHECKSUM", checksum)
         .status()
@@ -264,11 +277,14 @@ fn concurrent_installs_are_serialized() {
     .to_string();
     let dest1 = tempfile::TempDir::new().unwrap();
     let dest2 = tempfile::TempDir::new().unwrap();
+    let home1 = isolated_home();
+    let home2 = isolated_home();
 
     // Spawn two concurrent installs
     let tar1 = tar.clone();
     let checksum1 = checksum.clone();
     let dest1_path = dest1.path().to_path_buf();
+    let home1_path = home1.path().to_path_buf();
 
     let handle1 = std::thread::spawn(move || {
         Command::new("bash")
@@ -278,6 +294,7 @@ fn concurrent_installs_are_serialized() {
             .arg("--dest")
             .arg(&dest1_path)
             .arg("--easy-mode")
+            .env("HOME", home1_path)
             .env("ARTIFACT_URL", format!("file://{}", tar1.display()))
             .env("CHECKSUM", checksum1)
             .status()
@@ -289,6 +306,7 @@ fn concurrent_installs_are_serialized() {
     let tar2 = tar;
     let checksum2 = checksum;
     let dest2_path = dest2.path().to_path_buf();
+    let home2_path = home2.path().to_path_buf();
 
     let handle2 = std::thread::spawn(move || {
         Command::new("bash")
@@ -298,6 +316,7 @@ fn concurrent_installs_are_serialized() {
             .arg("--dest")
             .arg(&dest2_path)
             .arg("--easy-mode")
+            .env("HOME", home2_path)
             .env("ARTIFACT_URL", format!("file://{}", tar2.display()))
             .env("CHECKSUM", checksum2)
             .status()
@@ -341,6 +360,7 @@ fn verify_flag_runs_self_test() {
     .trim()
     .to_string();
     let dest = tempfile::TempDir::new().unwrap();
+    let home = isolated_home();
 
     let output = Command::new("bash")
         .arg("install.sh")
@@ -350,6 +370,7 @@ fn verify_flag_runs_self_test() {
         .arg(dest.path())
         .arg("--easy-mode")
         .arg("--verify") // This should run the binary after install
+        .env("HOME", home.path())
         .env("ARTIFACT_URL", format!("file://{}", tar.display()))
         .env("CHECKSUM", checksum)
         .output()

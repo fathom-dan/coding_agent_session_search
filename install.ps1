@@ -24,8 +24,14 @@ if (-not $Version) {
   }
 }
 
+# Windows releases are published for 64-bit Windows only.
+if (-not [Environment]::Is64BitOperatingSystem) {
+  Write-Error "cass publishes Windows binaries for 64-bit Windows only."
+  exit 1
+}
+
 # Map architecture to the naming convention used by release.yml
-$arch = if ([Environment]::Is64BitProcess) { "amd64" } else { "x86" }
+$arch = "amd64"
 $zip = "cass-windows-${arch}.zip"
 
 if ($ArtifactUrl) {
