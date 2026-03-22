@@ -294,6 +294,7 @@ impl FrankenConnectionManager {
             let conn = FrankenConnection::open(&path_str)
                 .with_context(|| format!("opening reader connection at {}", db_path.display()))?;
             // Apply read-tuned config (no migration, no write PRAGMAs)
+            let _ = conn.execute("PRAGMA busy_timeout = 5000;"); // match writer config
             let _ = conn.execute("PRAGMA cache_size = -16384;"); // 16MB reader cache
             readers.push(parking_lot::Mutex::new(SendFrankenConnection(conn)));
         }
@@ -335,10 +336,21 @@ impl FrankenConnectionManager {
             .recv()
             .map_err(|_| anyhow!("writer token channel closed"))?;
         let path_str = self.db_path.to_string_lossy().to_string();
-        let conn = FrankenConnection::open(&path_str)
-            .with_context(|| format!("opening writer connection at {}", self.db_path.display()))?;
+        let conn = match FrankenConnection::open(&path_str) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = self.writer_tokens.0.send(());
+                return Err(anyhow::Error::from(e).context(format!(
+                    "opening writer connection at {}",
+                    self.db_path.display()
+                )));
+            }
+        };
         let storage = FrankenStorage { conn };
-        storage.apply_config()?;
+        if let Err(e) = storage.apply_config() {
+            let _ = self.writer_tokens.0.send(());
+            return Err(e);
+        }
         Ok(WriterGuard {
             storage,
             mgr: self,
@@ -356,10 +368,21 @@ impl FrankenConnectionManager {
             .recv()
             .map_err(|_| anyhow!("writer token channel closed"))?;
         let path_str = self.db_path.to_string_lossy().to_string();
-        let conn = FrankenConnection::open(&path_str)
-            .with_context(|| format!("opening concurrent writer at {}", self.db_path.display()))?;
+        let conn = match FrankenConnection::open(&path_str) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = self.writer_tokens.0.send(());
+                return Err(anyhow::Error::from(e).context(format!(
+                    "opening concurrent writer at {}",
+                    self.db_path.display()
+                )));
+            }
+        };
         let storage = FrankenStorage { conn };
-        storage.apply_config()?;
+        if let Err(e) = storage.apply_config() {
+            let _ = self.writer_tokens.0.send(());
+            return Err(e);
+        }
         // Reduced cache for concurrent writers (they're short-lived)
         let _ = storage.raw().execute("PRAGMA cache_size = -4096;");
         Ok(WriterGuard {
