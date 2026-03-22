@@ -1597,7 +1597,10 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
     let mut first_event: Option<Instant> = None;
     let mut last_stale_check = Instant::now();
     // Initialize to the past so the first scan can fire immediately.
-    let mut last_scan = Instant::now() - min_scan_interval;
+    // Use checked_sub to avoid panic if system uptime < min_scan_interval.
+    let mut last_scan = Instant::now()
+        .checked_sub(min_scan_interval)
+        .unwrap_or_else(Instant::now);
 
     tracing::info!(
         watch_interval_secs,
@@ -1649,7 +1652,6 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
                     // operator-initiated rebuilds.
                     if !pending.is_empty() {
                         callback(std::mem::take(&mut pending), &roots, false);
-                        last_scan = Instant::now();
                     }
                     callback(vec![], &roots, true);
                     last_scan = Instant::now();
