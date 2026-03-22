@@ -602,6 +602,26 @@ impl std::error::Error for DownloadError {
     }
 }
 
+impl DownloadError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            DownloadError::NetworkError(_) | DownloadError::IoError(_) | DownloadError::Timeout => {
+                true
+            }
+            DownloadError::HttpError { status, .. } => {
+                *status == 408 || *status == 429 || (500..=599).contains(status)
+            }
+            DownloadError::VerificationFailed { .. }
+            | DownloadError::Cancelled
+            | DownloadError::ManifestNotVerified { .. } => false,
+        }
+    }
+
+    fn should_discard_temp(&self) -> bool {
+        matches!(self, DownloadError::VerificationFailed { .. })
+    }
+}
+
 impl From<std::io::Error> for DownloadError {
     fn from(err: std::io::Error) -> Self {
         DownloadError::IoError(err)
@@ -752,10 +772,7 @@ impl ModelDownloader {
         let bytes_downloaded = Arc::new(AtomicU64::new(0));
 
         for (idx, file) in manifest.files.iter().enumerate() {
-            if self.is_cancelled() {
-                self.cleanup_temp();
-                return Err(DownloadError::Cancelled);
-            }
+            self.fail_if_cancelled()?;
 
             // Use local_name() for local path (handles onnx/model.onnx -> model.onnx)
             let file_path = self.temp_dir.join(file.local_name());
@@ -767,10 +784,7 @@ impl ModelDownloader {
             // Download with retries
             let mut last_error = None;
             for attempt in 0..self.max_retries {
-                if self.is_cancelled() {
-                    self.cleanup_temp();
-                    return Err(DownloadError::Cancelled);
-                }
+                self.fail_if_cancelled()?;
 
                 // Reset byte counter to before this file on retry (avoid double-counting)
                 if attempt > 0 {
@@ -797,31 +811,36 @@ impl ModelDownloader {
                         last_error = None;
                         break;
                     }
+                    Err(DownloadError::Cancelled) => {
+                        return Err(DownloadError::Cancelled);
+                    }
                     Err(e) => {
+                        if !e.is_retryable() {
+                            self.cleanup_temp_for_error(&e);
+                            return Err(e);
+                        }
                         last_error = Some(e);
                     }
                 }
             }
 
             if let Some(err) = last_error {
-                self.cleanup_temp();
+                self.cleanup_temp_for_error(&err);
                 return Err(err);
             }
 
             // Verify SHA256
-            if self.is_cancelled() {
-                self.cleanup_temp();
-                return Err(DownloadError::Cancelled);
-            }
+            self.fail_if_cancelled()?;
 
             let actual_hash = compute_sha256(&file_path)?;
             if actual_hash != file.sha256 {
-                self.cleanup_temp();
-                return Err(DownloadError::VerificationFailed {
+                let err = DownloadError::VerificationFailed {
                     file: file.name.clone(),
                     expected: file.sha256.clone(),
                     actual: actual_hash,
-                });
+                };
+                self.cleanup_temp_for_error(&err);
+                return Err(err);
             }
         }
 
@@ -1110,6 +1129,20 @@ impl ModelDownloader {
     /// Clean up temporary download directory.
     fn cleanup_temp(&self) {
         let _ = fs::remove_dir_all(&self.temp_dir);
+    }
+
+    fn cleanup_temp_for_error(&self, err: &DownloadError) {
+        if err.should_discard_temp() {
+            self.cleanup_temp();
+        }
+    }
+
+    fn fail_if_cancelled(&self) -> Result<(), DownloadError> {
+        if self.is_cancelled() {
+            Err(DownloadError::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1490,6 +1523,89 @@ mod tests {
         assert!(
             outside.exists(),
             "cleanup must not touch the symlink target"
+        );
+    }
+
+    #[test]
+    fn test_retryable_error_classification() {
+        assert!(DownloadError::NetworkError("boom".into()).is_retryable());
+        assert!(DownloadError::Timeout.is_retryable());
+        assert!(
+            DownloadError::HttpError {
+                status: 503,
+                message: "unavailable".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !DownloadError::HttpError {
+                status: 404,
+                message: "missing".into()
+            }
+            .is_retryable()
+        );
+        assert!(!DownloadError::Cancelled.is_retryable());
+        assert!(
+            !DownloadError::VerificationFailed {
+                file: "model.onnx".into(),
+                expected: "a".into(),
+                actual: "b".into(),
+            }
+            .is_retryable()
+        );
+    }
+
+    #[test]
+    fn test_cleanup_temp_for_error_preserves_partial_downloads_on_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        fs::create_dir_all(&downloader.temp_dir).unwrap();
+        let partial = downloader.temp_dir.join("model.onnx");
+        fs::write(&partial, b"partial").unwrap();
+
+        downloader.cleanup_temp_for_error(&DownloadError::Cancelled);
+
+        assert!(
+            partial.exists(),
+            "cancelled downloads should keep partial files for a resumable retry"
+        );
+    }
+
+    #[test]
+    fn test_fail_if_cancelled_preserves_partial_downloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        fs::create_dir_all(&downloader.temp_dir).unwrap();
+        let partial = downloader.temp_dir.join("model.onnx");
+        fs::write(&partial, b"partial").unwrap();
+        downloader.cancel();
+
+        let result = downloader.fail_if_cancelled();
+
+        assert!(matches!(result, Err(DownloadError::Cancelled)));
+        assert!(
+            partial.exists(),
+            "early cancellation checks should not discard resumable partial files"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_temp_for_error_discards_temp_after_verification_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        fs::create_dir_all(&downloader.temp_dir).unwrap();
+        let partial = downloader.temp_dir.join("model.onnx");
+        fs::write(&partial, b"partial").unwrap();
+
+        downloader.cleanup_temp_for_error(&DownloadError::VerificationFailed {
+            file: "model.onnx".into(),
+            expected: "good".into(),
+            actual: "bad".into(),
+        });
+
+        assert!(
+            !downloader.temp_dir.exists(),
+            "verification failures should discard the temp directory to avoid reusing corrupt data"
         );
     }
 }

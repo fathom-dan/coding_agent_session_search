@@ -12094,9 +12094,6 @@ fn read_session_paths(source: &str) -> Result<std::collections::HashSet<String>,
     Ok(paths)
 }
 
-const OWNER: &str = "Dicklesworthstone";
-const REPO: &str = "coding_agent_session_search";
-
 async fn maybe_prompt_for_update(once: bool) -> Result<()> {
     if once
         || dotenvy::var("CI").is_ok()
@@ -12133,56 +12130,7 @@ async fn maybe_prompt_for_update(once: bool) -> Result<()> {
     }
 
     info!(target: "update", "starting self-update to {}", update_info.tag_name);
-    match run_self_update(&update_info.tag_name) {
-        Ok(true) => {
-            println!("Update complete. Please restart cass.");
-            std::process::exit(0);
-        }
-        Ok(false) => {
-            warn!(target: "update", "self-update failed (installer returned error)");
-        }
-        Err(err) => {
-            warn!(target: "update", "self-update failed: {err}");
-        }
-    }
-
-    Ok(())
-}
-#[cfg(windows)]
-fn run_self_update(tag: &str) -> Result<bool> {
-    // Download the install script to a temp file and invoke it with parameters.
-    // Piping irm to iex doesn't support Param() arguments, so we save first.
-    let ps_cmd = format!(
-        "$s = Join-Path $env:TEMP 'cass-install.ps1';          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/{OWNER}/{REPO}/{tag}/install.ps1' -OutFile $s;          & $s -EasyMode -Verify -Version '{tag}';          Remove-Item -Force $s"
-    );
-    let status = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &ps_cmd])
-        .status()?;
-    if status.success() {
-        info!(target: "update", "updated to {tag}");
-        Ok(true)
-    } else {
-        warn!(target: "update", "installer returned non-zero status: {status:?}");
-        Ok(false)
-    }
-}
-
-#[cfg(not(windows))]
-fn run_self_update(tag: &str) -> Result<bool> {
-    let sh_cmd = format!(
-        "curl -fsSL https://raw.githubusercontent.com/{OWNER}/{REPO}/{tag}/install.sh | bash -s -- --easy-mode --verify --version {tag}"
-    );
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&sh_cmd)
-        .status()?;
-    if status.success() {
-        info!(target: "update", "updated to {tag}");
-        Ok(true)
-    } else {
-        warn!(target: "update", "installer returned non-zero status: {status:?}");
-        Ok(false)
-    }
+    crate::update_check::run_self_update(&update_info.tag_name);
 }
 
 // ============================================================================

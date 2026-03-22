@@ -4596,6 +4596,18 @@ pub struct CassApp {
     pub last_tick: Instant,
     /// When state became dirty (for debounced persistence).
     pub dirty_since: Option<Instant>,
+    /// Dirty marker captured for the state save currently in flight.
+    state_save_started_at: Option<Instant>,
+    /// Whether a state save task is currently running.
+    state_save_in_flight: bool,
+    /// Token for the state save currently in flight.
+    state_save_token: Option<u64>,
+    /// Monotonic token source for state saves.
+    next_state_save_token: u64,
+    /// Shared epoch for invalidating stale state save tasks after resets.
+    state_file_io_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared mutex that serializes state-file writes and resets.
+    state_file_io_lock: Arc<Mutex<()>>,
     /// When query/filters changed (for debounced search, 60ms).
     pub search_dirty_since: Option<Instant>,
     /// Current spinner frame index.
@@ -4842,6 +4854,12 @@ impl Default for CassApp {
             peek_badge_until: None,
             last_tick: Instant::now(),
             dirty_since: None,
+            state_save_started_at: None,
+            state_save_in_flight: false,
+            state_save_token: None,
+            next_state_save_token: 0,
+            state_file_io_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            state_file_io_lock: Arc::new(Mutex::new(())),
             search_dirty_since: None,
             spinner_frame: 0,
             loading_context: None,
@@ -5121,6 +5139,36 @@ impl CassApp {
             }
         }
         self.startup_state_bootstrapped = true;
+    }
+
+    fn begin_state_save(&mut self) -> Option<u64> {
+        if self.state_save_in_flight {
+            return None;
+        }
+        let save_token = self.next_state_save_token;
+        self.next_state_save_token = self.next_state_save_token.wrapping_add(1);
+        self.state_save_in_flight = true;
+        self.state_save_token = Some(save_token);
+        self.state_save_started_at = self.dirty_since;
+        Some(save_token)
+    }
+
+    fn complete_state_save(&mut self, save_token: u64, succeeded: bool) -> bool {
+        if self.state_save_token != Some(save_token) {
+            return false;
+        }
+        self.state_save_in_flight = false;
+        self.state_save_token = None;
+        let started_at = self.state_save_started_at.take();
+
+        if succeeded {
+            if self.dirty_since == started_at {
+                self.dirty_since = None;
+            }
+        } else if self.dirty_since.is_none() {
+            self.dirty_since = started_at;
+        }
+        true
     }
 
     fn capture_persisted_state(&self) -> PersistedState {
@@ -12759,9 +12807,9 @@ pub enum CassMsg {
     /// Save current state to disk.
     StateSaveRequested,
     /// Persisted state save completed.
-    StateSaved,
+    StateSaved(u64),
     /// Persisted state save failed.
-    StateSaveFailed(String),
+    StateSaveFailed { save_token: u64, err: String },
     /// Reset all persisted state to defaults.
     StateResetRequested,
 
@@ -13495,6 +13543,29 @@ fn clear_persisted_state_file(path: &Path) -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("failed removing {}: {e}", path.display())),
+    }
+}
+
+fn persist_state_snapshot(
+    state_path: PathBuf,
+    snapshot: PersistedState,
+    state_file_io_epoch: Arc<std::sync::atomic::AtomicU64>,
+    save_epoch: u64,
+    state_file_io_lock: Arc<Mutex<()>>,
+    save_token: u64,
+) -> CassMsg {
+    let _io_guard = match state_file_io_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if state_file_io_epoch.load(std::sync::atomic::Ordering::Acquire) != save_epoch {
+        return CassMsg::StateSaved(save_token);
+    }
+
+    match save_persisted_state_to_path(&state_path, &snapshot) {
+        Ok(()) => CassMsg::StateSaved(save_token),
+        Err(e) => CassMsg::StateSaveFailed { save_token, err: e },
     }
 }
 
@@ -17708,19 +17779,33 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::none()
             }
             CassMsg::StateSaveRequested => {
+                let Some(save_token) = self.begin_state_save() else {
+                    return ftui::Cmd::none();
+                };
                 let state_path = self.state_file_path();
                 let snapshot = self.capture_persisted_state();
-                self.dirty_since = None;
+                let state_file_io_epoch = Arc::clone(&self.state_file_io_epoch);
+                let state_file_io_lock = Arc::clone(&self.state_file_io_lock);
+                let save_epoch = state_file_io_epoch.load(std::sync::atomic::Ordering::Acquire);
                 ftui::Cmd::task(move || {
-                    match save_persisted_state_to_path(&state_path, &snapshot) {
-                        Ok(()) => CassMsg::StateSaved,
-                        Err(e) => CassMsg::StateSaveFailed(e),
-                    }
+                    persist_state_snapshot(
+                        state_path,
+                        snapshot,
+                        state_file_io_epoch,
+                        save_epoch,
+                        state_file_io_lock,
+                        save_token,
+                    )
                 })
             }
-            CassMsg::StateSaved => ftui::Cmd::none(),
-            CassMsg::StateSaveFailed(err) => {
-                self.status = format!("Failed to save TUI state: {err}");
+            CassMsg::StateSaved(save_token) => {
+                self.complete_state_save(save_token, true);
+                ftui::Cmd::none()
+            }
+            CassMsg::StateSaveFailed { save_token, err } => {
+                if self.complete_state_save(save_token, false) {
+                    self.status = format!("Failed to save TUI state: {err}");
+                }
                 ftui::Cmd::none()
             }
             CassMsg::StateResetRequested => {
@@ -17730,12 +17815,24 @@ impl super::ftui_adapter::Model for CassApp {
                 let search_service = self.search_service.clone();
                 let db_reader = self.db_reader.clone();
                 let known_workspaces = self.known_workspaces.clone();
+                let next_state_save_token = self.next_state_save_token;
+                let state_file_io_epoch = Arc::clone(&self.state_file_io_epoch);
+                let state_file_io_lock = Arc::clone(&self.state_file_io_lock);
+                state_file_io_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let state_file_io_lock_for_reset = Arc::clone(&state_file_io_lock);
+                let _state_file_io_guard = match state_file_io_lock.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 let reset = CassApp {
                     data_dir,
                     db_path,
                     search_service,
                     db_reader,
                     known_workspaces,
+                    next_state_save_token,
+                    state_file_io_epoch,
+                    state_file_io_lock: state_file_io_lock_for_reset,
                     ..CassApp::default()
                 };
                 *self = reset;
@@ -17902,9 +17999,9 @@ impl super::ftui_adapter::Model for CassApp {
                     cmds.push(ftui::Cmd::msg(CassMsg::SearchRequested));
                 }
                 if let Some(dirty_ts) = self.dirty_since
+                    && !self.state_save_in_flight
                     && dirty_ts.elapsed() >= STATE_SAVE_DEBOUNCE
                 {
-                    self.dirty_since = None;
                     cmds.push(ftui::Cmd::msg(CassMsg::StateSaveRequested));
                 }
                 cmds.push(ftui::Cmd::msg(CassMsg::ToastTick));
@@ -22516,6 +22613,181 @@ mod tests {
         let cmd = app.update(CassMsg::StateSaveRequested);
         let debug = format!("{cmd:?}");
         assert!(debug.contains("Task"), "expected Cmd::Task, got: {debug}");
+    }
+
+    #[test]
+    fn state_save_failed_keeps_dirty_state_retryable() {
+        let mut app = CassApp::default();
+        app.dirty_since = Some(Instant::now() - STATE_SAVE_DEBOUNCE);
+
+        let _ = app.update(CassMsg::StateSaveRequested);
+        let save_token = app.state_save_token.expect("save token");
+        assert!(app.state_save_in_flight, "save should be marked in flight");
+        assert!(
+            app.dirty_since.is_some(),
+            "save request should not clear dirty state before persistence succeeds"
+        );
+
+        let _ = app.update(CassMsg::StateSaveFailed {
+            save_token,
+            err: "disk full".to_string(),
+        });
+        assert!(
+            app.dirty_since.is_some(),
+            "failed save should leave state dirty so autosave can retry"
+        );
+        assert!(
+            !app.state_save_in_flight,
+            "failed save should release the in-flight guard"
+        );
+    }
+
+    #[test]
+    fn state_save_failure_without_pending_changes_stays_clean() {
+        let mut app = CassApp::default();
+
+        let _ = app.update(CassMsg::StateSaveRequested);
+        let save_token = app.state_save_token.expect("save token");
+        let _ = app.update(CassMsg::StateSaveFailed {
+            save_token,
+            err: "disk full".to_string(),
+        });
+
+        assert!(
+            app.dirty_since.is_none(),
+            "save failures should not invent dirty state when nothing changed"
+        );
+        assert!(
+            !app.state_save_in_flight,
+            "failed save should release the in-flight guard"
+        );
+    }
+
+    #[test]
+    fn persist_state_snapshot_skips_stale_save_after_epoch_bump() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_path = tmp.path().join("tui-state.json");
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let lock = Arc::new(Mutex::new(()));
+        let state = persisted_state_defaults();
+
+        epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let msg = persist_state_snapshot(
+            state_path.clone(),
+            state,
+            Arc::clone(&epoch),
+            0,
+            Arc::clone(&lock),
+            7,
+        );
+
+        assert!(
+            matches!(msg, CassMsg::StateSaved(7)),
+            "stale saves should short-circuit without writing or surfacing an error"
+        );
+        assert!(
+            !state_path.exists(),
+            "stale save should not recreate the state file after reset invalidation"
+        );
+    }
+
+    #[test]
+    fn state_saved_preserves_newer_changes_made_during_save() {
+        let mut app = CassApp::default();
+        app.dirty_since = Some(Instant::now() - STATE_SAVE_DEBOUNCE);
+
+        let _ = app.update(CassMsg::StateSaveRequested);
+        let save_token = app.state_save_token.expect("save token");
+        let original_marker = app.state_save_started_at.expect("save marker");
+
+        app.dirty_since = Some(Instant::now());
+        let _ = app.update(CassMsg::StateSaved(save_token));
+
+        assert!(
+            app.dirty_since.is_some(),
+            "state saved should not clear edits made after the snapshot was captured"
+        );
+        assert_ne!(
+            app.dirty_since,
+            Some(original_marker),
+            "newer dirty marker should survive the completed save"
+        );
+        assert!(
+            !app.state_save_in_flight,
+            "successful save should release the in-flight guard"
+        );
+    }
+
+    #[test]
+    fn stale_state_save_failure_is_ignored_after_reset_and_resave() {
+        let mut app = CassApp::default();
+        app.dirty_since = Some(Instant::now() - STATE_SAVE_DEBOUNCE);
+
+        let _ = app.update(CassMsg::StateSaveRequested);
+        let stale_save_token = app.state_save_token.expect("stale save token");
+
+        let _ = app.update(CassMsg::StateResetRequested);
+        app.status = "post-reset".to_string();
+        app.dirty_since = Some(Instant::now() - STATE_SAVE_DEBOUNCE);
+
+        let _ = app.update(CassMsg::StateSaveRequested);
+        let active_save_token = app.state_save_token.expect("active save token");
+
+        assert_ne!(
+            stale_save_token, active_save_token,
+            "reset should not recycle save tokens and let stale completions target the new save"
+        );
+
+        let _ = app.update(CassMsg::StateSaveFailed {
+            save_token: stale_save_token,
+            err: "stale failure".to_string(),
+        });
+
+        assert_eq!(
+            app.status, "post-reset",
+            "stale save failures should not overwrite current status"
+        );
+        assert_eq!(
+            app.state_save_token,
+            Some(active_save_token),
+            "stale save failures should not complete the active save"
+        );
+        assert!(
+            app.state_save_in_flight,
+            "stale save failures should leave the current save in flight"
+        );
+    }
+
+    #[test]
+    fn stale_state_save_success_is_ignored_after_reset_and_resave() {
+        let mut app = CassApp::default();
+        app.dirty_since = Some(Instant::now() - STATE_SAVE_DEBOUNCE);
+
+        let _ = app.update(CassMsg::StateSaveRequested);
+        let stale_save_token = app.state_save_token.expect("stale save token");
+
+        let _ = app.update(CassMsg::StateResetRequested);
+        app.dirty_since = Some(Instant::now() - STATE_SAVE_DEBOUNCE);
+
+        let _ = app.update(CassMsg::StateSaveRequested);
+        let active_save_token = app.state_save_token.expect("active save token");
+        let active_dirty_marker = app.dirty_since;
+
+        let _ = app.update(CassMsg::StateSaved(stale_save_token));
+
+        assert_eq!(
+            app.state_save_token,
+            Some(active_save_token),
+            "stale save success should not complete the active save"
+        );
+        assert!(
+            app.state_save_in_flight,
+            "stale save success should leave the current save in flight"
+        );
+        assert_eq!(
+            app.dirty_since, active_dirty_marker,
+            "stale save success should not clear current dirty state"
+        );
     }
 
     #[test]

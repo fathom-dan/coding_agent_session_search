@@ -60,6 +60,26 @@ fn is_openrsync() -> bool {
     })
 }
 
+fn quote_remote_shell_path(path: &str) -> String {
+    format!("'{}'", path.replace('\'', r#"'\''"#))
+}
+
+fn remote_spec_for_shell_bound_copy(host: &str, remote_path: &str) -> String {
+    format!("{host}:{}", quote_remote_shell_path(remote_path))
+}
+
+fn remote_spec_for_scp(host: &str, remote_path: &str) -> String {
+    format!("{host}:{remote_path}")
+}
+
+fn remote_spec_for_rsync(host: &str, remote_path: &str, protect_args_supported: bool) -> String {
+    if protect_args_supported {
+        remote_spec_for_scp(host, remote_path)
+    } else {
+        remote_spec_for_shell_bound_copy(host, remote_path)
+    }
+}
+
 /// Errors that can occur during sync operations.
 #[derive(Error, Debug)]
 pub enum SyncError {
@@ -505,7 +525,8 @@ impl SyncEngine {
 
         // Build rsync command
         // NOTE: NO --delete flag! Safe additive sync only.
-        let remote_spec = format!("{}:{}", host, expanded_path);
+        let protect_args_supported = !is_openrsync();
+        let remote_spec = remote_spec_for_rsync(host, &expanded_path, protect_args_supported);
         let ssh_opts = strict_ssh_command_for_rsync(self.connection_timeout);
 
         let local_path_str = match local_path.to_str() {
@@ -526,7 +547,7 @@ impl SyncEngine {
         let mut cmd = Command::new("rsync");
         cmd.args(["-avz", "--stats", "--partial"]);
         // openrsync (macOS 15+) does not support --protect-args.
-        if !is_openrsync() {
+        if protect_args_supported {
             cmd.arg("--protect-args");
         }
         cmd.args([
@@ -682,7 +703,7 @@ impl SyncEngine {
         // E.g. C:\Users\george\AppData\... → /mnt/c/Users/george/AppData/...
         let wsl_dest = windows_path_to_wsl(local_path_str);
 
-        let remote_spec = format!("{}:{}", host, expanded_path);
+        let remote_spec = remote_spec_for_rsync(host, &expanded_path, true);
         let ssh_opts = strict_ssh_command_for_rsync(self.connection_timeout);
         let timeout_str = self.transfer_timeout.to_string();
 
@@ -848,7 +869,9 @@ impl SyncEngine {
         // -o: pass through SSH options
         // The remote source is "host:path"; the local destination is the mirror dir.
         let connect_timeout = self.connection_timeout.to_string();
-        let remote_spec = format!("{}:{}", host, expanded_path);
+        // Modern OpenSSH scp uses SFTP by default, so the remote path is not
+        // parsed by a remote shell unless the caller forces legacy `-O` mode.
+        let remote_spec = remote_spec_for_scp(host, &expanded_path);
 
         let mut cmd = Command::new("scp");
         cmd.args([
@@ -1825,6 +1848,50 @@ Total transferred file size: 1,234 bytes
         let stats = parse_rsync_stats("");
         assert_eq!(stats.files_transferred, 0);
         assert_eq!(stats.bytes_transferred, 0);
+    }
+
+    #[test]
+    fn test_quote_remote_shell_path_handles_spaces_and_quotes() {
+        assert_eq!(
+            quote_remote_shell_path("/Users/me/Library/Application Support/Cursor"),
+            "'/Users/me/Library/Application Support/Cursor'"
+        );
+        assert_eq!(
+            quote_remote_shell_path("/tmp/that's all"),
+            "'/tmp/that'\\''s all'"
+        );
+    }
+
+    #[test]
+    fn test_remote_spec_for_rsync_quotes_only_when_needed() {
+        assert_eq!(
+            remote_spec_for_rsync("work-mac", "/tmp/has space", true),
+            "work-mac:/tmp/has space"
+        );
+        assert_eq!(
+            remote_spec_for_rsync("work-mac", "/tmp/has space", false),
+            "work-mac:'/tmp/has space'"
+        );
+    }
+
+    #[test]
+    fn test_remote_spec_for_shell_bound_copy_quotes_remote_path() {
+        assert_eq!(
+            remote_spec_for_shell_bound_copy("work-mac", "/tmp/has space"),
+            "work-mac:'/tmp/has space'"
+        );
+    }
+
+    #[test]
+    fn test_remote_spec_for_scp_preserves_raw_path() {
+        assert_eq!(
+            remote_spec_for_scp("work-mac", "/tmp/has space"),
+            "work-mac:/tmp/has space"
+        );
+        assert_eq!(
+            remote_spec_for_scp("work-mac", "/tmp/that's all"),
+            "work-mac:/tmp/that's all"
+        );
     }
 
     #[test]

@@ -69,19 +69,21 @@ impl ExportEngine {
         let src = super::open_existing_sqlite_db(&self.source_db_path)
             .context("Failed to open source database")?;
 
-        // 2. Prepare output DB
-        if self.output_path.exists() {
-            std::fs::remove_file(&self.output_path)
-                .context("Failed to remove existing output file")?;
-        }
-        let output_path = self.output_path.to_string_lossy().to_string();
-        let dest = Connection::open(&output_path).context("Failed to create output database")?;
+        // 2. Build the export into a unique temp database, then atomically
+        // replace the final output only after a successful commit.
+        let temp_output_path = unique_atomic_temp_path(&self.output_path);
+        let mut replace_attempted = false;
+        let result = (|| -> Result<ExportStats> {
+            let output_path = temp_output_path.to_string_lossy().to_string();
+            let dest =
+                Connection::open(&output_path).context("Failed to create output database")?;
 
-        let mut tx = dest.transaction()?;
+            let (processed, msg_processed) = {
+                let mut tx = dest.transaction()?;
 
-        // 3. Create Schema (Split into individual statements)
-        tx.execute(
-            "CREATE TABLE conversations (
+                // 3. Create Schema (Split into individual statements)
+                tx.execute(
+                    "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
                 agent TEXT NOT NULL,
                 workspace TEXT,
@@ -92,11 +94,11 @@ impl ExportEngine {
                 message_count INTEGER,
                 metadata_json TEXT
             )",
-        )
-        .context("Failed to create conversations table")?;
+                )
+                .context("Failed to create conversations table")?;
 
-        tx.execute(
-            "CREATE TABLE messages (
+                tx.execute(
+                    "CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
                 conversation_id INTEGER NOT NULL,
                 idx INTEGER NOT NULL,
@@ -106,223 +108,238 @@ impl ExportEngine {
                 attachment_refs TEXT,
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id)
             )",
-        )
-        .context("Failed to create messages table")?;
+                )
+                .context("Failed to create messages table")?;
 
-        tx.execute(
-            "CREATE TABLE export_meta (
+                tx.execute(
+                    "CREATE TABLE export_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT
             )",
-        )
-        .context("Failed to create export_meta table")?;
+                )
+                .context("Failed to create export_meta table")?;
 
-        tx.execute(
-            "CREATE VIRTUAL TABLE messages_fts USING fts5(
+                tx.execute(
+                    "CREATE VIRTUAL TABLE messages_fts USING fts5(
                 content,
                 content='messages',
                 content_rowid='id',
                 tokenize='porter unicode61 remove_diacritics 2'
             )",
-        )
-        .context("Failed to create messages_fts table")?;
+                )
+                .context("Failed to create messages_fts table")?;
 
-        tx.execute(
-            r#"CREATE VIRTUAL TABLE messages_code_fts USING fts5(
+                tx.execute(
+                    r#"CREATE VIRTUAL TABLE messages_code_fts USING fts5(
                 content,
                 content='messages',
                 content_rowid='id',
                 tokenize="unicode61 tokenchars '-_./:@#$%\\'"
             )"#,
-        )
-        .context("Failed to create messages_code_fts table")?;
+                )
+                .context("Failed to create messages_code_fts table")?;
 
-        // 4. Query Source
-        let mut query = String::from(
-            "SELECT c.id, a.slug as agent, w.path as workspace, c.title, c.source_path, c.started_at, c.ended_at,
+                // 4. Query Source
+                let mut query = String::from(
+                "SELECT c.id, a.slug as agent, w.path as workspace, c.title, c.source_path, c.started_at, c.ended_at,
              (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count,
              c.metadata_json
              FROM conversations c
              JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              WHERE 1=1"
-        );
-        let mut params: Vec<ParamValue> = Vec::new();
+            );
+                let mut params: Vec<ParamValue> = Vec::new();
 
-        if let Some(agents) = &self.filter.agents {
-            if agents.is_empty() {
-                query.push_str(" AND 1=0");
-            } else {
-                query.push_str(" AND a.slug IN (");
-                for (i, agent) in agents.iter().enumerate() {
-                    if i > 0 {
-                        query.push_str(", ");
+                if let Some(agents) = &self.filter.agents {
+                    if agents.is_empty() {
+                        query.push_str(" AND 1=0");
+                    } else {
+                        query.push_str(" AND a.slug IN (");
+                        for (i, agent) in agents.iter().enumerate() {
+                            if i > 0 {
+                                query.push_str(", ");
+                            }
+                            query.push('?');
+                            params.push(ParamValue::from(agent.clone()));
+                        }
+                        query.push(')');
                     }
-                    query.push('?');
-                    params.push(ParamValue::from(agent.clone()));
                 }
-                query.push(')');
-            }
-        }
 
-        // Note: Workspace filtering in source DB might be string matching if paths aren't normalized consistently.
-        // Assuming strict matching for now.
-        if let Some(workspaces) = &self.filter.workspaces {
-            if workspaces.is_empty() {
-                query.push_str(" AND 1=0");
-            } else {
-                query.push_str(" AND w.path IN (");
-                for (i, ws) in workspaces.iter().enumerate() {
-                    if i > 0 {
-                        query.push_str(", ");
+                // Note: Workspace filtering in source DB might be string matching if paths aren't normalized consistently.
+                // Assuming strict matching for now.
+                if let Some(workspaces) = &self.filter.workspaces {
+                    if workspaces.is_empty() {
+                        query.push_str(" AND 1=0");
+                    } else {
+                        query.push_str(" AND w.path IN (");
+                        for (i, ws) in workspaces.iter().enumerate() {
+                            if i > 0 {
+                                query.push_str(", ");
+                            }
+                            query.push('?');
+                            params.push(ParamValue::from(ws.to_string_lossy().to_string()));
+                        }
+                        query.push(')');
                     }
-                    query.push('?');
-                    params.push(ParamValue::from(ws.to_string_lossy().to_string()));
                 }
-                query.push(')');
-            }
-        }
 
-        if let Some(since) = self.filter.since {
-            query.push_str(" AND c.started_at >= ?");
-            params.push(ParamValue::from(since.timestamp_millis()));
-        }
+                if let Some(since) = self.filter.since {
+                    query.push_str(" AND c.started_at >= ?");
+                    params.push(ParamValue::from(since.timestamp_millis()));
+                }
 
-        if let Some(until) = self.filter.until {
-            query.push_str(" AND c.started_at <= ?");
-            params.push(ParamValue::from(until.timestamp_millis()));
-        }
+                if let Some(until) = self.filter.until {
+                    query.push_str(" AND c.started_at <= ?");
+                    params.push(ParamValue::from(until.timestamp_millis()));
+                }
 
-        // Count total for progress
-        let count_query = format!("SELECT COUNT(*) FROM ({})", query);
-        let total_convs: usize = src.query_row_map(&count_query, &params, |row: &FrankenRow| {
-            row.get_typed::<i64>(0).map(|v| v as usize)
-        })?;
+                // Count total for progress
+                let count_query = format!("SELECT COUNT(*) FROM ({})", query);
+                let total_convs: usize =
+                    src.query_row_map(&count_query, &params, |row: &FrankenRow| {
+                        row.get_typed::<i64>(0).map(|v| v as usize)
+                    })?;
 
-        // Execute Main Query - collect all conversation rows
-        type ConversationExportRow = (
-            i64,
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-            Option<i64>,
-            Option<i64>,
-            i64,
-            Option<String>,
-        );
-        let conv_rows: Vec<ConversationExportRow> =
-            src.query_map_collect(&query, &params, |row: &FrankenRow| {
-                Ok((
-                    row.get_typed::<i64>(0)?,
-                    row.get_typed::<String>(1)?,
-                    row.get_typed::<Option<String>>(2)?,
-                    row.get_typed::<Option<String>>(3)?,
-                    row.get_typed::<String>(4)?,
-                    row.get_typed::<Option<i64>>(5)?,
-                    row.get_typed::<Option<i64>>(6)?,
-                    row.get_typed::<i64>(7)?,
-                    row.get_typed::<Option<String>>(8)?,
-                ))
-            })?;
+                // Execute Main Query - collect all conversation rows
+                type ConversationExportRow = (
+                    i64,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    Option<i64>,
+                    Option<i64>,
+                    i64,
+                    Option<String>,
+                );
+                let conv_rows: Vec<ConversationExportRow> =
+                    src.query_map_collect(&query, &params, |row: &FrankenRow| {
+                        Ok((
+                            row.get_typed::<i64>(0)?,
+                            row.get_typed::<String>(1)?,
+                            row.get_typed::<Option<String>>(2)?,
+                            row.get_typed::<Option<String>>(3)?,
+                            row.get_typed::<String>(4)?,
+                            row.get_typed::<Option<i64>>(5)?,
+                            row.get_typed::<Option<i64>>(6)?,
+                            row.get_typed::<i64>(7)?,
+                            row.get_typed::<Option<String>>(8)?,
+                        ))
+                    })?;
 
-        let mut processed = 0;
-        let mut msg_processed = 0;
+                let mut processed = 0;
+                let mut msg_processed = 0;
 
-        for (
-            id,
-            agent,
-            workspace,
-            title,
-            source_path,
-            started_at,
-            ended_at,
-            message_count,
-            metadata_json,
-        ) in &conv_rows
-        {
-            if let Some(r) = &running
-                && !r.load(Ordering::Relaxed)
-            {
-                return Err(anyhow::anyhow!("Export cancelled"));
-            }
+                for (
+                    id,
+                    agent,
+                    workspace,
+                    title,
+                    source_path,
+                    started_at,
+                    ended_at,
+                    message_count,
+                    metadata_json,
+                ) in &conv_rows
+                {
+                    if let Some(r) = &running
+                        && !r.load(Ordering::Relaxed)
+                    {
+                        return Err(anyhow::anyhow!("Export cancelled"));
+                    }
 
-            // Transform Path
-            let transformed_path = self.transform_path(source_path, workspace);
+                    // Transform Path
+                    let transformed_path = self.transform_path(source_path, workspace);
 
-            tx.execute_compat(
-                "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, ended_at, message_count, metadata_json)
+                    tx.execute_compat(
+                    "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, ended_at, message_count, metadata_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    *id,
-                    agent.as_str(),
-                    workspace.as_deref(),
-                    title.as_deref(),
-                    transformed_path.as_str(),
-                    *started_at,
-                    *ended_at,
-                    *message_count,
-                    metadata_json.as_deref()
-                ],
-            )?;
+                    params![
+                        *id,
+                        agent.as_str(),
+                        workspace.as_deref(),
+                        title.as_deref(),
+                        transformed_path.as_str(),
+                        *started_at,
+                        *ended_at,
+                        *message_count,
+                        metadata_json.as_deref()
+                    ],
+                )?;
 
-            // Fetch messages for this conversation
-            let msg_rows: Vec<(String, String, Option<i64>, i64)> = src.query_map_collect(
-                "SELECT role, content, created_at, idx
+                    // Fetch messages for this conversation
+                    let msg_rows: Vec<(String, String, Option<i64>, i64)> = src.query_map_collect(
+                        "SELECT role, content, created_at, idx
                  FROM messages
                  WHERE conversation_id = ?1
                  ORDER BY idx ASC",
-                frankensqlite::params![*id],
-                |row: &FrankenRow| {
-                    Ok((
-                        row.get_typed::<String>(0)?,
-                        row.get_typed::<String>(1)?,
-                        row.get_typed::<Option<i64>>(2)?,
-                        row.get_typed::<i64>(3)?,
-                    ))
-                },
-            )?;
+                        frankensqlite::params![*id],
+                        |row: &FrankenRow| {
+                            Ok((
+                                row.get_typed::<String>(0)?,
+                                row.get_typed::<String>(1)?,
+                                row.get_typed::<Option<i64>>(2)?,
+                                row.get_typed::<i64>(3)?,
+                            ))
+                        },
+                    )?;
 
-            for (role, content, created_at, idx) in &msg_rows {
-                tx.execute_compat(
-                    "INSERT INTO messages (conversation_id, idx, role, content, created_at)
+                    for (role, content, created_at, idx) in &msg_rows {
+                        tx.execute_compat(
+                            "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![*id, *idx, role.as_str(), content.as_str(), *created_at],
-                )?;
+                            params![*id, *idx, role.as_str(), content.as_str(), *created_at],
+                        )?;
 
-                let msg_id = tx.last_insert_rowid()?;
+                        let msg_id = tx.last_insert_rowid()?;
 
-                // Populate FTS
+                        // Populate FTS
+                        tx.execute_compat(
+                            "INSERT INTO messages_fts (rowid, content) VALUES (?1, ?2)",
+                            params![msg_id, content.as_str()],
+                        )?;
+                        tx.execute_compat(
+                            "INSERT INTO messages_code_fts (rowid, content) VALUES (?1, ?2)",
+                            params![msg_id, content.as_str()],
+                        )?;
+
+                        msg_processed += 1;
+                    }
+
+                    processed += 1;
+                    progress(processed, total_convs);
+                }
+
+                // Metadata
+                tx.execute("INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')")?;
+                let exported_at = Utc::now().to_rfc3339();
                 tx.execute_compat(
-                    "INSERT INTO messages_fts (rowid, content) VALUES (?1, ?2)",
-                    params![msg_id, content.as_str()],
-                )?;
-                tx.execute_compat(
-                    "INSERT INTO messages_code_fts (rowid, content) VALUES (?1, ?2)",
-                    params![msg_id, content.as_str()],
+                    "INSERT INTO export_meta (key, value) VALUES ('exported_at', ?1)",
+                    params![exported_at.as_str()],
                 )?;
 
-                msg_processed += 1;
-            }
+                tx.commit()?;
+                (processed, msg_processed)
+            };
+            drop(dest);
 
-            processed += 1;
-            progress(processed, total_convs);
+            replace_attempted = true;
+            replace_file_from_temp(&temp_output_path, &self.output_path)
+                .context("Failed to install completed export database")?;
+
+            Ok(ExportStats {
+                conversations_processed: processed,
+                messages_processed: msg_processed,
+            })
+        })();
+
+        if result.is_err() && !replace_attempted {
+            cleanup_sqlite_temp_artifacts(&temp_output_path);
         }
 
-        // Metadata
-        tx.execute("INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')")?;
-        let exported_at = Utc::now().to_rfc3339();
-        tx.execute_compat(
-            "INSERT INTO export_meta (key, value) VALUES ('exported_at', ?1)",
-            params![exported_at.as_str()],
-        )?;
-
-        tx.commit()?;
-
-        Ok(ExportStats {
-            conversations_processed: processed,
-            messages_processed: msg_processed,
-        })
+        result
     }
 
     fn transform_path(&self, path: &str, workspace: &Option<String>) -> String {
@@ -351,6 +368,124 @@ impl ExportEngine {
                 format!("{:x}", hasher.finalize())[..16].to_string()
             }
         }
+    }
+}
+
+fn unique_atomic_temp_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "tmp", "pages_export.db")
+}
+
+#[cfg(windows)]
+fn unique_replace_backup_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "bak", "pages_export.db")
+}
+
+fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> PathBuf {
+    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_name);
+
+    path.with_file_name(format!(
+        ".{file_name}.{suffix}.{}.{}.{}",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
+}
+
+fn cleanup_sqlite_temp_artifacts(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(sidecar_path(path, "-wal"));
+    let _ = std::fs::remove_file(sidecar_path(path, "-shm"));
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "pages_export.db".to_string());
+    path.with_file_name(format!("{file_name}{suffix}"))
+}
+
+fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        match std::fs::rename(temp_path, final_path) {
+            Ok(()) => Ok(()),
+            Err(first_err)
+                if final_path.exists()
+                    && matches!(
+                        first_err.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                let backup_path = unique_replace_backup_path(final_path);
+                std::fs::rename(final_path, &backup_path).with_context(|| {
+                    format!(
+                        "failed preparing backup {} before replacing {} after initial rename error: {}",
+                        backup_path.display(),
+                        final_path.display(),
+                        first_err
+                    )
+                })?;
+
+                match std::fs::rename(temp_path, final_path) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&backup_path);
+                        Ok(())
+                    }
+                    Err(second_err) => match std::fs::rename(&backup_path, final_path) {
+                        Ok(()) => {
+                            let _ = std::fs::remove_file(temp_path);
+                            bail!(
+                                "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
+                                final_path.display(),
+                                temp_path.display(),
+                                first_err,
+                                second_err
+                            );
+                        }
+                        Err(restore_err) => {
+                            bail!(
+                                "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}; temp file retained at {}",
+                                final_path.display(),
+                                temp_path.display(),
+                                first_err,
+                                second_err,
+                                restore_err,
+                                temp_path.display()
+                            );
+                        }
+                    },
+                }
+            }
+            Err(rename_err) => Err(rename_err).with_context(|| {
+                format!(
+                    "failed renaming completed export {} into place at {}",
+                    temp_path.display(),
+                    final_path.display()
+                )
+            }),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(temp_path, final_path).with_context(|| {
+            format!(
+                "failed renaming completed export {} into place at {}",
+                temp_path.display(),
+                final_path.display()
+            )
+        })
     }
 }
 
