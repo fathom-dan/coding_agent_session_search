@@ -154,6 +154,12 @@ pub enum Commands {
         #[arg(long, value_delimiter = ',', num_args = 1..)]
         watch_once: Option<Vec<PathBuf>>,
 
+        /// Minimum seconds between watch scan cycles (default: 30).
+        /// Prevents high CPU usage from tight-loop scanning when filesystem
+        /// events arrive continuously.
+        #[arg(long, default_value_t = 30)]
+        watch_interval: u64,
+
         /// Build semantic vector index after text indexing
         #[arg(long)]
         semantic: bool,
@@ -2682,6 +2688,7 @@ async fn execute_cli(
                     force_rebuild,
                     watch,
                     watch_once,
+                    watch_interval,
                     data_dir,
                     semantic,
                     build_hnsw,
@@ -2695,6 +2702,7 @@ async fn execute_cli(
                         force_rebuild,
                         watch,
                         watch_once,
+                        watch_interval,
                         data_dir,
                         semantic,
                         build_hnsw,
@@ -9397,6 +9405,7 @@ fn run_doctor(
                     build_hnsw: false,
                     embedder: "fastembed".to_string(),
                     progress: Some(progress.clone()),
+                    watch_interval_secs: 30,
                 };
 
                 let rebuild_handle = std::thread::spawn(move || {
@@ -11610,6 +11619,7 @@ fn run_index_with_data(
     force_rebuild: bool,
     watch: bool,
     watch_once: Option<Vec<PathBuf>>,
+    watch_interval: u64,
     data_dir_override: Option<PathBuf>,
     semantic: bool,
     build_hnsw: bool,
@@ -11739,6 +11749,7 @@ fn run_index_with_data(
         build_hnsw,
         embedder: embedder.clone(),
         progress: Some(index_progress.clone()),
+        watch_interval_secs: watch_interval,
     };
 
     // Set up progress display
@@ -16277,6 +16288,7 @@ fn run_sources_sync(
             false,          // force_rebuild
             false,          // watch
             None,           // watch_once
+            30,             // watch_interval (default)
             Some(data_dir), // data_dir
             false,          // semantic
             false,          // build_hnsw

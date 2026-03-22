@@ -351,6 +351,9 @@ pub struct IndexOptions {
     /// Embedder ID to use for semantic indexing (hash, fastembed).
     pub embedder: String,
     pub progress: Option<Arc<IndexingProgress>>,
+    /// Minimum interval (in seconds) between watch scan cycles. Prevents tight-loop
+    /// CPU burn when filesystem events arrive continuously. Default: 30.
+    pub watch_interval_secs: u64,
 }
 
 // =============================================================================
@@ -1236,6 +1239,7 @@ pub fn run_index(
             watch_roots.clone(),
             event_channel,
             stale_detector,
+            opts.watch_interval_secs,
             move |paths, roots, is_rebuild| {
                 let indexed;
                 if is_rebuild {
@@ -1547,6 +1551,7 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
     roots: Vec<(ConnectorKind, ScanRoot)>,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
     stale_detector: Arc<StaleDetector>,
+    watch_interval_secs: u64,
     callback: F,
 ) -> Result<()> {
     if let Some(paths) = watch_once_paths {
@@ -1583,11 +1588,15 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
 
     let debounce = Duration::from_secs(2);
     let max_wait = Duration::from_secs(5);
+    // Minimum interval between scan cycles to prevent tight-loop CPU burn
+    // when filesystem events arrive continuously. Default: 30s. (Issue #129)
+    let min_scan_interval = Duration::from_secs(watch_interval_secs.max(1));
     // Stale check interval: check every 5 minutes for quicker detection
     let stale_check_interval = Duration::from_secs(300);
     let mut pending: Vec<PathBuf> = Vec::new();
     let mut first_event: Option<Instant> = None;
     let mut last_stale_check = Instant::now();
+    let mut last_scan = Instant::now();
 
     loop {
         // Calculate timeout: use stale check interval when idle, debounce when active
@@ -1597,7 +1606,14 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
             let now = Instant::now();
             let elapsed = now.duration_since(first_event.unwrap_or(now));
             if elapsed >= max_wait {
+                // Enforce minimum interval between scans to prevent CPU burn
+                // when events arrive faster than we can process them (issue #129)
+                let since_last_scan = last_scan.elapsed();
+                if since_last_scan < min_scan_interval {
+                    std::thread::sleep(min_scan_interval - since_last_scan);
+                }
                 callback(std::mem::take(&mut pending), &roots, false);
+                last_scan = Instant::now();
                 first_event = None;
                 continue;
             }
@@ -1625,7 +1641,13 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // Process pending events if any
                 if !pending.is_empty() {
+                    // Enforce minimum interval between scans (issue #129)
+                    let since_last_scan = last_scan.elapsed();
+                    if since_last_scan < min_scan_interval {
+                        std::thread::sleep(min_scan_interval - since_last_scan);
+                    }
                     callback(std::mem::take(&mut pending), &roots, false);
+                    last_scan = Instant::now();
                     first_event = None;
                 }
 
@@ -3598,6 +3620,7 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
+            watch_interval_secs: 30,
         };
 
         // Manually set up dependencies for reindex_paths
@@ -3673,6 +3696,7 @@ mod tests {
             build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
+            watch_interval_secs: 30,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -3735,6 +3759,7 @@ mod tests {
             build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
+            watch_interval_secs: 30,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -3816,6 +3841,7 @@ mod tests {
             build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
+            watch_interval_secs: 30,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
