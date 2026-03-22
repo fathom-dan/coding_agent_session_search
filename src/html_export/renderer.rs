@@ -1075,14 +1075,14 @@ fn format_role_display(role: &str) -> String {
         "assistant" | "agent" => "Assistant".to_string(),
         "tool" => "Tool".to_string(),
         "system" => "System".to_string(),
-        other => other.to_string(),
+        other => html_escape(other),
     }
 }
 
 /// Render message content, converting markdown to HTML using pulldown-cmark.
 /// Raw HTML in the input is escaped for security (XSS prevention).
 fn render_content(content: &str, _options: &RenderOptions) -> String {
-    use pulldown_cmark::Event;
+    use pulldown_cmark::{Event, Tag};
 
     // Configure pulldown-cmark with all common extensions
     let mut opts = Options::empty();
@@ -1097,6 +1097,16 @@ fn render_content(content: &str, _options: &RenderOptions) -> String {
         // Convert raw HTML to escaped text (XSS prevention)
         Event::Html(html) => Event::Text(html),
         Event::InlineHtml(html) => Event::Text(html),
+        // Sanitize link destinations to prevent javascript:/vbscript:/data: XSS
+        Event::Start(Tag::Link { link_type, dest_url, title, id }) => {
+            let trimmed = dest_url.trim();
+            let lower = trimmed.to_lowercase();
+            if lower.starts_with("javascript:") || lower.starts_with("vbscript:") || lower.starts_with("data:") {
+                Event::Start(Tag::Link { link_type, dest_url: "#".into(), title, id })
+            } else {
+                Event::Start(Tag::Link { link_type, dest_url, title, id })
+            }
+        }
         // Pass through all other events
         other => other,
     });
@@ -1327,6 +1337,44 @@ mod tests {
         let html = render_message(&msg, &RenderOptions::default()).unwrap();
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn test_javascript_url_sanitized_in_markdown_links() {
+        let msg = test_message("user", "[click](javascript:alert(1))");
+        let html = render_message(&msg, &RenderOptions::default()).unwrap();
+        assert!(!html.contains("javascript:"), "javascript: URL should be sanitized, got: {}", html);
+        assert!(html.contains("click")); // link text preserved
+    }
+
+    #[test]
+    fn test_vbscript_and_data_urls_sanitized() {
+        let msg = test_message("user", "[a](vbscript:foo) [b](data:text/html,<script>)");
+        let html = render_message(&msg, &RenderOptions::default()).unwrap();
+        assert!(!html.contains("vbscript:"), "vbscript: URL should be sanitized, got: {}", html);
+        assert!(!html.contains("data:text"), "data: URL should be sanitized, got: {}", html);
+    }
+
+    #[test]
+    fn test_javascript_url_case_insensitive() {
+        let msg = test_message("user", "[x](JaVaScRiPt:alert(1))");
+        let html = render_message(&msg, &RenderOptions::default()).unwrap();
+        assert!(!html.contains("javascript:"), "case-variant javascript: should be sanitized, got: {}", html);
+        assert!(!html.contains("JaVaScRiPt:"), "case-variant javascript: should be sanitized, got: {}", html);
+    }
+
+    #[test]
+    fn test_normal_urls_not_affected() {
+        let msg = test_message("user", "[link](https://example.com)");
+        let html = render_message(&msg, &RenderOptions::default()).unwrap();
+        assert!(html.contains("https://example.com"), "normal URLs should be preserved, got: {}", html);
+    }
+
+    #[test]
+    fn test_format_role_display_escapes_unknown_roles() {
+        let display = format_role_display("<img src=x onerror=alert(1)>");
+        assert!(!display.contains("<img"), "unknown role should be HTML-escaped, got: {}", display);
+        assert!(display.contains("&lt;img"));
     }
 
     #[test]

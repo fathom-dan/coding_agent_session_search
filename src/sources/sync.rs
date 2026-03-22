@@ -1114,10 +1114,14 @@ impl SyncEngine {
             }
         };
 
-        // Set TCP timeout
-        let timeout = std::time::Duration::from_secs(self.connection_timeout);
-        let _ = tcp.set_read_timeout(Some(timeout));
-        let _ = tcp.set_write_timeout(Some(timeout));
+        // Set TCP read/write timeout (use transfer_timeout, not connection_timeout)
+        let timeout = std::time::Duration::from_secs(self.transfer_timeout);
+        if let Err(e) = tcp.set_read_timeout(Some(timeout)) {
+            tracing::warn!("Failed to set TCP read timeout: {}", e);
+        }
+        if let Err(e) = tcp.set_write_timeout(Some(timeout)) {
+            tracing::warn!("Failed to set TCP write timeout: {}", e);
+        }
         let tcp_shutdown = tcp.try_clone().ok();
 
         // Create SSH session
