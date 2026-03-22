@@ -4,6 +4,7 @@
 //! from an export. Output is safe for public hosting (GitHub Pages / Cloudflare Pages).
 
 use anyhow::{Context, Result, bail};
+use base64::prelude::*;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -660,10 +661,7 @@ pub(crate) fn write_private_artifacts_encrypted(
 
     // Write recovery secret if provided
     if let Some(secret) = recovery_secret {
-        let recovery_b64 = super::qr::RecoverySecret::from_bytes(secret.to_vec())
-            .context("Recovery secret bytes must meet minimum entropy requirements")?
-            .encoded()
-            .to_string();
+        let recovery_b64 = BASE64_URL_SAFE_NO_PAD.encode(secret);
         let recovery_content = format!(
             "Recovery Secret\n\
             ================\n\n\
