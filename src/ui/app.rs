@@ -10289,7 +10289,10 @@ impl CassApp {
         let bg = styles.style(style_system::STYLE_PANE_BASE);
         let accent = styles.style(style_system::STYLE_PANE_FOCUSED);
         let dim = styles.style(style_system::STYLE_TEXT_MUTED);
-        Block::new().style(bg).render(panel_area, frame);
+        // Clear background — use draw_rect_filled to overwrite both characters
+        // and styles (Block::style only sets bg without clearing foreground text).
+        let bg_color = bg.bg.unwrap_or(ftui::PackedRgba::rgb(0, 0, 0));
+        frame.draw_rect_filled(panel_area, ftui::Cell::from_char(' ').with_bg(bg_color));
         let outer = Block::new()
             .borders(Borders::ALL)
             .border_type(if panel_w >= 40 {
@@ -11501,7 +11504,10 @@ impl CassApp {
         let muted_style = styles.style(style_system::STYLE_TEXT_MUTED);
         let selected_style = styles.style(style_system::STYLE_RESULT_ROW_SELECTED);
 
-        Block::new().style(background).render(menu_area, frame);
+        // Clear background — use draw_rect_filled to overwrite both characters
+        // and styles (Block::style only sets bg without clearing foreground text).
+        let bg_color = background.bg.unwrap_or(ftui::PackedRgba::rgb(0, 0, 0));
+        frame.draw_rect_filled(menu_area, ftui::Cell::from_char(' ').with_bg(bg_color));
         let outer = Block::new()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -11564,7 +11570,10 @@ impl CassApp {
         let muted_style = styles.style(style_system::STYLE_TEXT_MUTED);
         let key_style = styles.style(style_system::STYLE_KBD_KEY);
 
-        Block::new().style(bg_style).render(dialog_area, frame);
+        // Clear background — use draw_rect_filled to overwrite both characters
+        // and styles (Block::style only sets bg without clearing foreground text).
+        let bg_color = bg_style.bg.unwrap_or(ftui::PackedRgba::rgb(0, 0, 0));
+        frame.draw_rect_filled(dialog_area, ftui::Cell::from_char(' ').with_bg(bg_color));
         let outer = Block::new()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
