@@ -77,6 +77,16 @@ function parseResultSelection(card) {
     return { conversationId, messageId };
 }
 
+export function buildResultCardId(result, index = 0) {
+    const conversationId = String(result?.conversation_id ?? 'unknown');
+    const messageId = result?.message_id;
+    if (messageId !== undefined && messageId !== null && messageId !== '') {
+        return `result-${conversationId}-m-${messageId}`;
+    }
+
+    return `result-${conversationId}-r-${index}`;
+}
+
 function isCurrentSearchEpoch(epoch) {
     return epoch === searchEpoch;
 }
@@ -600,7 +610,7 @@ function renderDirectResults() {
     elements.resultsList.style.minHeight = '';
     elements.resultsList.style.maxHeight = '';
 
-    const html = currentResults.map((result, index) => createResultCardHtml(result)).join('');
+    const html = currentResults.map((result, index) => createResultCardHtml(result, index)).join('');
     elements.resultsList.innerHTML = html;
 }
 
@@ -631,7 +641,7 @@ function createResultCard(result, index) {
     article.tabIndex = 0;
     article.setAttribute('role', 'option');
     article.setAttribute('aria-selected', 'false');
-    article.id = `result-${result.conversation_id}`;
+    article.id = buildResultCardId(result, index);
     article.setAttribute('aria-label', getResultAriaLabel(result));
 
     article.innerHTML = `
@@ -667,12 +677,12 @@ function createResultCard(result, index) {
  * Create result card HTML string (for direct rendering)
  * @private
  */
-function createResultCardHtml(result) {
+function createResultCardHtml(result, index) {
     const ariaLabel = escapeHtml(getResultAriaLabel(result));
     return `
         <article
             class="result-card"
-            id="result-${result.conversation_id}"
+            id="${buildResultCardId(result, index)}"
             data-conversation-id="${result.conversation_id}"
             data-message-id="${result.message_id || ''}"
             tabindex="0"

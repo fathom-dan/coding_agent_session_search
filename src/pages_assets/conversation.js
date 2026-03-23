@@ -45,6 +45,10 @@ const SANITIZE_CONFIG = {
     FORBID_TAGS: ['script', 'style', 'iframe', 'object', 'embed', 'form', 'input'],
     FORBID_ATTR: ['onerror', 'onclick', 'onload', 'onmouseover', 'style'],
 };
+const ALLOWED_TAGS = new Set(SANITIZE_CONFIG.ALLOWED_TAGS);
+const ALLOWED_ATTR = new Set([...SANITIZE_CONFIG.ALLOWED_ATTR, 'target', 'rel']);
+const FORBID_TAGS = new Set(SANITIZE_CONFIG.FORBID_TAGS);
+const FORBID_ATTR = new Set(SANITIZE_CONFIG.FORBID_ATTR);
 
 // Module state
 let currentConversation = null;
@@ -531,6 +535,24 @@ function base64ToBytes(base64) {
     return bytes;
 }
 
+export function sanitizeDestinationUrl(value) {
+    const url = typeof value === 'string' ? value.trim() : String(value ?? '').trim();
+    const normalized = Array.from(url)
+        .filter(ch => !/\s/.test(ch) && !/[\u0000-\u001F\u007F]/.test(ch))
+        .join('')
+        .toLowerCase();
+
+    if (
+        normalized.startsWith('javascript:')
+        || normalized.startsWith('vbscript:')
+        || normalized.startsWith('data:')
+    ) {
+        return '#';
+    }
+
+    return url;
+}
+
 /**
  * Simple markdown-like rendering (fallback)
  */
@@ -561,8 +583,10 @@ function simpleMarkdown(text) {
     html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
 
     // Links
-    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g,
-        '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) => {
+        const safeHref = escapeHtml(sanitizeDestinationUrl(href));
+        return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    });
 
     // Line breaks
     html = html.replace(/\n\n/g, '</p><p>');
@@ -591,18 +615,35 @@ function sanitizeHtml(html) {
     const template = document.createElement('template');
     template.innerHTML = html;
 
-    // Remove script tags and event handlers
-    const scripts = template.content.querySelectorAll('script, style, iframe, object, embed');
-    scripts.forEach(el => el.remove());
-
-    // Remove event handlers
-    const allElements = template.content.querySelectorAll('*');
+    const allElements = Array.from(template.content.querySelectorAll('*'));
     allElements.forEach(el => {
+        const tag = el.tagName.toLowerCase();
+        if (FORBID_TAGS.has(tag)) {
+            el.remove();
+            return;
+        }
+
+        if (!ALLOWED_TAGS.has(tag)) {
+            el.replaceWith(...Array.from(el.childNodes));
+            return;
+        }
+
         Array.from(el.attributes).forEach(attr => {
-            if (attr.name.startsWith('on') || attr.name === 'style') {
+            const name = attr.name.toLowerCase();
+            if (name.startsWith('on') || FORBID_ATTR.has(name) || !ALLOWED_ATTR.has(name)) {
                 el.removeAttribute(attr.name);
+                return;
+            }
+
+            if (name === 'href') {
+                el.setAttribute('href', sanitizeDestinationUrl(attr.value));
             }
         });
+
+        if (tag === 'a') {
+            el.setAttribute('target', '_blank');
+            el.setAttribute('rel', 'noopener noreferrer');
+        }
     });
 
     return template.innerHTML;

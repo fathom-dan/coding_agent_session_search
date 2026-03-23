@@ -510,4 +510,112 @@ mod tests {
             "stats role bar markup should use the slugged role class"
         );
     }
+
+    #[test]
+    fn test_viewer_lock_paths_reset_hash_to_home() {
+        let viewer_js = include_str!("../src/pages_assets/viewer.js");
+        assert!(
+            viewer_js.contains("function syncLockedViewerState()"),
+            "viewer lock handling should centralize state/hash reset"
+        );
+        assert!(
+            viewer_js.contains("window.history?.replaceState"),
+            "viewer lock handling should update the hash without triggering a fresh route load"
+        );
+        assert_eq!(
+            viewer_js.matches("syncLockedViewerState();").count(),
+            2,
+            "both viewer lock paths should reset state and hash together"
+        );
+        assert_eq!(
+            viewer_js.matches("cleanup();").count(),
+            2,
+            "both viewer lock paths should tear down the live viewer to avoid stale route handling while locked"
+        );
+    }
+
+    #[test]
+    fn test_conversation_fallback_sanitizer_blocks_unsafe_link_schemes() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import { sanitizeDestinationUrl } from './src/pages_assets/conversation.js';
+
+                const blocked = [
+                    'javascript:alert(1)',
+                    ' JaVaScRiPt:alert(1)',
+                    'java\tscript:alert(1)',
+                    '\u0000data:image/svg+xml,<svg/onload=1>',
+                    'vbscript:msgbox(1)',
+                ];
+
+                for (const url of blocked) {
+                    if (sanitizeDestinationUrl(url) !== '#') {
+                        throw new Error(`expected ${JSON.stringify(url)} to be blocked`);
+                    }
+                }
+
+                const allowed = [
+                    'https://example.com/path?q=1',
+                    '/local/path',
+                    './relative/path',
+                    '#message-12',
+                    'mailto:test@example.com',
+                ];
+
+                for (const url of allowed) {
+                    if (sanitizeDestinationUrl(url) !== url.trim()) {
+                        throw new Error(`expected ${JSON.stringify(url)} to remain allowed`);
+                    }
+                }
+            "#,
+        )?;
+
+        let conversation_js = include_str!("../src/pages_assets/conversation.js");
+        assert!(
+            conversation_js
+                .contains("el.setAttribute('href', sanitizeDestinationUrl(attr.value));"),
+            "fallback HTML sanitizer should sanitize href attributes, not just markdown link generation"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_search_result_card_ids_are_unique_per_hit() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import { buildResultCardId } from './src/pages_assets/search.js';
+
+                const sameConversationDifferentMessages = [
+                    buildResultCardId({ conversation_id: 12, message_id: 34 }, 0),
+                    buildResultCardId({ conversation_id: 12, message_id: 35 }, 1),
+                ];
+
+                if (sameConversationDifferentMessages[0] === sameConversationDifferentMessages[1]) {
+                    throw new Error(`expected unique ids for different message hits, got ${JSON.stringify(sameConversationDifferentMessages)}`);
+                }
+
+                const conversationOnly = [
+                    buildResultCardId({ conversation_id: 99, message_id: null }, 0),
+                    buildResultCardId({ conversation_id: 99, message_id: null }, 1),
+                ];
+
+                if (conversationOnly[0] === conversationOnly[1]) {
+                    throw new Error(`expected unique ids for repeated conversation-only hits, got ${JSON.stringify(conversationOnly)}`);
+                }
+            "#,
+        )?;
+
+        let search_js = include_str!("../src/pages_assets/search.js");
+        assert!(
+            search_js.contains("article.id = buildResultCardId(result, index);"),
+            "virtual result rendering should use the unique result id helper"
+        );
+        assert!(
+            search_js.contains("id=\"${buildResultCardId(result, index)}\""),
+            "direct result rendering should use the unique result id helper"
+        );
+
+        Ok(())
+    }
 }

@@ -627,11 +627,26 @@ function handleBackToSearch() {
     }
 }
 
+function syncLockedViewerState() {
+    state.view = 'search';
+    state.conversationId = null;
+    state.messageId = null;
+    state.searchQuery = '';
+
+    if (window?.location?.href) {
+        const url = new URL(window.location.href);
+        url.hash = '/';
+        if (window.history?.replaceState) {
+            window.history.replaceState(null, '', url.toString());
+        } else {
+            window.location.replace(url.toString());
+        }
+    }
+}
+
 function handleSessionReset(action) {
-    clearViewer();
-    clearSearch({ reloadRecent: false });
-    clearStatsCache();
-    closeDatabase();
+    syncLockedViewerState();
+    cleanup();
     window.dispatchEvent(new CustomEvent('cass:lock', {
         detail: { action, source: 'viewer' },
     }));
@@ -642,15 +657,8 @@ function handleGlobalLock(event) {
         return;
     }
 
-    clearViewer();
-    clearSearch({ reloadRecent: false });
-    clearStatsCache();
-    state.view = 'search';
-    state.conversationId = null;
-    state.messageId = null;
-    state.searchQuery = '';
-    showViewContainer('search');
-    updateActiveNavLink('search');
+    syncLockedViewerState();
+    cleanup();
 }
 
 /**
