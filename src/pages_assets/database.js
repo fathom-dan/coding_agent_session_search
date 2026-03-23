@@ -5,7 +5,7 @@
  * Uses OPFS for persistence when user has opted in, falls back to in-memory.
  */
 
-import { isOpfsEnabled } from './storage.js';
+import { getArchiveOpfsPrimaryDbName, isOpfsEnabled } from './storage.js';
 
 // Module state
 let sqlite3 = null;
@@ -31,8 +31,9 @@ export async function initDatabase(dbBytes) {
     // Try OPFS first (better performance, persists in cache) if user opted in
     if (isOpfsEnabled() && sqlite3.oo1.OpfsDb && navigator.storage?.getDirectory) {
         try {
+            const opfsDbName = getArchiveOpfsPrimaryDbName();
             await writeBytesToOPFS(dbBytes);
-            db = new sqlite3.oo1.OpfsDb('/cass-archive.sqlite3');
+            db = new sqlite3.oo1.OpfsDb(`/${opfsDbName}`);
             console.log('[DB] Loaded from OPFS');
             isInitialized = true;
             return;
@@ -75,7 +76,7 @@ async function loadSqliteWasm() {
  */
 async function writeBytesToOPFS(bytes) {
     const root = await navigator.storage.getDirectory();
-    const handle = await root.getFileHandle('cass-archive.sqlite3', { create: true });
+    const handle = await root.getFileHandle(getArchiveOpfsPrimaryDbName(), { create: true });
     const writable = await handle.createWritable();
     await writable.write(bytes);
     await writable.close();

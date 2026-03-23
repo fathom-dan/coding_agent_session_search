@@ -250,6 +250,11 @@ impl EncryptionEngine {
         Ok(slot_id)
     }
 
+    /// Returns the number of key slots currently configured
+    pub fn key_slot_count(&self) -> usize {
+        self.key_slots.len()
+    }
+
     /// Encrypt a file with streaming compression and chunked AEAD
     pub fn encrypt_file<P: AsRef<Path>>(
         &self,

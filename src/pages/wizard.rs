@@ -48,7 +48,7 @@ impl std::fmt::Display for DeployTarget {
 }
 
 /// Wizard state tracking all configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WizardState {
     // Content selection
     pub agents: Vec<String>,
@@ -100,6 +100,40 @@ pub struct WizardState {
 
     // Final output location (set after export)
     pub final_site_dir: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for WizardState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WizardState")
+            .field("agents", &self.agents)
+            .field("time_range", &self.time_range)
+            .field("workspaces", &self.workspaces)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("recovery_secret", &self.recovery_secret.as_ref().map(|_| "[REDACTED]"))
+            .field("generate_recovery", &self.generate_recovery)
+            .field("generate_qr", &self.generate_qr)
+            .field("title", &self.title)
+            .field("description", &self.description)
+            .field("hide_metadata", &self.hide_metadata)
+            .field("target", &self.target)
+            .field("output_dir", &self.output_dir)
+            .field("repo_name", &self.repo_name)
+            .field("db_path", &self.db_path)
+            .field("exclusions", &self.exclusions)
+            .field("last_summary", &self.last_summary)
+            .field("secret_scan_has_findings", &self.secret_scan_has_findings)
+            .field("secret_scan_has_critical", &self.secret_scan_has_critical)
+            .field("secret_scan_count", &self.secret_scan_count)
+            .field("password_entropy_bits", &self.password_entropy_bits)
+            .field("no_encryption", &self.no_encryption)
+            .field("unencrypted_confirmed", &self.unencrypted_confirmed)
+            .field("include_attachments", &self.include_attachments)
+            .field("cloudflare_branch", &self.cloudflare_branch)
+            .field("cloudflare_account_id", &self.cloudflare_account_id)
+            .field("cloudflare_api_token", &self.cloudflare_api_token.as_ref().map(|_| "[REDACTED]"))
+            .field("final_site_dir", &self.final_site_dir)
+            .finish()
+    }
 }
 
 impl Default for WizardState {
@@ -1659,6 +1693,11 @@ impl PagesWizard {
                 rng.fill_bytes(&mut recovery_bytes);
                 enc_engine.add_recovery_slot(&recovery_bytes)?;
                 self.state.recovery_secret = Some(recovery_bytes.to_vec());
+            }
+
+            // Guard: refuse to produce an archive with zero key slots
+            if enc_engine.key_slot_count() == 0 {
+                bail!("No encryption key slots configured — archive would be permanently undecryptable");
             }
 
             // Encrypt the database

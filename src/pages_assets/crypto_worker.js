@@ -9,6 +9,30 @@
 let dek = null;
 let config = null;
 
+function hashScopeId(input) {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < input.length; i++) {
+        hash ^= input.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(16).padStart(8, '0');
+}
+
+function getArchiveScopeId() {
+    try {
+        return hashScopeId(new URL('./', self.location.href).href);
+    } catch (error) {
+        const href = typeof self?.location?.href === 'string'
+            ? self.location.href
+            : 'unknown';
+        return hashScopeId(href.split('#')[0].split('?')[0]);
+    }
+}
+
+function getArchiveOpfsDbName() {
+    return `cass-archive-${getArchiveScopeId()}.db`;
+}
+
 /**
  * Handle messages from main thread
  */
@@ -431,14 +455,15 @@ async function initDatabase(dbBytes, opfsEnabled) {
         let db;
         if (opfsEnabled && sqlite3.oo1.OpfsDb) {
             try {
+                const opfsDbName = getArchiveOpfsDbName();
                 // Write to OPFS
                 const opfs = await navigator.storage.getDirectory();
-                const fileHandle = await opfs.getFileHandle('cass-archive.db', { create: true });
+                const fileHandle = await opfs.getFileHandle(opfsDbName, { create: true });
                 const writable = await fileHandle.createWritable();
                 await writable.write(dbBytes);
                 await writable.close();
 
-                db = new sqlite3.oo1.OpfsDb('cass-archive.db');
+                db = new sqlite3.oo1.OpfsDb(opfsDbName);
             } catch (opfsError) {
                 console.warn('OPFS not available, using in-memory:', opfsError);
                 db = new sqlite3.oo1.DB();

@@ -6,7 +6,7 @@
  */
 
 import { createStrengthMeter } from './password-strength.js';
-import { StorageMode, StorageKeys, isOpfsEnabled } from './storage.js';
+import { StorageMode, StorageKeys, getArchiveScopeId, isOpfsEnabled } from './storage.js';
 import { SESSION_CONFIG } from './session.js';
 
 // State
@@ -17,7 +17,7 @@ let strengthMeter = null;
 let isUnencryptedArchive = false;
 let tofuStatus = { valid: true, isFirstVisit: true };
 
-const SESSION_KEYS = {
+const LEGACY_SESSION_KEYS = {
     DEK: 'cass_session_dek',
     EXPIRY: 'cass_session_expiry',
     UNLOCKED: 'cass_unlocked',
@@ -183,21 +183,19 @@ async function loadConfig() {
     return response.json();
 }
 
-function getArchiveTofuScope() {
-    try {
-        return new URL('./', window.location.href).href;
-    } catch (error) {
-        const href = typeof window?.location?.href === 'string'
-            ? window.location.href
-            : 'unknown';
-        return href.split('#')[0].split('?')[0];
-    }
+function getSessionKeys() {
+    const scopeId = getArchiveScopeId();
+    return {
+        DEK: `cass_session_dek_${scopeId}`,
+        EXPIRY: `cass_session_expiry_${scopeId}`,
+        UNLOCKED: `cass_unlocked_${scopeId}`,
+    };
 }
 
 function getTofuKey() {
     // Scope TOFU to the archive location, not the archive's self-declared export_id.
     // Otherwise a full archive swap at the same URL looks like a first visit.
-    return `cass_fingerprint_v2_${getArchiveTofuScope()}`;
+    return `cass_fingerprint_v2_${getArchiveScopeId()}`;
 }
 
 /**
@@ -945,10 +943,11 @@ function persistSession(dekBase64) {
     }
 
     const expiry = Date.now() + SESSION_CONFIG.DEFAULT_DURATION_MS;
+    const sessionKeys = getSessionKeys();
     try {
-        storage.setItem(SESSION_KEYS.DEK, dekBase64);
-        storage.setItem(SESSION_KEYS.EXPIRY, expiry.toString());
-        storage.setItem(SESSION_KEYS.UNLOCKED, 'true');
+        storage.setItem(sessionKeys.DEK, dekBase64);
+        storage.setItem(sessionKeys.EXPIRY, expiry.toString());
+        storage.setItem(sessionKeys.UNLOCKED, 'true');
     } catch (e) {
         // Ignore write failures
     }
@@ -963,9 +962,10 @@ function restoreSession() {
     }
 
     try {
-        const unlocked = storage.getItem(SESSION_KEYS.UNLOCKED);
-        const dekStored = storage.getItem(SESSION_KEYS.DEK);
-        const expiry = parseInt(storage.getItem(SESSION_KEYS.EXPIRY) || '0', 10);
+        const sessionKeys = getSessionKeys();
+        const unlocked = storage.getItem(sessionKeys.UNLOCKED);
+        const dekStored = storage.getItem(sessionKeys.DEK);
+        const expiry = parseInt(storage.getItem(sessionKeys.EXPIRY) || '0', 10);
 
         if (unlocked !== 'true' || !dekStored) {
             clearStoredSession();
@@ -990,11 +990,19 @@ function restoreSession() {
 
 function clearStoredSession() {
     const storages = [sessionStorage, localStorage];
+    const sessionKeys = getSessionKeys();
     for (const storage of storages) {
         try {
-            storage.removeItem(SESSION_KEYS.DEK);
-            storage.removeItem(SESSION_KEYS.EXPIRY);
-            storage.removeItem(SESSION_KEYS.UNLOCKED);
+            for (const key of [
+                sessionKeys.DEK,
+                sessionKeys.EXPIRY,
+                sessionKeys.UNLOCKED,
+                LEGACY_SESSION_KEYS.DEK,
+                LEGACY_SESSION_KEYS.EXPIRY,
+                LEGACY_SESSION_KEYS.UNLOCKED,
+            ]) {
+                storage.removeItem(key);
+            }
         } catch (e) {
             // Ignore
         }

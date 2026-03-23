@@ -30,7 +30,7 @@ const KEYS = {
     LAST_UNLOCK: `${STORAGE_PREFIX}last-unlock`,
     DB_CACHED: `${STORAGE_PREFIX}db-cached`,
 };
-const OPFS_DB_FILES = [
+const LEGACY_OPFS_DB_FILES = [
     'cass-archive.sqlite3',
     'cass-archive.sqlite3-wal',
     'cass-archive.sqlite3-shm',
@@ -47,6 +47,53 @@ let currentMode = StorageMode.MEMORY;
 
 // OPFS directory handle (cached)
 let opfsRoot = null;
+
+function hashScopeId(input) {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < input.length; i++) {
+        hash ^= input.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(16).padStart(8, '0');
+}
+
+export function getArchiveScopeUrl() {
+    try {
+        return new URL('./', window.location.href).href;
+    } catch (error) {
+        const href = typeof window?.location?.href === 'string'
+            ? window.location.href
+            : 'unknown';
+        return href.split('#')[0].split('?')[0];
+    }
+}
+
+export function getArchiveScopeId() {
+    return hashScopeId(getArchiveScopeUrl());
+}
+
+export function getArchiveOpfsDbFiles() {
+    const scopeId = getArchiveScopeId();
+    return [
+        `cass-archive-${scopeId}.sqlite3`,
+        `cass-archive-${scopeId}.sqlite3-wal`,
+        `cass-archive-${scopeId}.sqlite3-shm`,
+        `cass-archive-${scopeId}.db`,
+        `cass-archive-${scopeId}.db-wal`,
+        `cass-archive-${scopeId}.db-shm`,
+    ];
+}
+
+export function getArchiveOpfsPrimaryDbName() {
+    return getArchiveOpfsDbFiles()[0];
+}
+
+function isCassOpfsDbFile(name) {
+    return (
+        LEGACY_OPFS_DB_FILES.includes(name)
+        || /^cass-archive-[0-9a-f]{8}\.(?:sqlite3|db)(?:-(?:wal|shm))?$/.test(name)
+    );
+}
 
 /**
  * Initialize storage module
@@ -522,18 +569,27 @@ export async function clearCurrentStorage() {
 /**
  * Clear OPFS storage
  */
-export async function clearOPFS() {
+export async function clearOPFS(options = {}) {
+    const { allArchives = false } = options;
+
     if (!isOPFSAvailable()) {
         return;
     }
 
     try {
         const root = await navigator.storage.getDirectory();
+        const currentArchiveFiles = new Set([
+            ...LEGACY_OPFS_DB_FILES,
+            ...getArchiveOpfsDbFiles(),
+        ]);
 
         // Iterate and delete all entries
         const entries = [];
         for await (const entry of root.keys()) {
-            if (entry.startsWith(STORAGE_PREFIX) || OPFS_DB_FILES.includes(entry)) {
+            const shouldDeleteDb = allArchives
+                ? isCassOpfsDbFile(entry)
+                : currentArchiveFiles.has(entry);
+            if (entry.startsWith(STORAGE_PREFIX) || shouldDeleteDb) {
                 entries.push(entry);
             }
         }
@@ -594,7 +650,7 @@ export async function clearAllStorage() {
     }
 
     // Clear OPFS
-    await clearOPFS();
+    await clearOPFS({ allArchives: true });
 
     console.log('[Storage] All storage cleared');
 }
@@ -712,13 +768,13 @@ export async function getStorageStats() {
         try {
             const root = await navigator.storage.getDirectory();
             for await (const name of root.keys()) {
-                if (name.startsWith(STORAGE_PREFIX) || OPFS_DB_FILES.includes(name)) {
+                if (name.startsWith(STORAGE_PREFIX) || isCassOpfsDbFile(name)) {
                     stats.opfs.items++;
                     try {
                         const handle = await root.getFileHandle(name);
                         const file = await handle.getFile();
                         stats.opfs.bytes += file.size;
-                        if (OPFS_DB_FILES.includes(name)) {
+                        if (isCassOpfsDbFile(name)) {
                             stats.opfs.dbBytes += file.size;
                             stats.opfs.dbFiles.push(name);
                         }
@@ -750,7 +806,7 @@ export async function getStorageStats() {
 export async function isDatabaseCached() {
     try {
         const root = await getOPFSRoot();
-        for (const name of OPFS_DB_FILES) {
+        for (const name of [...LEGACY_OPFS_DB_FILES, ...getArchiveOpfsDbFiles()]) {
             try {
                 await root.getFileHandle(name);
                 return true;
@@ -804,4 +860,8 @@ export default {
     getStorageStats,
     isDatabaseCached,
     formatBytes,
+    getArchiveScopeUrl,
+    getArchiveScopeId,
+    getArchiveOpfsDbFiles,
+    getArchiveOpfsPrimaryDbName,
 };
