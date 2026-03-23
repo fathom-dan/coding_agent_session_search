@@ -18,10 +18,13 @@ let isUnencryptedArchive = false;
 let tofuStatus = { valid: true, isFirstVisit: true };
 let unlockInFlight = false;
 let decryptInFlight = false;
+let activeQrScannerSession = 0;
 let activeUnlockRequestId = null;
 let activeDecryptRequestId = null;
 let nextWorkerRequestId = 1;
 let activeAppInitToken = 0;
+let qrLibraryLoadPromise = null;
+let qrScannerTeardownPromise = null;
 const LEGACY_SESSION_KEYS = {
     DEK: 'cass_session_dek',
     EXPIRY: 'cass_session_expiry',
@@ -169,7 +172,7 @@ function setupEventListeners() {
     // Escape key to close QR scanner
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape' && !elements.qrScanner?.classList.contains('hidden')) {
-            closeQrScanner();
+            void closeQrScanner();
         }
     });
 }
@@ -191,6 +194,19 @@ function isCurrentAppInitToken(token) {
 
 function invalidateAppInitAttempt() {
     activeAppInitToken += 1;
+}
+
+function beginQrScannerSession() {
+    activeQrScannerSession += 1;
+    return activeQrScannerSession;
+}
+
+function invalidateQrScannerSession() {
+    activeQrScannerSession += 1;
+}
+
+function isCurrentQrScannerSession(sessionToken) {
+    return sessionToken === activeQrScannerSession;
 }
 
 function clearWorkerKeys() {
@@ -571,34 +587,44 @@ function toggleFingerprintTooltip() {
  * Open QR code scanner
  */
 async function openQrScanner() {
+    await waitForQrScannerTeardown();
+    if (qrScanner && !elements.qrScanner?.classList.contains('hidden')) {
+        return;
+    }
+    const sessionToken = beginQrScannerSession();
     elements.qrScanner.classList.remove('hidden');
 
-    // Dynamically load QR scanner library if not loaded
-    if (!window.Html5Qrcode) {
-        try {
-            // Try to load from vendor folder
-            const script = document.createElement('script');
-            script.src = './vendor/html5-qrcode.min.js';
-            await new Promise((resolve, reject) => {
-                script.onload = resolve;
-                script.onerror = reject;
-                document.head.appendChild(script);
-            });
-        } catch (error) {
-            showError('Failed to load QR scanner library');
-            closeQrScanner();
-            return;
-        }
+    try {
+        await loadQrScannerLibrary();
+    } catch (error) {
+        showError('Failed to load QR scanner library');
+        await closeQrScanner();
+        return;
+    }
+
+    if (
+        !isCurrentQrScannerSession(sessionToken)
+        || elements.qrScanner?.classList.contains('hidden')
+    ) {
+        return;
     }
 
     try {
-        qrScanner = new window.Html5Qrcode('qr-reader');
-        await qrScanner.start(
+        const scanner = new window.Html5Qrcode('qr-reader');
+        qrScanner = scanner;
+        await scanner.start(
             { facingMode: 'environment' },
             { fps: 10, qrbox: { width: 250, height: 250 } },
             handleQrSuccess,
             handleQrError
         );
+        if (
+            !isCurrentQrScannerSession(sessionToken)
+            || elements.qrScanner?.classList.contains('hidden')
+        ) {
+            await finalizeQrScannerClose(scanner);
+            return;
+        }
     } catch (error) {
         console.error('QR scanner error:', error);
         if (error.name === 'NotAllowedError') {
@@ -606,7 +632,7 @@ async function openQrScanner() {
         } else {
             showError('Failed to start camera. Please enter password manually.');
         }
-        closeQrScanner();
+        await closeQrScanner();
     }
 }
 
@@ -614,15 +640,18 @@ async function openQrScanner() {
  * Close QR code scanner
  */
 async function closeQrScanner() {
-    if (qrScanner) {
-        try {
-            await qrScanner.stop();
-        } catch (e) {
-            // Ignore stop errors
-        }
-        qrScanner = null;
-    }
+    invalidateQrScannerSession();
+    const scanner = qrScanner;
+    qrScanner = null;
     elements.qrScanner.classList.add('hidden');
+    let teardown = finalizeQrScannerClose(scanner);
+    teardown = teardown.finally(() => {
+        if (qrScannerTeardownPromise === teardown) {
+            qrScannerTeardownPromise = null;
+        }
+    });
+    qrScannerTeardownPromise = teardown;
+    await teardown;
 }
 
 /**
@@ -633,7 +662,7 @@ function handleQrSuccess(decodedText) {
         return;
     }
 
-    closeQrScanner();
+    void closeQrScanner();
 
     hideError();
     showProgress('Deriving key from QR...');
@@ -722,6 +751,7 @@ async function handleWorkerError(error) {
     invalidateAppInitAttempt();
     unlockInFlight = false;
     decryptInFlight = false;
+    await closeQrScanner();
     activeUnlockRequestId = null;
     activeDecryptRequestId = null;
     clearWorkerKeys();
@@ -845,6 +875,7 @@ function handleDecryptFailed(data) {
     invalidateAppInitAttempt();
     decryptInFlight = false;
     activeDecryptRequestId = null;
+    void closeQrScanner();
     hideProgress();
     showError(`Decryption failed: ${data.error}`);
     enableForm();
@@ -877,6 +908,7 @@ async function recoverFromAppInitFailure(message, error, initToken = activeAppIn
     console.error(message, error);
     unlockInFlight = false;
     decryptInFlight = false;
+    await closeQrScanner();
     activeUnlockRequestId = null;
     activeDecryptRequestId = null;
     clearWorkerKeys();
@@ -1093,6 +1125,7 @@ async function lockArchive(options = {}) {
     invalidateAppInitAttempt();
     unlockInFlight = false;
     decryptInFlight = false;
+    await closeQrScanner();
     activeUnlockRequestId = null;
     activeDecryptRequestId = null;
 
@@ -1118,6 +1151,58 @@ async function lockArchive(options = {}) {
     enableForm();
     hideError();
     hideProgress();
+}
+
+async function loadQrScannerLibrary() {
+    if (window.Html5Qrcode) {
+        return;
+    }
+    if (qrLibraryLoadPromise) {
+        await qrLibraryLoadPromise;
+        return;
+    }
+
+    qrLibraryLoadPromise = new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = './vendor/html5-qrcode.min.js';
+        script.onload = () => {
+            qrLibraryLoadPromise = null;
+            resolve();
+        };
+        script.onerror = (error) => {
+            qrLibraryLoadPromise = null;
+            script.remove();
+            reject(error);
+        };
+        document.head.appendChild(script);
+    });
+
+    await qrLibraryLoadPromise;
+}
+
+async function waitForQrScannerTeardown() {
+    if (qrScannerTeardownPromise) {
+        await qrScannerTeardownPromise;
+    }
+}
+
+async function finalizeQrScannerClose(scanner) {
+    if (scanner) {
+        try {
+            await scanner.stop();
+        } catch (error) {
+            // Ignore stop errors
+        }
+        try {
+            await scanner.clear();
+        } catch (error) {
+            // Ignore clear errors
+        }
+    }
+    if (qrScanner === scanner) {
+        qrScanner = null;
+    }
+    elements.qrReader?.replaceChildren();
 }
 
 /**

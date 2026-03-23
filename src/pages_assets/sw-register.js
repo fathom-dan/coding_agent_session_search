@@ -276,10 +276,13 @@ export async function getRegistration() {
 export async function unregisterServiceWorker() {
     const currentRegistration = registration ?? await resolveRegistration();
     if (currentRegistration) {
-        await currentRegistration.unregister();
-        registration = null;
-        console.log('[SW] Unregistered');
-        return true;
+        const unregistered = await currentRegistration.unregister();
+        if (unregistered) {
+            registration = null;
+            console.log('[SW] Unregistered');
+            return true;
+        }
+        console.warn('[SW] Service Worker refused unregister request');
     }
     return false;
 }

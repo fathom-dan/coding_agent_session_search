@@ -618,4 +618,38 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_auth_qr_scanner_cancel_invalidates_pending_start_and_clears_dom() {
+        let auth_js = include_str!("../src/pages_assets/auth.js");
+        assert!(
+            auth_js.contains("let activeQrScannerSession = 0;"),
+            "auth QR flow should track scanner sessions so cancel/lock can invalidate in-flight starts"
+        );
+        assert!(
+            auth_js.contains("let qrLibraryLoadPromise = null;"),
+            "auth QR flow should share one library load promise instead of injecting duplicate scripts"
+        );
+        assert!(
+            auth_js.contains("const sessionToken = beginQrScannerSession();"),
+            "auth QR open flow should snapshot the current scanner session before async work"
+        );
+        assert!(
+            auth_js.contains("if (qrScanner && !elements.qrScanner?.classList.contains('hidden'))"),
+            "auth QR open flow should refuse to spawn a second scanner while one is already active"
+        );
+        assert!(
+            auth_js.contains("!isCurrentQrScannerSession(sessionToken)")
+                && auth_js.contains("elements.qrScanner?.classList.contains('hidden')"),
+            "auth QR open flow should abort stale scanner starts after cancel or lock"
+        );
+        assert!(
+            auth_js.contains("await scanner.clear();"),
+            "auth QR teardown should clear the library-owned DOM after stopping the camera"
+        );
+        assert!(
+            auth_js.contains("elements.qrReader?.replaceChildren();"),
+            "auth QR teardown should clear any stale scanner markup from the reader container"
+        );
+    }
 }

@@ -858,10 +858,14 @@ export async function clearServiceWorkerCache(options = {}) {
                 : name.startsWith(cachePrefix)
         );
 
-        await Promise.all(cassNames.map((name) => caches.delete(name)));
+        const deleteResults = await Promise.all(cassNames.map((name) => caches.delete(name)));
+        const cleared = deleteResults.every(Boolean);
+        if (!cleared) {
+            console.warn('[Storage] Some Service Worker caches could not be cleared:', cassNames);
+        }
 
         console.log('[Storage] Service Worker caches cleared:', cassNames);
-        return true;
+        return cleared;
     } catch (e) {
         console.error('[Storage] Failed to clear SW cache:', e);
         return false;
@@ -882,9 +886,13 @@ export async function unregisterServiceWorker(options = {}) {
         const registrations = await navigator.serviceWorker.getRegistrations();
         const currentScope = getArchiveScopeUrl();
         const targets = registrations.filter((reg) => allArchives || reg.scope === currentScope);
-        await Promise.all(targets.map((reg) => reg.unregister()));
+        const unregisterResults = await Promise.all(targets.map((reg) => reg.unregister()));
+        const unregistered = unregisterResults.every(Boolean);
+        if (!unregistered) {
+            console.warn('[Storage] Some Service Workers could not be unregistered');
+        }
         console.log('[Storage] Service Workers unregistered');
-        return true;
+        return unregistered;
     } catch (e) {
         console.error('[Storage] Failed to unregister SW:', e);
         return false;
