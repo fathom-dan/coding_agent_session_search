@@ -21,11 +21,6 @@ let decryptInFlight = false;
 let activeUnlockRequestId = null;
 let activeDecryptRequestId = null;
 let nextWorkerRequestId = 1;
-const LEGACY_SESSION_KEYS = {
-    DEK: 'cass_session_dek',
-    EXPIRY: 'cass_session_expiry',
-    UNLOCKED: 'cass_unlocked',
-};
 
 // DOM Elements
 const elements = {
@@ -826,6 +821,25 @@ function handleDatabaseReady(data) {
     window.dispatchEvent(new CustomEvent('cass:db-ready', { detail: data }));
 }
 
+async function recoverFromAppInitFailure(message, error) {
+    console.error(message, error);
+    unlockInFlight = false;
+    decryptInFlight = false;
+    activeUnlockRequestId = null;
+    activeDecryptRequestId = null;
+    clearStoredSession();
+    window.cassSession = null;
+    await closeLiveDatabase();
+    hideProgress();
+    enableForm();
+    elements.appScreen.classList.add('hidden');
+    elements.authScreen.classList.remove('hidden');
+    if (elements.passwordInput) {
+        elements.passwordInput.value = '';
+    }
+    showError(message);
+}
+
 /**
  * Transition from auth screen to app screen
  */
@@ -840,16 +854,23 @@ function transitionToApp() {
     elements.appScreen.classList.remove('hidden');
 
     // Start decryption and database loading
-    worker.postMessage({
-        type: 'DECRYPT_DATABASE',
-        dek: window.cassSession.dek,
-        config: config,
-        opfsEnabled: isOpfsEnabled(),
-        requestId: activeDecryptRequestId,
-    });
+    try {
+        worker.postMessage({
+            type: 'DECRYPT_DATABASE',
+            dek: window.cassSession.dek,
+            config: config,
+            opfsEnabled: isOpfsEnabled(),
+            requestId: activeDecryptRequestId,
+        });
+    } catch (error) {
+        void recoverFromAppInitFailure('Failed to start archive decryption', error);
+        return;
+    }
 
     // Load viewer module
-    loadViewerModule();
+    void loadViewerModule().catch((error) => {
+        void recoverFromAppInitFailure('Failed to load archive viewer', error);
+    });
 }
 
 async function transitionToAppUnencrypted() {
@@ -865,7 +886,9 @@ async function transitionToAppUnencrypted() {
     elements.appScreen.classList.remove('hidden');
 
     // Load viewer module early so it can subscribe to db-ready if needed
-    loadViewerModule();
+    void loadViewerModule().catch((error) => {
+        void recoverFromAppInitFailure('Failed to load archive viewer', error);
+    });
 
     try {
         await loadUnencryptedDatabase();
@@ -1081,17 +1104,16 @@ function restoreSession() {
 }
 
 function clearStoredSession() {
-    const storages = [sessionStorage, localStorage];
     const sessionKeys = getSessionKeys();
-    for (const storage of storages) {
+    for (const storage of [getSessionStorage(StorageMode.SESSION), getSessionStorage(StorageMode.LOCAL)]) {
+        if (!storage) {
+            continue;
+        }
         try {
             for (const key of [
                 sessionKeys.DEK,
                 sessionKeys.EXPIRY,
                 sessionKeys.UNLOCKED,
-                LEGACY_SESSION_KEYS.DEK,
-                LEGACY_SESSION_KEYS.EXPIRY,
-                LEGACY_SESSION_KEYS.UNLOCKED,
             ]) {
                 storage.removeItem(key);
             }
@@ -1105,13 +1127,8 @@ function clearStoredSession() {
  * Dynamically load the viewer module
  */
 async function loadViewerModule() {
-    try {
-        const module = await import('./viewer.js');
-        module.init?.();
-    } catch (error) {
-        console.error('Failed to load viewer module:', error);
-        // Viewer may not exist yet - that's OK for now
-    }
+    const module = await import('./viewer.js');
+    module.init?.();
 }
 
 /**

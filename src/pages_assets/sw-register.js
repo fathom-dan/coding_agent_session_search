@@ -59,6 +59,28 @@ async function postMessageWithReply(message, { timeoutMs = DEFAULT_SW_MESSAGE_TI
     });
 }
 
+function waitForControllerChange({ timeoutMs = DEFAULT_SW_MESSAGE_TIMEOUT_MS } = {}) {
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            clearTimeout(timeoutId);
+            navigator.serviceWorker.removeEventListener('controllerchange', handleControllerChange);
+            resolve();
+        };
+        const handleControllerChange = () => finish();
+        const timeoutId = setTimeout(() => {
+            console.warn('[SW] Timed out waiting for controller change');
+            finish();
+        }, timeoutMs);
+
+        navigator.serviceWorker.addEventListener('controllerchange', handleControllerChange);
+    });
+}
+
 /**
  * Register the service worker
  * @returns {Promise<ServiceWorkerRegistration|null>}
@@ -223,8 +245,10 @@ function showUpdateNotification() {
 export async function applyUpdate() {
     const currentRegistration = registration ?? await resolveRegistration();
     if (currentRegistration?.waiting) {
+        const waitForActivation = waitForControllerChange();
         // Tell waiting service worker to skip waiting
         currentRegistration.waiting.postMessage({ type: 'SKIP_WAITING' });
+        await waitForActivation;
     }
     // Reload the page
     window.location.reload();

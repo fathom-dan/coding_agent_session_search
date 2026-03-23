@@ -71,6 +71,28 @@ let currentMode = StorageMode.MEMORY;
 // OPFS directory handle (cached)
 let opfsRoot = null;
 
+function tryGetSessionStorage() {
+    try {
+        if (typeof sessionStorage !== 'undefined') {
+            return sessionStorage;
+        }
+    } catch (error) {
+        // Ignore unavailable storage backends.
+    }
+    return null;
+}
+
+function tryGetLocalStorage() {
+    try {
+        if (typeof localStorage !== 'undefined') {
+            return localStorage;
+        }
+    } catch (error) {
+        // Ignore unavailable storage backends.
+    }
+    return null;
+}
+
 function hashScopeId(input) {
     let hash = 0x811c9dc5;
     for (let i = 0; i < input.length; i++) {
@@ -548,21 +570,33 @@ async function migrateStorage(fromMode, toMode) {
             break;
 
         case StorageMode.SESSION:
-            for (let i = 0; i < sessionStorage.length; i++) {
-                const key = sessionStorage.key(i);
-                if (key && key.startsWith(archiveDataPrefix)) {
-                    keys.push(key);
-                    values.set(key, sessionStorage.getItem(key));
+            {
+                const storage = tryGetSessionStorage();
+                if (!storage) {
+                    break;
+                }
+                for (let i = 0; i < storage.length; i++) {
+                    const key = storage.key(i);
+                    if (key && key.startsWith(archiveDataPrefix)) {
+                        keys.push(key);
+                        values.set(key, storage.getItem(key));
+                    }
                 }
             }
             break;
 
         case StorageMode.LOCAL:
-            for (let i = 0; i < localStorage.length; i++) {
-                const key = localStorage.key(i);
-                if (key && key.startsWith(archiveDataPrefix)) {
-                    keys.push(key);
-                    values.set(key, localStorage.getItem(key));
+            {
+                const storage = tryGetLocalStorage();
+                if (!storage) {
+                    break;
+                }
+                for (let i = 0; i < storage.length; i++) {
+                    const key = storage.key(i);
+                    if (key && key.startsWith(archiveDataPrefix)) {
+                        keys.push(key);
+                        values.set(key, storage.getItem(key));
+                    }
                 }
             }
             break;
@@ -646,25 +680,36 @@ export async function clearCurrentStorage() {
     console.log('[Storage] Clearing current storage:', currentMode);
     const archiveDataPrefix = getArchiveDataPrefix();
     const currentSessionKeys = getCurrentArchiveSessionKeys();
-    const currentTofuKey = getCurrentArchiveTofuKey();
+
+    // Writes in session/local modes can fall back to memoryStore if the browser
+    // rejects storage access. Clear that archive-scoped fallback copy too.
+    removeMapEntriesWithPrefix(memoryStore, archiveDataPrefix);
 
     switch (currentMode) {
         case StorageMode.MEMORY:
-            removeMapEntriesWithPrefix(memoryStore, archiveDataPrefix);
             break;
 
         case StorageMode.SESSION:
-            removeStorageEntries(sessionStorage, (key) =>
-                key.startsWith(archiveDataPrefix) || currentSessionKeys.has(key)
-            );
+            {
+                const storage = tryGetSessionStorage();
+                if (storage) {
+                    removeStorageEntries(storage, (key) =>
+                        key.startsWith(archiveDataPrefix) || currentSessionKeys.has(key)
+                    );
+                }
+            }
             break;
 
         case StorageMode.LOCAL:
-            removeStorageEntries(localStorage, (key) =>
-                key.startsWith(archiveDataPrefix)
-                || currentSessionKeys.has(key)
-                || key === currentTofuKey
-            );
+            {
+                const storage = tryGetLocalStorage();
+                if (storage) {
+                    removeStorageEntries(storage, (key) =>
+                        key.startsWith(archiveDataPrefix)
+                        || currentSessionKeys.has(key)
+                    );
+                }
+            }
             break;
 
         case StorageMode.OPFS:
@@ -696,7 +741,7 @@ export async function clearOPFS(options = {}) {
                 : entry.startsWith(archiveDataPrefix);
             const shouldDeleteDb = allArchives
                 ? isCassOpfsDbFile(entry)
-                : currentArchiveDbFiles.has(entry) || LEGACY_OPFS_DB_FILES.includes(entry);
+                : currentArchiveDbFiles.has(entry);
             if (shouldDeleteData || shouldDeleteDb) {
                 entries.push(entry);
             }
@@ -725,7 +770,6 @@ export async function clearAllStorage(options = {}) {
     console.log('[Storage] Clearing all storage');
     const archiveDataPrefix = getArchiveDataPrefix();
     const currentSessionKeys = getCurrentArchiveSessionKeys();
-    const currentTofuKey = getCurrentArchiveTofuKey();
 
     // Clear memory
     if (allArchives) {
@@ -762,9 +806,8 @@ export async function clearAllStorage(options = {}) {
             removeStorageEntries(localStorage, (key) =>
                 key.startsWith(archiveDataPrefix)
                 || currentSessionKeys.has(key)
-                || key === currentTofuKey
             );
-            clearCurrentArchivePreferenceKeys({ includeLegacy: true });
+            clearCurrentArchivePreferenceKeys();
         }
     } catch (e) {
         // Ignore

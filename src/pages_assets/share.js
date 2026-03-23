@@ -215,7 +215,15 @@ export function parseShareLink(link) {
         // Conversation
         if (parts[0] === 'c' && parts[1]) {
             const conversationId = parseInt(parts[1], 10);
-            const messageId = parts[2] === 'm' && parts[3] ? parseInt(parts[3], 10) : null;
+            if (Number.isNaN(conversationId)) {
+                return null;
+            }
+
+            const hasMessageSegment = parts[2] === 'm' && parts[3];
+            const messageId = hasMessageSegment ? parseInt(parts[3], 10) : null;
+            if (hasMessageSegment && Number.isNaN(messageId)) {
+                return null;
+            }
 
             return {
                 view: 'conversation',

@@ -273,8 +273,15 @@ self.addEventListener('message', (event) => {
             break;
 
         case 'CLEAR_CACHE':
-            caches.delete(getCacheName()).then(() => {
-                respond({ type: 'CACHE_CLEARED' });
+            caches.keys().then((keys) => {
+                const cachePrefix = getCachePrefix();
+                const targets = keys.filter((key) => key.startsWith(cachePrefix));
+                return Promise.all(targets.map((key) => caches.delete(key))).then(() => {
+                    respond({
+                        type: 'CACHE_CLEARED',
+                        cleared: targets,
+                    });
+                });
             });
             break;
 

@@ -5,7 +5,7 @@
  * Uses OPFS for persistence when user has opted in, falls back to in-memory.
  */
 
-import { getArchiveOpfsPrimaryDbName, isOpfsEnabled } from './storage.js';
+import { getArchiveOpfsDbFiles, getArchiveOpfsPrimaryDbName, isOpfsEnabled } from './storage.js';
 
 // Module state
 let sqlite3 = null;
@@ -38,6 +38,7 @@ export async function initDatabase(dbBytes) {
             isInitialized = true;
             return;
         } catch (error) {
+            await cleanupArchiveOpfsDatabaseFiles();
             console.warn('[DB] OPFS unavailable, using in-memory:', error.message);
         }
     }
@@ -80,6 +81,23 @@ async function writeBytesToOPFS(bytes) {
     const writable = await handle.createWritable();
     await writable.write(bytes);
     await writable.close();
+}
+
+async function cleanupArchiveOpfsDatabaseFiles() {
+    try {
+        const root = await navigator.storage.getDirectory();
+        for (const name of getArchiveOpfsDbFiles()) {
+            try {
+                await root.removeEntry(name);
+            } catch (error) {
+                if (error?.name !== 'NotFoundError') {
+                    console.warn('[DB] Failed to clean up OPFS database file:', name, error);
+                }
+            }
+        }
+    } catch (error) {
+        console.warn('[DB] Failed to clean up OPFS database directory:', error);
+    }
 }
 
 /**
@@ -487,10 +505,15 @@ export function checkMemoryPressure() {
  */
 export function closeDatabase() {
     if (db) {
-        db.close();
-        db = null;
-        isInitialized = false;
-        console.log('[DB] Closed');
+        try {
+            db.close();
+            console.log('[DB] Closed');
+        } catch (error) {
+            console.warn('[DB] Close failed, resetting handle anyway:', error);
+        } finally {
+            db = null;
+            isInitialized = false;
+        }
     }
 }
 

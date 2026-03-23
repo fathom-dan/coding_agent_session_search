@@ -47,7 +47,25 @@ function decodeBytes(base64) {
 }
 
 function getPersistentStorages() {
-    return [sessionStorage, localStorage].filter((storage) => typeof storage !== 'undefined');
+    const storages = [];
+
+    try {
+        if (typeof sessionStorage !== 'undefined') {
+            storages.push(sessionStorage);
+        }
+    } catch (error) {
+        // Ignore unavailable storage backends and fall back to memory-only behavior.
+    }
+
+    try {
+        if (typeof localStorage !== 'undefined') {
+            storages.push(localStorage);
+        }
+    } catch (error) {
+        // Ignore unavailable storage backends and fall back to memory-only behavior.
+    }
+
+    return storages;
 }
 
 /**
@@ -291,9 +309,23 @@ export class SessionManager {
     getStorage() {
         switch (this.storage) {
             case SESSION_CONFIG.STORAGE_LOCAL:
-                return typeof localStorage !== 'undefined' ? localStorage : this.memoryStorage;
+                try {
+                    if (typeof localStorage !== 'undefined') {
+                        return localStorage;
+                    }
+                } catch (error) {
+                    // Fall back to memory-only storage below.
+                }
+                return this.memoryStorage;
             case SESSION_CONFIG.STORAGE_SESSION:
-                return typeof sessionStorage !== 'undefined' ? sessionStorage : this.memoryStorage;
+                try {
+                    if (typeof sessionStorage !== 'undefined') {
+                        return sessionStorage;
+                    }
+                } catch (error) {
+                    // Fall back to memory-only storage below.
+                }
+                return this.memoryStorage;
             case SESSION_CONFIG.STORAGE_MEMORY:
             default:
                 return this.memoryStorage;
@@ -305,6 +337,8 @@ export class SessionManager {
      */
     clearStorage() {
         const sessionKeys = getScopedSessionKeys();
+        this.memoryStorage.removeItem(sessionKeys.TOKEN);
+        this.memoryStorage.removeItem(sessionKeys.EXPIRY);
         for (const storage of getPersistentStorages()) {
             storage.removeItem(sessionKeys.TOKEN);
             storage.removeItem(sessionKeys.EXPIRY);
