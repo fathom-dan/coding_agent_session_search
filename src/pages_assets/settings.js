@@ -439,8 +439,8 @@ async function handleClearCurrentStorage() {
  */
 async function handleClearOPFS() {
     const confirmed = confirm(
-        'Clear OPFS cache?\n\n' +
-        'The cached database will be deleted. You\'ll need to decrypt again on next visit.'
+        'Clear this archive\'s OPFS cache?\n\n' +
+        'This archive\'s cached database will be deleted. You\'ll need to decrypt again on next visit.'
     );
 
     if (!confirmed) return;
@@ -460,8 +460,8 @@ async function handleClearOPFS() {
  */
 async function handleClearSWCache() {
     const confirmed = confirm(
-        'Clear Service Worker cache?\n\n' +
-        'Static assets will be re-downloaded on next visit.'
+        'Clear this archive\'s Service Worker cache?\n\n' +
+        'This archive\'s static assets will be re-downloaded on next visit.'
     );
 
     if (!confirmed) return;
@@ -480,10 +480,10 @@ async function handleClearSWCache() {
  */
 async function handleClearAll() {
     const confirmed = confirm(
-        'Clear ALL data?\n\n' +
+        'Clear all data for this archive?\n\n' +
         'This will clear:\n' +
-        '- All storage (memory, session, local, OPFS)\n' +
-        '- Service Worker caches\n\n' +
+        '- This archive\'s storage (memory, session, local, OPFS)\n' +
+        '- This archive\'s Service Worker caches\n\n' +
         'This cannot be undone.'
     );
 
@@ -526,10 +526,10 @@ function handleLockSession() {
  */
 async function handleResetSession() {
     const confirmed = confirm(
-        'Reset EVERYTHING?\n\n' +
+        'Reset this archive?\n\n' +
         'This will:\n' +
-        '- Clear all data\n' +
-        '- Unregister all Service Workers\n' +
+        '- Clear this archive\'s data\n' +
+        '- Unregister this archive\'s Service Worker\n' +
         '- Reload the page\n\n' +
         'Are you sure?'
     );

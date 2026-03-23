@@ -6,7 +6,7 @@
  */
 
 import { createStrengthMeter } from './password-strength.js';
-import { StorageMode, StorageKeys, getArchiveScopeId, isOpfsEnabled } from './storage.js';
+import { StorageMode, getArchiveScopeId, getStoredMode, isOpfsEnabled } from './storage.js';
 import { SESSION_CONFIG } from './session.js';
 
 // State
@@ -906,17 +906,13 @@ function checkExistingSession() {
 }
 
 function getPreferredSessionMode() {
-    try {
-        const savedMode = localStorage.getItem(StorageKeys.MODE);
-        if (
-            savedMode === StorageMode.MEMORY
-            || savedMode === StorageMode.SESSION
-            || savedMode === StorageMode.LOCAL
-        ) {
-            return savedMode;
-        }
-    } catch (e) {
-        // Ignore
+    const savedMode = getStoredMode();
+    if (
+        savedMode === StorageMode.MEMORY
+        || savedMode === StorageMode.SESSION
+        || savedMode === StorageMode.LOCAL
+    ) {
+        return savedMode;
     }
     return StorageMode.MEMORY;
 }
@@ -937,6 +933,9 @@ function getSessionStorage(mode) {
 
 function persistSession(dekBase64) {
     const mode = getPreferredSessionMode();
+    // Remove stale copies from previously selected backends before persisting.
+    clearStoredSession();
+
     const storage = getSessionStorage(mode);
     if (!storage) {
         return;

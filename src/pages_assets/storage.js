@@ -23,12 +23,28 @@ export const StorageMode = {
 
 // Storage keys (prefixed to avoid collisions)
 const STORAGE_PREFIX = 'cass-archive-';
-const KEYS = {
+const ALL_ARCHIVE_DATA_PREFIX_RE = /^cass-archive-[0-9a-f]{8}-data-/;
+const ALL_ARCHIVE_PREF_PREFIX_RE = /^cass-archive-[0-9a-f]{8}-pref-/;
+const LEGACY_PREF_KEYS = {
     MODE: `${STORAGE_PREFIX}storage-mode`,
     OPFS_ENABLED: `${STORAGE_PREFIX}opfs-enabled`,
-    THEME: `${STORAGE_PREFIX}theme`,
     LAST_UNLOCK: `${STORAGE_PREFIX}last-unlock`,
     DB_CACHED: `${STORAGE_PREFIX}db-cached`,
+};
+const KEYS = {
+    get MODE() {
+        return `${getArchivePreferencePrefix()}storage-mode`;
+    },
+    get OPFS_ENABLED() {
+        return `${getArchivePreferencePrefix()}opfs-enabled`;
+    },
+    THEME: `${STORAGE_PREFIX}theme`,
+    get LAST_UNLOCK() {
+        return `${getArchivePreferencePrefix()}last-unlock`;
+    },
+    get DB_CACHED() {
+        return `${getArchivePreferencePrefix()}db-cached`;
+    },
 };
 const LEGACY_OPFS_DB_FILES = [
     'cass-archive.sqlite3',
@@ -38,6 +54,13 @@ const LEGACY_OPFS_DB_FILES = [
     'cass-archive.db-wal',
     'cass-archive.db-shm',
 ];
+const LEGACY_SESSION_KEYS = [
+    'cass_session_dek',
+    'cass_session_expiry',
+    'cass_unlocked',
+];
+const ALL_ARCHIVE_SESSION_KEY_RE = /^cass_session_(?:dek|expiry|unlocked)_[0-9a-f]{8}$/;
+const ALL_ARCHIVE_TOFU_KEY_RE = /^cass_fingerprint_v2_[0-9a-f]{8}$/;
 
 // In-memory storage (fallback and default)
 const memoryStore = new Map();
@@ -70,6 +93,52 @@ export function getArchiveScopeUrl() {
 
 export function getArchiveScopeId() {
     return hashScopeId(getArchiveScopeUrl());
+}
+
+function getArchivePreferencePrefix() {
+    return `${STORAGE_PREFIX}${getArchiveScopeId()}-pref-`;
+}
+
+function getArchiveDataPrefix() {
+    return `${STORAGE_PREFIX}${getArchiveScopeId()}-data-`;
+}
+
+function getArchiveDataKey(key) {
+    return `${getArchiveDataPrefix()}${key}`;
+}
+
+function isArchiveDataEntryName(name) {
+    return ALL_ARCHIVE_DATA_PREFIX_RE.test(name);
+}
+
+function isArchivePreferenceKey(name) {
+    return ALL_ARCHIVE_PREF_PREFIX_RE.test(name);
+}
+
+function getCurrentArchiveSessionKeys() {
+    const scopeId = getArchiveScopeId();
+    return new Set([
+        ...LEGACY_SESSION_KEYS,
+        `cass_session_dek_${scopeId}`,
+        `cass_session_expiry_${scopeId}`,
+        `cass_unlocked_${scopeId}`,
+    ]);
+}
+
+function isArchiveSessionKey(name) {
+    return LEGACY_SESSION_KEYS.includes(name) || ALL_ARCHIVE_SESSION_KEY_RE.test(name);
+}
+
+function getCurrentArchiveTofuKey() {
+    return `cass_fingerprint_v2_${getArchiveScopeId()}`;
+}
+
+function isArchiveTofuKey(name) {
+    return ALL_ARCHIVE_TOFU_KEY_RE.test(name);
+}
+
+function getServiceWorkerCachePrefix() {
+    return `cass-archive-${getArchiveScopeId()}-`;
 }
 
 export function getArchiveOpfsDbFiles() {
@@ -163,6 +232,7 @@ export function setOpfsEnabled(enabled) {
         } else {
             localStorage.removeItem(KEYS.OPFS_ENABLED);
         }
+        localStorage.removeItem(LEGACY_PREF_KEYS.OPFS_ENABLED);
     } catch (e) {
         // Ignore
     }
@@ -198,6 +268,7 @@ export async function setStorageMode(mode, migrate = false) {
     // Save mode preference (in localStorage so it persists)
     try {
         localStorage.setItem(KEYS.MODE, mode);
+        localStorage.removeItem(LEGACY_PREF_KEYS.MODE);
     } catch (e) {
         console.warn('[Storage] Could not save mode preference');
     }
@@ -242,7 +313,7 @@ export async function getOPFSRoot() {
  * @param {*} value - Value to store (will be JSON serialized)
  */
 export async function setItem(key, value) {
-    const fullKey = STORAGE_PREFIX + key;
+    const fullKey = getArchiveDataKey(key);
     const serialized = JSON.stringify(value);
 
     switch (currentMode) {
@@ -280,7 +351,7 @@ export async function setItem(key, value) {
  * @param {*} defaultValue - Default value if not found
  */
 export async function getItem(key, defaultValue = null) {
-    const fullKey = STORAGE_PREFIX + key;
+    const fullKey = getArchiveDataKey(key);
     let serialized = null;
 
     switch (currentMode) {
@@ -325,7 +396,7 @@ export async function getItem(key, defaultValue = null) {
  * @param {string} key - Storage key
  */
 export async function removeItem(key) {
-    const fullKey = STORAGE_PREFIX + key;
+    const fullKey = getArchiveDataKey(key);
 
     switch (currentMode) {
         case StorageMode.MEMORY:
@@ -410,7 +481,7 @@ async function deleteOPFSFile(filename) {
  * @param {ArrayBuffer|Uint8Array} data - Binary data
  */
 export async function setBinaryItem(key, data) {
-    const fullKey = STORAGE_PREFIX + key;
+    const fullKey = getArchiveDataKey(key);
 
     if (currentMode === StorageMode.OPFS) {
         try {
@@ -438,7 +509,7 @@ export async function setBinaryItem(key, data) {
  * @param {string} key - Storage key
  */
 export async function getBinaryItem(key) {
-    const fullKey = STORAGE_PREFIX + key;
+    const fullKey = getArchiveDataKey(key);
 
     if (currentMode === StorageMode.OPFS) {
         try {
@@ -464,13 +535,14 @@ async function migrateStorage(fromMode, toMode) {
     console.log('[Storage] Migrating from', fromMode, 'to', toMode);
 
     // Get all keys from source
+    const archiveDataPrefix = getArchiveDataPrefix();
     const keys = [];
     const values = new Map();
 
     switch (fromMode) {
         case StorageMode.MEMORY:
             for (const [key, value] of memoryStore) {
-                if (key.startsWith(STORAGE_PREFIX)) {
+                if (key.startsWith(archiveDataPrefix)) {
                     keys.push(key);
                     values.set(key, value);
                 }
@@ -480,7 +552,7 @@ async function migrateStorage(fromMode, toMode) {
         case StorageMode.SESSION:
             for (let i = 0; i < sessionStorage.length; i++) {
                 const key = sessionStorage.key(i);
-                if (key && key.startsWith(STORAGE_PREFIX)) {
+                if (key && key.startsWith(archiveDataPrefix)) {
                     keys.push(key);
                     values.set(key, sessionStorage.getItem(key));
                 }
@@ -490,7 +562,7 @@ async function migrateStorage(fromMode, toMode) {
         case StorageMode.LOCAL:
             for (let i = 0; i < localStorage.length; i++) {
                 const key = localStorage.key(i);
-                if (key && key.startsWith(STORAGE_PREFIX)) {
+                if (key && key.startsWith(archiveDataPrefix)) {
                     keys.push(key);
                     values.set(key, localStorage.getItem(key));
                 }
@@ -508,7 +580,7 @@ async function migrateStorage(fromMode, toMode) {
     currentMode = toMode;
 
     for (const key of keys) {
-        const shortKey = key.replace(STORAGE_PREFIX, '');
+        const shortKey = key.slice(archiveDataPrefix.length);
         const value = values.get(key);
         if (value) {
             try {
@@ -523,41 +595,78 @@ async function migrateStorage(fromMode, toMode) {
     console.log('[Storage] Migrated', keys.length, 'items');
 }
 
+function removeMapEntriesWithPrefix(map, prefix) {
+    for (const key of [...map.keys()]) {
+        if (key.startsWith(prefix)) {
+            map.delete(key);
+        }
+    }
+}
+
+function removeStorageEntriesWithPrefix(storage, prefix) {
+    const keys = [];
+    for (let i = 0; i < storage.length; i++) {
+        const key = storage.key(i);
+        if (key && key.startsWith(prefix)) {
+            keys.push(key);
+        }
+    }
+    keys.forEach((key) => storage.removeItem(key));
+}
+
+function removeStorageEntries(storage, predicate) {
+    const keys = [];
+    for (let i = 0; i < storage.length; i++) {
+        const key = storage.key(i);
+        if (key && predicate(key)) {
+            keys.push(key);
+        }
+    }
+    keys.forEach((key) => storage.removeItem(key));
+}
+
+function clearCurrentArchivePreferenceKeys(options = {}) {
+    const { includeLegacy = false } = options;
+
+    try {
+        localStorage.removeItem(KEYS.MODE);
+        localStorage.removeItem(KEYS.OPFS_ENABLED);
+        localStorage.removeItem(KEYS.LAST_UNLOCK);
+        localStorage.removeItem(KEYS.DB_CACHED);
+        if (includeLegacy) {
+            Object.values(LEGACY_PREF_KEYS).forEach((key) => localStorage.removeItem(key));
+        }
+    } catch (e) {
+        // Ignore
+    }
+}
+
 /**
  * Clear all cass storage in current mode
  */
 export async function clearCurrentStorage() {
     console.log('[Storage] Clearing current storage:', currentMode);
+    const archiveDataPrefix = getArchiveDataPrefix();
+    const currentSessionKeys = getCurrentArchiveSessionKeys();
+    const currentTofuKey = getCurrentArchiveTofuKey();
 
     switch (currentMode) {
         case StorageMode.MEMORY:
-            for (const key of memoryStore.keys()) {
-                if (key.startsWith(STORAGE_PREFIX)) {
-                    memoryStore.delete(key);
-                }
-            }
+            removeMapEntriesWithPrefix(memoryStore, archiveDataPrefix);
             break;
 
         case StorageMode.SESSION:
-            const sessionKeys = [];
-            for (let i = 0; i < sessionStorage.length; i++) {
-                const key = sessionStorage.key(i);
-                if (key && key.startsWith(STORAGE_PREFIX)) {
-                    sessionKeys.push(key);
-                }
-            }
-            sessionKeys.forEach((key) => sessionStorage.removeItem(key));
+            removeStorageEntries(sessionStorage, (key) =>
+                key.startsWith(archiveDataPrefix) || currentSessionKeys.has(key)
+            );
             break;
 
         case StorageMode.LOCAL:
-            const localKeys = [];
-            for (let i = 0; i < localStorage.length; i++) {
-                const key = localStorage.key(i);
-                if (key && key.startsWith(STORAGE_PREFIX)) {
-                    localKeys.push(key);
-                }
-            }
-            localKeys.forEach((key) => localStorage.removeItem(key));
+            removeStorageEntries(localStorage, (key) =>
+                key.startsWith(archiveDataPrefix)
+                || currentSessionKeys.has(key)
+                || key === currentTofuKey
+            );
             break;
 
         case StorageMode.OPFS:
@@ -578,18 +687,19 @@ export async function clearOPFS(options = {}) {
 
     try {
         const root = await navigator.storage.getDirectory();
-        const currentArchiveFiles = new Set([
-            ...LEGACY_OPFS_DB_FILES,
-            ...getArchiveOpfsDbFiles(),
-        ]);
+        const currentArchiveDbFiles = new Set(getArchiveOpfsDbFiles());
+        const archiveDataPrefix = getArchiveDataPrefix();
 
         // Iterate and delete all entries
         const entries = [];
         for await (const entry of root.keys()) {
+            const shouldDeleteData = allArchives
+                ? isArchiveDataEntryName(entry)
+                : entry.startsWith(archiveDataPrefix);
             const shouldDeleteDb = allArchives
                 ? isCassOpfsDbFile(entry)
-                : currentArchiveFiles.has(entry);
-            if (entry.startsWith(STORAGE_PREFIX) || shouldDeleteDb) {
+                : currentArchiveDbFiles.has(entry) || LEGACY_OPFS_DB_FILES.includes(entry);
+            if (shouldDeleteData || shouldDeleteDb) {
                 entries.push(entry);
             }
         }
@@ -611,46 +721,59 @@ export async function clearOPFS(options = {}) {
 /**
  * Clear all cass storage across all modes
  */
-export async function clearAllStorage() {
+export async function clearAllStorage(options = {}) {
+    const { allArchives = false } = options;
+
     console.log('[Storage] Clearing all storage');
+    const archiveDataPrefix = getArchiveDataPrefix();
+    const currentSessionKeys = getCurrentArchiveSessionKeys();
+    const currentTofuKey = getCurrentArchiveTofuKey();
 
     // Clear memory
-    for (const key of [...memoryStore.keys()]) {
-        if (key.startsWith(STORAGE_PREFIX)) {
-            memoryStore.delete(key);
-        }
+    if (allArchives) {
+        removeMapEntriesWithPrefix(memoryStore, STORAGE_PREFIX);
+    } else {
+        removeMapEntriesWithPrefix(memoryStore, archiveDataPrefix);
     }
 
     // Clear sessionStorage
     try {
-        const sessionKeys = [];
-        for (let i = 0; i < sessionStorage.length; i++) {
-            const key = sessionStorage.key(i);
-            if (key && key.startsWith(STORAGE_PREFIX)) {
-                sessionKeys.push(key);
-            }
+        if (allArchives) {
+            removeStorageEntries(sessionStorage, (key) =>
+                key.startsWith(STORAGE_PREFIX) || isArchiveSessionKey(key)
+            );
+        } else {
+            removeStorageEntries(sessionStorage, (key) =>
+                key.startsWith(archiveDataPrefix) || currentSessionKeys.has(key)
+            );
         }
-        sessionKeys.forEach((key) => sessionStorage.removeItem(key));
     } catch (e) {
         // Ignore
     }
 
     // Clear localStorage
     try {
-        const localKeys = [];
-        for (let i = 0; i < localStorage.length; i++) {
-            const key = localStorage.key(i);
-            if (key && key.startsWith(STORAGE_PREFIX)) {
-                localKeys.push(key);
-            }
+        if (allArchives) {
+            removeStorageEntries(localStorage, (key) =>
+                key.startsWith(STORAGE_PREFIX)
+                && (isArchiveDataEntryName(key) || isArchivePreferenceKey(key) || Object.values(LEGACY_PREF_KEYS).includes(key))
+                || isArchiveSessionKey(key)
+                || isArchiveTofuKey(key)
+            );
+        } else {
+            removeStorageEntries(localStorage, (key) =>
+                key.startsWith(archiveDataPrefix)
+                || currentSessionKeys.has(key)
+                || key === currentTofuKey
+            );
+            clearCurrentArchivePreferenceKeys({ includeLegacy: true });
         }
-        localKeys.forEach((key) => localStorage.removeItem(key));
     } catch (e) {
         // Ignore
     }
 
     // Clear OPFS
-    await clearOPFS({ allArchives: true });
+    await clearOPFS({ allArchives });
 
     console.log('[Storage] All storage cleared');
 }
@@ -658,7 +781,9 @@ export async function clearAllStorage() {
 /**
  * Clear Service Worker cache
  */
-export async function clearServiceWorkerCache() {
+export async function clearServiceWorkerCache(options = {}) {
+    const { allArchives = false } = options;
+
     if (!('caches' in window)) {
         console.log('[Storage] Cache API not available');
         return false;
@@ -666,8 +791,11 @@ export async function clearServiceWorkerCache() {
 
     try {
         const cacheNames = await caches.keys();
+        const cachePrefix = getServiceWorkerCachePrefix();
         const cassNames = cacheNames.filter(
-            (name) => name.includes('cass') || name.includes('archive')
+            (name) => allArchives
+                ? name.startsWith('cass-archive-')
+                : name.startsWith(cachePrefix)
         );
 
         await Promise.all(cassNames.map((name) => caches.delete(name)));
@@ -683,14 +811,18 @@ export async function clearServiceWorkerCache() {
 /**
  * Unregister Service Worker
  */
-export async function unregisterServiceWorker() {
+export async function unregisterServiceWorker(options = {}) {
+    const { allArchives = false } = options;
+
     if (!('serviceWorker' in navigator)) {
         return false;
     }
 
     try {
         const registrations = await navigator.serviceWorker.getRegistrations();
-        await Promise.all(registrations.map((reg) => reg.unregister()));
+        const currentScope = getArchiveScopeUrl();
+        const targets = registrations.filter((reg) => allArchives || reg.scope === currentScope);
+        await Promise.all(targets.map((reg) => reg.unregister()));
         console.log('[Storage] Service Workers unregistered');
         return true;
     } catch (e) {
@@ -727,9 +859,12 @@ export async function getStorageStats() {
         quota: null,
     };
 
+    const archiveDataPrefix = getArchiveDataPrefix();
+    const currentArchiveDbFiles = new Set(getArchiveOpfsDbFiles());
+
     // Count memory items
     for (const [key, value] of memoryStore) {
-        if (key.startsWith(STORAGE_PREFIX)) {
+        if (key.startsWith(archiveDataPrefix)) {
             stats.memory.items++;
             stats.memory.bytes += key.length + (value?.length || 0);
         }
@@ -739,7 +874,7 @@ export async function getStorageStats() {
     try {
         for (let i = 0; i < sessionStorage.length; i++) {
             const key = sessionStorage.key(i);
-            if (key && key.startsWith(STORAGE_PREFIX)) {
+            if (key && key.startsWith(archiveDataPrefix)) {
                 stats.session.items++;
                 const value = sessionStorage.getItem(key);
                 stats.session.bytes += key.length + (value?.length || 0);
@@ -753,7 +888,7 @@ export async function getStorageStats() {
     try {
         for (let i = 0; i < localStorage.length; i++) {
             const key = localStorage.key(i);
-            if (key && key.startsWith(STORAGE_PREFIX)) {
+            if (key && key.startsWith(archiveDataPrefix)) {
                 stats.local.items++;
                 const value = localStorage.getItem(key);
                 stats.local.bytes += key.length + (value?.length || 0);
@@ -768,13 +903,13 @@ export async function getStorageStats() {
         try {
             const root = await navigator.storage.getDirectory();
             for await (const name of root.keys()) {
-                if (name.startsWith(STORAGE_PREFIX) || isCassOpfsDbFile(name)) {
+                if (name.startsWith(archiveDataPrefix) || currentArchiveDbFiles.has(name)) {
                     stats.opfs.items++;
                     try {
                         const handle = await root.getFileHandle(name);
                         const file = await handle.getFile();
                         stats.opfs.bytes += file.size;
-                        if (isCassOpfsDbFile(name)) {
+                        if (currentArchiveDbFiles.has(name)) {
                             stats.opfs.dbBytes += file.size;
                             stats.opfs.dbFiles.push(name);
                         }
@@ -806,7 +941,7 @@ export async function getStorageStats() {
 export async function isDatabaseCached() {
     try {
         const root = await getOPFSRoot();
-        for (const name of [...LEGACY_OPFS_DB_FILES, ...getArchiveOpfsDbFiles()]) {
+        for (const name of getArchiveOpfsDbFiles()) {
             try {
                 await root.getFileHandle(name);
                 return true;
