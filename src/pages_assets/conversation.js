@@ -53,6 +53,7 @@ let onBack = null;
 let messageVirtualList = null; // Virtual list for long conversations
 let attachmentState = createAttachmentState();
 let activeConversationLoadId = 0;
+let documentKeydownHandler = null;
 
 // DOM element references
 let elements = {
@@ -69,6 +70,7 @@ let elements = {
 export function initConversationViewer(container, backCallback) {
     elements.container = container;
     onBack = backCallback;
+    window.removeEventListener('cass:lock', handleArchiveLock);
     window.addEventListener('cass:lock', handleArchiveLock);
 }
 
@@ -124,7 +126,7 @@ export async function loadConversation(conversationId, highlightMessageId = null
         showMemoryWarning();
     }
 
-    await ensureAttachmentsReady();
+    await ensureAttachmentsReady(loadId);
 
     if (loadId !== activeConversationLoadId) {
         return;
@@ -146,9 +148,11 @@ function createAttachmentState() {
     };
 }
 
-async function ensureAttachmentsReady() {
-    if (attachmentState.ready) {
-        return attachmentState.available;
+async function ensureAttachmentsReady(loadId = activeConversationLoadId) {
+    const state = attachmentState;
+
+    if (state.ready) {
+        return state.available;
     }
 
     const session = window.cassSession;
@@ -156,23 +160,35 @@ async function ensureAttachmentsReady() {
     const exportIdBase64 = session?.config?.export_id;
 
     if (!dekBase64 || !exportIdBase64) {
-        attachmentState.ready = true;
-        attachmentState.available = false;
+        if (state === attachmentState && loadId === activeConversationLoadId) {
+            state.ready = true;
+            state.available = false;
+        }
         return false;
     }
 
     try {
-        attachmentState.dek = base64ToBytes(dekBase64);
-        attachmentState.exportId = base64ToBytes(exportIdBase64);
-        const manifest = await initAttachments(attachmentState.dek, attachmentState.exportId);
-        attachmentState.available = Boolean(manifest?.entries?.length);
+        const dek = base64ToBytes(dekBase64);
+        const exportId = base64ToBytes(exportIdBase64);
+        const manifest = await initAttachments(dek, exportId);
+
+        if (state !== attachmentState || loadId !== activeConversationLoadId) {
+            return false;
+        }
+
+        state.dek = dek;
+        state.exportId = exportId;
+        state.available = Boolean(manifest?.entries?.length);
     } catch (error) {
+        if (state !== attachmentState || loadId !== activeConversationLoadId) {
+            return false;
+        }
         console.warn('[Conversation] Attachment manifest unavailable:', error);
-        attachmentState.available = false;
+        state.available = false;
     }
 
-    attachmentState.ready = true;
-    return attachmentState.available;
+    state.ready = true;
+    return state.available;
 }
 
 /**
@@ -442,6 +458,7 @@ function handleArchiveLock() {
     activeConversationLoadId += 1;
     currentConversation = null;
     currentMessages = [];
+    teardownDocumentListeners();
     destroyVirtualList();
     clearAllCache();
     attachmentState = createAttachmentState();
@@ -452,6 +469,8 @@ function handleArchiveLock() {
  * Set up event listeners
  */
 function setupEventListeners() {
+    teardownDocumentListeners();
+
     // Back button
     const backBtn = document.getElementById('back-btn');
     backBtn?.addEventListener('click', () => {
@@ -467,13 +486,19 @@ function setupEventListeners() {
     });
 
     // Escape key to go back
-    const handleKeydown = (e) => {
+    documentKeydownHandler = (e) => {
         if (e.key === 'Escape' && onBack) {
             onBack();
-            document.removeEventListener('keydown', handleKeydown);
         }
     };
-    document.addEventListener('keydown', handleKeydown);
+    document.addEventListener('keydown', documentKeydownHandler);
+}
+
+function teardownDocumentListeners() {
+    if (documentKeydownHandler) {
+        document.removeEventListener('keydown', documentKeydownHandler);
+        documentKeydownHandler = null;
+    }
 }
 
 /**
@@ -908,10 +933,16 @@ export function clearViewer() {
     activeConversationLoadId += 1;
     // Clean up virtual list
     destroyVirtualList();
+    teardownDocumentListeners();
 
     currentConversation = null;
     currentMessages = [];
     elements.container.innerHTML = '';
+}
+
+export function cleanupConversationViewer() {
+    window.removeEventListener('cass:lock', handleArchiveLock);
+    clearViewer();
 }
 
 /**
@@ -930,6 +961,7 @@ export default {
     getCurrentConversationId,
     getCurrentConversation,
     clearViewer,
+    cleanupConversationViewer,
     clearAllCache,
     clearOldConversations,
     getCacheStats,

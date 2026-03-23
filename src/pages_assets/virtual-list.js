@@ -49,6 +49,7 @@ export class VirtualList {
             recycled: 0,
             created: 0,
         };
+        this.destroyed = false;
 
         this._init();
     }
@@ -92,9 +93,16 @@ export class VirtualList {
     _createThrottledHandler(fn, wait) {
         let pending = false;
         return () => {
+            if (this.destroyed || pending) {
+                return;
+            }
             if (!pending) {
                 pending = true;
                 requestAnimationFrame(() => {
+                    if (this.destroyed) {
+                        pending = false;
+                        return;
+                    }
                     fn();
                     pending = false;
                 });
@@ -107,6 +115,9 @@ export class VirtualList {
      * @private
      */
     _onResize() {
+        if (this.destroyed) {
+            return;
+        }
         this.containerHeight = this.container.clientHeight;
         this._render();
     }
@@ -116,6 +127,9 @@ export class VirtualList {
      * @private
      */
     _onScroll() {
+        if (this.destroyed) {
+            return;
+        }
         this.scrollTop = this.container.scrollTop;
         this._render();
 
@@ -154,6 +168,9 @@ export class VirtualList {
      * @private
      */
     _render() {
+        if (this.destroyed || !this.inner) {
+            return;
+        }
         const { start, end } = this._getVisibleRange();
 
         // Skip render if range unchanged
@@ -260,6 +277,8 @@ export class VirtualList {
      * Clean up resources
      */
     destroy() {
+        this.destroyed = true;
+
         if (this._resizeObserver) {
             this._resizeObserver.disconnect();
             this._resizeObserver = null;
@@ -325,6 +344,7 @@ export class VariableHeightVirtualList {
         // DOM tracking
         this.items = new Map(); // index -> element
         this.lastVisibleRange = { start: -1, end: -1 };
+        this.destroyed = false;
 
         this._init();
     }
@@ -430,6 +450,9 @@ export class VariableHeightVirtualList {
      * @private
      */
     _onResize() {
+        if (this.destroyed) {
+            return;
+        }
         this.containerHeight = this.container.clientHeight;
         this._render();
     }
@@ -439,6 +462,9 @@ export class VariableHeightVirtualList {
      * @private
      */
     _onScroll() {
+        if (this.destroyed) {
+            return;
+        }
         this.scrollTop = this.container.scrollTop;
         this._render();
     }
@@ -461,6 +487,9 @@ export class VariableHeightVirtualList {
      * @private
      */
     _render() {
+        if (this.destroyed || !this.inner) {
+            return;
+        }
         const { start, end } = this._getVisibleRange();
 
         // Skip if unchanged
@@ -488,6 +517,9 @@ export class VariableHeightVirtualList {
 
                 // Measure actual height after render
                 requestAnimationFrame(() => {
+                    if (this.destroyed) {
+                        return;
+                    }
                     this._measureItem(i, element);
                 });
             }
@@ -509,6 +541,9 @@ export class VariableHeightVirtualList {
      * @private
      */
     _measureItem(index, element) {
+        if (this.destroyed || !this.inner || !element?.isConnected) {
+            return;
+        }
         const measuredHeight = element.offsetHeight;
         const previousHeight = this.heights.get(index);
 
@@ -578,6 +613,8 @@ export class VariableHeightVirtualList {
      * Clean up resources
      */
     destroy() {
+        this.destroyed = true;
+
         if (this._resizeObserver) {
             this._resizeObserver.disconnect();
         }
@@ -593,6 +630,7 @@ export class VariableHeightVirtualList {
 
         if (this.inner) {
             this.inner.remove();
+            this.inner = null;
         }
 
         console.debug('[VariableVirtualList] Destroyed');

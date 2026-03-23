@@ -15,7 +15,13 @@
 
 import { isDatabaseReady, getStatistics, closeDatabase } from './database.js';
 import { initSearch, clearSearch, getSearchState, setSearchQuery } from './search.js';
-import { initConversationViewer, loadConversation, clearViewer, getCurrentConversation } from './conversation.js';
+import {
+    initConversationViewer,
+    loadConversation,
+    clearViewer,
+    cleanupConversationViewer,
+    getCurrentConversation,
+} from './conversation.js';
 import { createRouter, getRouter, parseSearchParams, buildConversationPath } from './router.js';
 import { getConversationLink, copyConversationLink, isWebShareAvailable, shareConversation } from './share.js';
 import { initStats, renderStatsDashboard, clearStatsCache } from './stats.js';
@@ -301,14 +307,15 @@ function handleSearchRoute(query = {}) {
     // Update nav
     updateActiveNavLink('search');
 
-    // If there's a search query, we could trigger the search
-    // This would require exposing a setQuery function from search.js
     if (state.searchQuery) {
         console.debug('[Viewer] Search query from URL:', state.searchQuery);
         setSearchQuery(state.searchQuery).catch((error) => {
             console.warn('[Viewer] Failed to run search from URL:', error);
         });
+        return;
     }
+
+    clearSearch({ reloadRecent: true });
 }
 
 /**
@@ -720,8 +727,8 @@ export function cleanup() {
     state.initialized = false;
 
     closeDatabase();
-    clearSearch();
-    clearViewer();
+    clearSearch({ reloadRecent: false });
+    cleanupConversationViewer();
     clearStatsCache();
     console.log('[Viewer] Cleaned up');
 }
