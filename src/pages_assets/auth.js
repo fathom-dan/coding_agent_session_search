@@ -69,6 +69,8 @@ async function init() {
     }
 
     if (config?.encrypted === false) {
+        clearStoredSession();
+        window.cassSession = null;
         setupUnencryptedMode();
         enableForm();
         return;
@@ -83,6 +85,8 @@ async function init() {
     } catch (error) {
         showError('Failed to initialize decryption worker. Your browser may not support Web Workers.');
         console.error('Worker init error:', error);
+        disableForm();
+        return;
     }
 
     // Check for existing session
@@ -680,12 +684,23 @@ function handleWorkerMessage(event) {
  */
 function handleWorkerError(error) {
     console.error('Worker error:', error);
+    const hadActiveSession =
+        decryptInFlight
+        || unlockInFlight
+        || !!window.cassSession?.dek;
     unlockInFlight = false;
     decryptInFlight = false;
     activeUnlockRequestId = null;
     activeDecryptRequestId = null;
+    clearStoredSession();
+    window.cassSession = null;
     hideProgress();
     enableForm();
+    if (hadActiveSession) {
+        elements.appScreen.classList.add('hidden');
+        elements.authScreen.classList.remove('hidden');
+        elements.passwordInput.value = '';
+    }
     showError('An error occurred during decryption. Please try again.');
 }
 

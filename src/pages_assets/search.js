@@ -79,9 +79,6 @@ export function initSearch(container, onSelect) {
     // Set up event listeners
     setupEventListeners();
 
-    // Load initial data (recent conversations)
-    loadRecentConversations(searchEpoch);
-
     // Populate filter options
     populateFilters();
 }

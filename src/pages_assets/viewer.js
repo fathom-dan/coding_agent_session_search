@@ -196,9 +196,6 @@ function refreshAfterDatabaseReady() {
     }
 
     handleSearchRoute({ q: state.searchQuery });
-    if (!state.searchQuery) {
-        clearSearch({ reloadRecent: true });
-    }
 }
 
 /**
