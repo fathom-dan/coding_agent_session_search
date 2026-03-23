@@ -15,6 +15,7 @@
 //! - Add/revoke only modifies config.json; payload unchanged
 //! - Rotate re-encrypts entire payload with new DEK
 
+use crate::pages::attachments::reencrypt_blobs_into_dir;
 use crate::pages::encrypt::{
     Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, SlotType, load_config,
 };
@@ -23,7 +24,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::prelude::*;
 use chrono::{DateTime, Utc};
@@ -146,8 +147,7 @@ pub fn key_add_password(
     config.key_slots.push(new_slot);
 
     // Write updated config
-    let file = File::create(&config_path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), &config)?;
+    write_json_pretty_atomically(&config_path, &config)?;
 
     // Update integrity.json if present
     let manifest = regenerate_integrity_manifest(&archive_dir)?;
@@ -185,8 +185,7 @@ pub fn key_add_recovery(
     config.key_slots.push(new_slot);
 
     // Write updated config
-    let file = File::create(&config_path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), &config)?;
+    write_json_pretty_atomically(&config_path, &config)?;
 
     // Update integrity.json if present
     let manifest = regenerate_integrity_manifest(&archive_dir)?;
@@ -245,8 +244,7 @@ pub fn key_revoke(
     config.key_slots.retain(|s| s.id != slot_id_to_revoke);
 
     // Write updated config
-    let file = File::create(&config_path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), &config)?;
+    write_json_pretty_atomically(&config_path, &config)?;
 
     // Update integrity.json if present
     let manifest = regenerate_integrity_manifest(&archive_dir)?;
@@ -278,8 +276,14 @@ pub fn key_rotate(
     progress: impl Fn(f32),
 ) -> Result<RotateResult> {
     let archive_dir = super::resolve_site_dir(archive_dir)?;
-    let config_path = archive_dir.join("config.json");
     let config = load_config(&archive_dir)?;
+    let old_export_id_raw = BASE64_STANDARD.decode(&config.export_id)?;
+    let old_export_id: [u8; 16] = old_export_id_raw.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid export_id length: expected 16, got {}",
+            old_export_id_raw.len()
+        )
+    })?;
 
     // 1. Decrypt payload with old password
     let old_dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, old_password)?);
@@ -297,15 +301,27 @@ pub fn key_rotate(
     rng.fill_bytes(&mut new_export_id);
     rng.fill_bytes(&mut new_base_nonce);
 
-    // 3. Re-encrypt payload with new DEK
+    let staged_site_dir = unique_staged_site_dir(&archive_dir);
+    copy_site_except_runtime_state(&archive_dir, &staged_site_dir)?;
+
+    // 3. Re-encrypt payload with new DEK into the staged site
     let chunk_count = encrypt_all_chunks(
         &plaintext,
         &new_dek,
         &new_export_id,
         &new_base_nonce,
         config.payload.chunk_size,
-        &archive_dir.join("payload"),
+        &staged_site_dir.join("payload"),
         |p| progress(0.5 + p * 0.5),
+    )?;
+
+    reencrypt_blobs_into_dir(
+        &archive_dir,
+        &staged_site_dir,
+        &old_dek,
+        &old_export_id,
+        &new_dek,
+        &new_export_id,
     )?;
 
     // 4. Create new key slots
@@ -349,17 +365,18 @@ pub fn key_rotate(
         key_slots: new_slots.clone(),
     };
 
-    let file = File::create(&config_path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), &new_config)?;
+    write_json_pretty(&staged_site_dir.join("config.json"), &new_config)?;
 
-    // 6. Regenerate integrity.json
-    let manifest = regenerate_integrity_manifest(&archive_dir)?;
+    // 6. Regenerate integrity.json for the staged site, then swap atomically
+    let manifest = crate::pages::bundle::generate_integrity_manifest(&staged_site_dir)?;
+    write_json_pretty(&staged_site_dir.join("integrity.json"), &manifest)?;
+    replace_dir_from_temp(&staged_site_dir, &archive_dir)?;
     refresh_private_artifacts(
         &archive_dir,
         &new_config,
-        manifest.as_ref(),
+        Some(&manifest),
         recovery_secret_bytes.as_deref(),
-        keep_recovery,
+        !keep_recovery,
     )?;
 
     Ok(RotateResult {
@@ -733,10 +750,260 @@ fn regenerate_integrity_manifest(
     }
 
     let integrity = crate::pages::bundle::generate_integrity_manifest(archive_dir)?;
-    let file = File::create(&integrity_path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), &integrity)?;
+    write_json_pretty(&integrity_path, &integrity)?;
 
     Ok(Some(integrity))
+}
+
+fn write_json_pretty_atomically<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let temp_path = unique_atomic_temp_path(path);
+    {
+        let file = File::create(&temp_path)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, value)?;
+        writer.flush()?;
+    }
+    replace_file_from_temp(&temp_path, path)
+}
+
+fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, value)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
+    if cfg!(windows) {
+        match std::fs::rename(temp_path, final_path) {
+            Ok(()) => Ok(()),
+            Err(first_err) if final_path.exists() => {
+                let backup_path = unique_atomic_backup_path(final_path);
+                std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
+                    anyhow::anyhow!(
+                        "failed replacing {} with {}: {}; failed moving existing file to backup {}: {}",
+                        final_path.display(),
+                        temp_path.display(),
+                        first_err,
+                        backup_path.display(),
+                        backup_err
+                    )
+                })?;
+
+                match std::fs::rename(temp_path, final_path) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&backup_path);
+                        Ok(())
+                    }
+                    Err(second_err) => match std::fs::rename(&backup_path, final_path) {
+                        Ok(()) => {
+                            let _ = std::fs::remove_file(temp_path);
+                            anyhow::bail!(
+                                "failed replacing {} with {}: {}; restored original file",
+                                final_path.display(),
+                                temp_path.display(),
+                                second_err
+                            );
+                        }
+                        Err(restore_err) => {
+                            anyhow::bail!(
+                                "failed replacing {} with {}: {}; restore error: {}; temp file retained at {}",
+                                final_path.display(),
+                                temp_path.display(),
+                                second_err,
+                                restore_err,
+                                temp_path.display()
+                            );
+                        }
+                    },
+                }
+            }
+            Err(err) => Err(err.into()),
+        }
+    } else {
+        std::fs::rename(temp_path, final_path)?;
+        Ok(())
+    }
+}
+
+fn unique_atomic_temp_path(path: &Path) -> std::path::PathBuf {
+    unique_atomic_sidecar_path(path, "tmp", "config.json")
+}
+
+fn unique_atomic_backup_path(path: &Path) -> std::path::PathBuf {
+    unique_atomic_sidecar_path(path, "bak", "config.json")
+}
+
+fn unique_staged_site_dir(path: &Path) -> std::path::PathBuf {
+    unique_atomic_sidecar_path(path, "rotate", "site")
+}
+
+fn unique_staged_site_backup_dir(path: &Path) -> std::path::PathBuf {
+    unique_atomic_sidecar_path(path, "bak", "site")
+}
+
+fn unique_atomic_sidecar_path(
+    path: &Path,
+    suffix: &str,
+    fallback_name: &str,
+) -> std::path::PathBuf {
+    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_name);
+
+    path.with_file_name(format!(
+        ".{file_name}.{suffix}.{}.{}.{}",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
+}
+
+fn replace_dir_from_temp(temp_dir: &Path, final_dir: &Path) -> Result<()> {
+    if !final_dir.exists() {
+        std::fs::rename(temp_dir, final_dir).with_context(|| {
+            format!(
+                "failed renaming staged site {} into place at {}",
+                temp_dir.display(),
+                final_dir.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    let backup_dir = unique_staged_site_backup_dir(final_dir);
+    std::fs::rename(final_dir, &backup_dir).with_context(|| {
+        format!(
+            "failed preparing backup {} before replacing {}",
+            backup_dir.display(),
+            final_dir.display()
+        )
+    })?;
+
+    match std::fs::rename(temp_dir, final_dir) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&backup_dir);
+            Ok(())
+        }
+        Err(second_err) => match std::fs::rename(&backup_dir, final_dir) {
+            Ok(()) => anyhow::bail!(
+                "failed replacing {} with {}: {}; restored original site",
+                final_dir.display(),
+                temp_dir.display(),
+                second_err
+            ),
+            Err(restore_err) => anyhow::bail!(
+                "failed replacing {} with {}: {}; restore error: {}; staged site retained at {}",
+                final_dir.display(),
+                temp_dir.display(),
+                second_err,
+                restore_err,
+                temp_dir.display()
+            ),
+        },
+    }
+}
+
+fn copy_site_except_runtime_state(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)
+        .with_context(|| format!("Failed to create staged site directory {}", dst.display()))?;
+    let canonical_base = src.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve archive root {} before staging key rotation",
+            src.display()
+        )
+    })?;
+    copy_site_except_runtime_state_recursive(src, dst, src, &canonical_base)
+}
+
+fn copy_site_except_runtime_state_recursive(
+    src: &Path,
+    dst: &Path,
+    base: &Path,
+    canonical_base: &Path,
+) -> Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel_path = path.strip_prefix(base)?;
+        let skip_root_entry = rel_path.components().count() == 1
+            && matches!(
+                rel_path.to_str(),
+                Some("payload" | "blobs" | "config.json" | "integrity.json")
+            );
+        if skip_root_entry {
+            continue;
+        }
+
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let file_type = metadata.file_type();
+        let dest_path = dst.join(rel_path);
+        if file_type.is_dir() {
+            std::fs::create_dir_all(&dest_path)?;
+            copy_site_except_runtime_state_recursive(&path, dst, base, canonical_base)?;
+        } else if file_type.is_symlink() {
+            let canonical_target = path.canonicalize().with_context(|| {
+                format!(
+                    "Failed to resolve symlinked site entry {} while staging key rotation",
+                    rel_path.display()
+                )
+            })?;
+            if !canonical_target.starts_with(canonical_base) {
+                bail!(
+                    "Refusing to rotate symlinked site entry outside archive root: {}",
+                    rel_path.display()
+                );
+            }
+
+            let target_meta = std::fs::metadata(&path).with_context(|| {
+                format!(
+                    "Failed to read symlink target metadata for {} while staging key rotation",
+                    rel_path.display()
+                )
+            })?;
+            if !target_meta.is_file() {
+                bail!(
+                    "Refusing to rotate symlinked site entry that does not point to a regular file: {}",
+                    rel_path.display()
+                );
+            }
+
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Materialize safe symlink targets into the staged site so the staged
+            // integrity pass stays self-contained before the final atomic swap.
+            std::fs::copy(&canonical_target, &dest_path).with_context(|| {
+                format!(
+                    "Failed copying symlink target {} into staged site path {}",
+                    canonical_target.display(),
+                    dest_path.display()
+                )
+            })?;
+        } else if file_type.is_file() {
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&path, &dest_path).with_context(|| {
+                format!(
+                    "Failed copying staged site file {} to {}",
+                    path.display(),
+                    dest_path.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 fn refresh_private_artifacts(
@@ -788,10 +1055,27 @@ fn private_dir_for_archive(archive_dir: &Path) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pages::attachments::{
+        AttachmentConfig, AttachmentData, AttachmentProcessor, decrypt_blob, decrypt_manifest,
+    };
     use crate::pages::bundle::BundleBuilder;
     use crate::pages::encrypt::{DecryptionEngine, EncryptionEngine};
     use crate::pages::verify::verify_bundle;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn replace_viewer_with_in_tree_symlink(site_dir: &Path) {
+        use std::os::unix::fs::symlink;
+
+        let real_viewer = site_dir.join("viewer-real.js");
+        std::fs::rename(site_dir.join("viewer.js"), &real_viewer).unwrap();
+        symlink("viewer-real.js", site_dir.join("viewer.js")).unwrap();
+
+        let manifest = crate::pages::bundle::generate_integrity_manifest(site_dir).unwrap();
+        write_json_pretty(&site_dir.join("integrity.json"), &manifest).unwrap();
+
+        assert_eq!(verify_bundle(site_dir, false).unwrap().status, "valid");
+    }
 
     fn setup_test_archive() -> (TempDir, std::path::PathBuf) {
         let temp_dir = TempDir::new().unwrap();
@@ -807,6 +1091,47 @@ mod tests {
         engine.add_password_slot("test-password").unwrap();
         engine
             .encrypt_file(&input_path, &encrypted_dir, |_, _| {})
+            .unwrap();
+
+        BundleBuilder::new()
+            .build(&encrypted_dir, &bundle_root, |_, _| {})
+            .unwrap();
+
+        (temp_dir, bundle_root)
+    }
+
+    fn setup_test_archive_with_attachments() -> (TempDir, std::path::PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("input.txt");
+        let bundle_root = temp_dir.path().join("bundle");
+        let encrypted_dir = temp_dir.path().join("encrypted");
+
+        std::fs::write(&input_path, b"Test data for key management").unwrap();
+
+        let mut engine = EncryptionEngine::new(1024).unwrap();
+        engine.add_password_slot("test-password").unwrap();
+        engine
+            .encrypt_file(&input_path, &encrypted_dir, |_, _| {})
+            .unwrap();
+
+        let config = load_config(&encrypted_dir).unwrap();
+        let dek = unwrap_dek_with_password(&config, "test-password").unwrap();
+        let export_id_raw = BASE64_STANDARD.decode(&config.export_id).unwrap();
+        let export_id: [u8; 16] = export_id_raw.as_slice().try_into().unwrap();
+
+        let mut processor = AttachmentProcessor::new(AttachmentConfig::enabled());
+        processor
+            .process_attachments(
+                1,
+                &[AttachmentData {
+                    filename: "proof.txt".to_string(),
+                    mime_type: "text/plain".to_string(),
+                    data: b"attachment payload".to_vec(),
+                }],
+            )
+            .unwrap();
+        processor
+            .write_encrypted_blobs(&encrypted_dir, &dek, &export_id)
             .unwrap();
 
         BundleBuilder::new()
@@ -1009,6 +1334,44 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_key_add_password_preserves_in_tree_symlinked_required_asset() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        replace_viewer_with_in_tree_symlink(&site_dir);
+
+        key_add_password(&archive_dir, "test-password", "new-password").unwrap();
+
+        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+        assert!(
+            std::fs::symlink_metadata(site_dir.join("viewer.js"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_key_rotate_materializes_in_tree_symlinked_required_asset() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        replace_viewer_with_in_tree_symlink(&site_dir);
+        let expected_viewer = std::fs::read(site_dir.join("viewer-real.js")).unwrap();
+
+        key_rotate(&archive_dir, "test-password", "new-password", true, |_| {}).unwrap();
+
+        let viewer_metadata = std::fs::symlink_metadata(site_dir.join("viewer.js")).unwrap();
+        assert!(viewer_metadata.file_type().is_file());
+        assert!(!viewer_metadata.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read(site_dir.join("viewer.js")).unwrap(),
+            expected_viewer
+        );
+        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+    }
+
+    #[test]
     fn test_key_add_password_updates_private_fingerprint_and_master_key() {
         let (_temp_dir, archive_dir) = setup_test_archive();
         let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
@@ -1099,5 +1462,96 @@ mod tests {
 
         assert_ne!(old_master_key, new_master_key);
         assert!(recovery_file.contains(result.recovery_secret.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn test_key_rotate_without_recovery_removes_stale_private_recovery_artifact() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let private_dir = site_dir.parent().unwrap().join("private");
+
+        let (_slot_id, _secret) = key_add_recovery(&archive_dir, "test-password").unwrap();
+        assert!(private_dir.join("recovery-secret.txt").exists());
+
+        key_rotate(&archive_dir, "test-password", "new-password", false, |_| {}).unwrap();
+
+        assert!(!private_dir.join("recovery-secret.txt").exists());
+        assert!(!private_dir.join("qr-code.png").exists());
+        assert!(!private_dir.join("qr-code.svg").exists());
+    }
+
+    #[test]
+    fn test_key_rotate_reencrypts_attachment_blobs() {
+        let (_temp_dir, archive_dir) = setup_test_archive_with_attachments();
+
+        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+
+        key_rotate(&archive_dir, "test-password", "new-password", false, |_| {}).unwrap();
+
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let config = load_config(&archive_dir).unwrap();
+        let dek = unwrap_dek_with_password(&config, "new-password").unwrap();
+        let export_id_raw = BASE64_STANDARD.decode(&config.export_id).unwrap();
+        let export_id: [u8; 16] = export_id_raw.as_slice().try_into().unwrap();
+
+        let manifest_ciphertext =
+            std::fs::read(site_dir.join("blobs").join("manifest.enc")).unwrap();
+        let manifest = decrypt_manifest(&manifest_ciphertext, &dek, &export_id).unwrap();
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(manifest.entries[0].filename, "proof.txt");
+
+        let blob_ciphertext = std::fs::read(
+            site_dir
+                .join("blobs")
+                .join(format!("{}.bin", manifest.entries[0].hash)),
+        )
+        .unwrap();
+        let plaintext = decrypt_blob(
+            &blob_ciphertext,
+            &dek,
+            &export_id,
+            &manifest.entries[0].hash,
+        )
+        .unwrap();
+        assert_eq!(plaintext, b"attachment payload");
+        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+    }
+
+    #[test]
+    fn test_key_rotate_failure_before_site_swap_preserves_live_archive() {
+        let (temp_dir, archive_dir) = setup_test_archive_with_attachments();
+        let decrypted_path = temp_dir.path().join("decrypted-after-failure.txt");
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+
+        std::fs::write(site_dir.join("blobs").join("manifest.enc"), b"corrupted").unwrap();
+
+        let rotate_result =
+            key_rotate(&archive_dir, "test-password", "new-password", false, |_| {});
+        assert!(rotate_result.is_err());
+
+        let config = load_config(&archive_dir).unwrap();
+        assert!(unwrap_dek_with_password(&config, "new-password").is_err());
+
+        let decryptor = DecryptionEngine::unlock_with_password(config, "test-password").unwrap();
+        decryptor
+            .decrypt_to_file(&archive_dir, &decrypted_path, |_, _| {})
+            .unwrap();
+
+        let decrypted = std::fs::read(&decrypted_path).unwrap();
+        assert_eq!(decrypted, b"Test data for key management");
+    }
+
+    #[test]
+    fn test_write_json_pretty_atomically_overwrites_existing_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.json");
+        std::fs::write(&path, "{\"before\":true}\n").unwrap();
+
+        let value = serde_json::json!({ "after": true });
+        write_json_pretty_atomically(&path, &value).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written, value);
     }
 }

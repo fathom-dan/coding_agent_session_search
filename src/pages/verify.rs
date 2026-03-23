@@ -244,10 +244,25 @@ fn resolve_site_dir(path: &Path) -> Result<PathBuf> {
 /// Check that all required files exist
 fn check_required_files(site_dir: &Path) -> CheckResult {
     let mut missing = Vec::new();
+    let mut invalid = Vec::new();
 
     for file in REQUIRED_FILES {
-        if !site_dir.join(file).exists() {
-            missing.push(*file);
+        let path = site_dir.join(file);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if file_type.is_file() {
+                    continue;
+                }
+                if file_type.is_symlink()
+                    && let Ok(target_meta) = fs::metadata(&path)
+                    && target_meta.file_type().is_file()
+                {
+                    continue;
+                }
+                invalid.push(format!("{file} (must be a regular file)"));
+            }
+            Err(_) => missing.push(*file),
         }
     }
 
@@ -256,10 +271,17 @@ fn check_required_files(site_dir: &Path) -> CheckResult {
         missing.push("payload/");
     }
 
-    if missing.is_empty() {
+    if missing.is_empty() && invalid.is_empty() {
         CheckResult::pass()
     } else {
-        CheckResult::fail(format!("Missing files: {}", missing.join(", ")))
+        let mut parts = Vec::new();
+        if !missing.is_empty() {
+            parts.push(format!("Missing files: {}", missing.join(", ")));
+        }
+        if !invalid.is_empty() {
+            parts.push(format!("Invalid required files: {}", invalid.join(", ")));
+        }
+        CheckResult::fail(parts.join("; "))
     }
 }
 
@@ -1598,6 +1620,43 @@ mod tests {
         let result = verify_bundle(&site_dir, false).unwrap();
         assert_eq!(result.status, "invalid");
         assert!(!result.checks.required_files.passed);
+    }
+
+    #[test]
+    fn test_verify_rejects_required_file_replaced_by_directory() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        let viewer_backup = temp.path().join("viewer.js.backup");
+
+        copy_fixture("valid", &site_dir).unwrap();
+        fs::rename(site_dir.join("viewer.js"), &viewer_backup).unwrap();
+        fs::create_dir(site_dir.join("viewer.js")).unwrap();
+
+        let mut manifest: IntegrityManifest = serde_json::from_reader(BufReader::new(
+            File::open(site_dir.join("integrity.json")).unwrap(),
+        ))
+        .unwrap();
+        manifest.files.remove("viewer.js");
+        fs::write(
+            site_dir.join("integrity.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let result = verify_bundle(&site_dir, false).unwrap();
+        assert_eq!(result.status, "invalid");
+        assert!(!result.checks.required_files.passed);
+        assert!(
+            result
+                .checks
+                .required_files
+                .details
+                .as_ref()
+                .map(|details| details.contains("viewer.js (must be a regular file)"))
+                .unwrap_or(false),
+            "required file directories should be rejected: {:?}",
+            result.checks.required_files.details
+        );
     }
 
     #[test]

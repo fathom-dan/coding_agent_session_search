@@ -566,52 +566,93 @@ fn collect_file_hashes(
     current_dir: &Path,
     files: &mut BTreeMap<String, IntegrityEntry>,
 ) -> Result<()> {
+    let canonical_base_dir = base_dir.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve site directory {} while generating integrity manifest",
+            base_dir.display()
+        )
+    })?;
+    collect_file_hashes_recursive(base_dir, current_dir, &canonical_base_dir, files)
+}
+
+fn collect_file_hashes_recursive(
+    base_dir: &Path,
+    current_dir: &Path,
+    canonical_base_dir: &Path,
+    files: &mut BTreeMap<String, IntegrityEntry>,
+) -> Result<()> {
     for entry in fs::read_dir(current_dir)? {
         let entry = entry?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         let file_type = metadata.file_type();
+        let rel_path = path.strip_prefix(base_dir)?;
+        let rel_str = rel_path.to_string_lossy().replace('\\', "/");
 
-        if file_type.is_symlink() {
+        // Skip integrity.json itself (chicken/egg)
+        if rel_str == "integrity.json" {
             continue;
         }
 
         if file_type.is_dir() {
-            collect_file_hashes(base_dir, &path, files)?;
+            collect_file_hashes_recursive(base_dir, &path, canonical_base_dir, files)?;
+        } else if file_type.is_symlink() {
+            let canonical_target = path.canonicalize().with_context(|| {
+                format!(
+                    "Failed to resolve symlink {} while generating integrity manifest",
+                    rel_str
+                )
+            })?;
+            if !canonical_target.starts_with(canonical_base_dir) {
+                bail!(
+                    "Refusing to include symlink outside site directory in integrity manifest: {}",
+                    rel_str
+                );
+            }
+
+            let target_meta = fs::metadata(&path).with_context(|| {
+                format!(
+                    "Failed to read symlink target metadata for {} while generating integrity manifest",
+                    rel_str
+                )
+            })?;
+            if !target_meta.is_file() {
+                bail!(
+                    "Refusing to include symlink that does not point to a regular file in integrity manifest: {}",
+                    rel_str
+                );
+            }
+
+            files.insert(rel_str, build_integrity_entry(&path)?);
         } else if file_type.is_file() {
-            // Compute relative path
-            let rel_path = path.strip_prefix(base_dir)?;
-            let rel_str = rel_path.to_string_lossy().replace('\\', "/");
-
-            // Skip integrity.json itself (chicken/egg)
-            if rel_str == "integrity.json" {
-                continue;
-            }
-
-            // Compute hash and size
-            let file = File::open(&path)?;
-            let metadata = file.metadata()?;
-            let size = metadata.len();
-
-            let mut hasher = Sha256::new();
-            let mut reader = BufReader::new(file);
-            let mut buffer = [0u8; 8192];
-
-            loop {
-                let bytes_read = reader.read(&mut buffer)?;
-                if bytes_read == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..bytes_read]);
-            }
-
-            let hash = format!("{:x}", hasher.finalize());
-
-            files.insert(rel_str, IntegrityEntry { sha256: hash, size });
+            files.insert(rel_str, build_integrity_entry(&path)?);
         }
     }
 
     Ok(())
+}
+
+fn build_integrity_entry(path: &Path) -> Result<IntegrityEntry> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    let size = metadata.len();
+
+    let mut hasher = Sha256::new();
+    let mut reader = BufReader::new(file);
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    Ok(IntegrityEntry {
+        sha256: format!("{:x}", hasher.finalize()),
+        size,
+    })
 }
 
 /// Compute a short fingerprint from the integrity manifest
@@ -974,7 +1015,28 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_collect_file_hashes_skips_symlinks() {
+    fn test_collect_file_hashes_includes_symlinked_files_within_site() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let temp_path = temp.path();
+
+        fs::write(temp_path.join("real.txt"), "real").unwrap();
+        symlink("real.txt", temp_path.join("linked-file.txt")).unwrap();
+
+        let mut files = BTreeMap::new();
+        collect_file_hashes(temp_path, temp_path, &mut files).unwrap();
+
+        assert_eq!(files.len(), 2);
+        assert!(files.contains_key("real.txt"));
+        assert!(files.contains_key("linked-file.txt"));
+        assert_eq!(files["real.txt"].sha256, files["linked-file.txt"].sha256);
+        assert_eq!(files["real.txt"].size, files["linked-file.txt"].size);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_collect_file_hashes_rejects_symlinks_outside_site() {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().unwrap();
@@ -993,11 +1055,11 @@ mod tests {
         symlink(outside.path().join("nested"), temp_path.join("linked-dir")).unwrap();
 
         let mut files = BTreeMap::new();
-        collect_file_hashes(temp_path, temp_path, &mut files).unwrap();
-
-        assert!(files.contains_key("root.txt"));
-        assert!(!files.contains_key("linked-file.txt"));
-        assert!(!files.keys().any(|p| p.starts_with("linked-dir/")));
+        let err = collect_file_hashes(temp_path, temp_path, &mut files).unwrap_err();
+        assert!(
+            err.to_string().contains("outside site directory"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

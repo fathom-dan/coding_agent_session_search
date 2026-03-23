@@ -19,7 +19,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -476,6 +476,153 @@ pub fn decrypt_manifest(
     Ok(manifest)
 }
 
+pub(crate) fn reencrypt_blobs_into_dir(
+    source_archive_dir: &Path,
+    output_archive_dir: &Path,
+    old_dek: &[u8; 32],
+    old_export_id: &[u8; 16],
+    new_dek: &[u8; 32],
+    new_export_id: &[u8; 16],
+) -> Result<()> {
+    let source_blobs_dir = source_archive_dir.join("blobs");
+    match fs::symlink_metadata(&source_blobs_dir) {
+        Ok(meta) => {
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "Refusing to re-encrypt attachments from symlinked blobs directory: {}",
+                    source_blobs_dir.display()
+                );
+            }
+            if !file_type.is_dir() {
+                bail!(
+                    "Refusing to re-encrypt attachments from non-directory blobs path: {}",
+                    source_blobs_dir.display()
+                );
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to inspect attachment blobs directory {}",
+                    source_blobs_dir.display()
+                )
+            });
+        }
+    }
+
+    let output_blobs_dir = output_archive_dir.join("blobs");
+    match fs::symlink_metadata(&output_blobs_dir) {
+        Ok(meta) => {
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "Refusing to write re-encrypted attachments into symlinked blobs directory: {}",
+                    output_blobs_dir.display()
+                );
+            }
+            if !file_type.is_dir() {
+                bail!(
+                    "Refusing to write re-encrypted attachments into non-directory blobs path: {}",
+                    output_blobs_dir.display()
+                );
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&output_blobs_dir)
+                .context("Failed to create destination blobs directory during key rotation")?;
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to inspect destination blobs directory {}",
+                    output_blobs_dir.display()
+                )
+            });
+        }
+    }
+
+    let manifest_path = source_blobs_dir.join("manifest.enc");
+    ensure_regular_ciphertext_file(&manifest_path, "attachment manifest")?;
+    let manifest_ciphertext =
+        fs::read(&manifest_path).context("Failed to read attachment manifest for rekey")?;
+    let manifest = decrypt_manifest(&manifest_ciphertext, old_dek, old_export_id)
+        .context("Failed to decrypt attachment manifest during key rotation")?;
+
+    let mut plaintext_blobs: HashMap<String, Vec<u8>> = HashMap::new();
+    for entry in &manifest.entries {
+        if plaintext_blobs.contains_key(&entry.hash) {
+            continue;
+        }
+
+        let blob_path = source_blobs_dir.join(format!("{}.bin", entry.hash));
+        ensure_regular_ciphertext_file(&blob_path, &format!("attachment blob {}", entry.hash))?;
+        let ciphertext = fs::read(&blob_path)
+            .with_context(|| format!("Failed to read attachment blob {}", entry.hash))?;
+        let plaintext = decrypt_blob(&ciphertext, old_dek, old_export_id, &entry.hash)
+            .with_context(|| format!("Failed to decrypt attachment blob {}", entry.hash))?;
+        plaintext_blobs.insert(entry.hash.clone(), plaintext);
+    }
+
+    let cipher = Aes256Gcm::new_from_slice(new_dek).expect("Invalid DEK length");
+
+    for (hash, data) in plaintext_blobs {
+        let nonce = derive_blob_nonce(&hash);
+        let hash_bytes = hex::decode(&hash).context("Invalid hash hex")?;
+        let mut aad = Vec::with_capacity(new_export_id.len() + hash_bytes.len());
+        aad.extend_from_slice(new_export_id);
+        aad.extend_from_slice(&hash_bytes);
+
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: data.as_slice(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("Blob encryption failed during key rotation: {}", e))?;
+
+        fs::write(output_blobs_dir.join(format!("{}.bin", hash)), ciphertext)
+            .with_context(|| format!("Failed to rewrite attachment blob {}", hash))?;
+    }
+
+    let manifest_json =
+        serde_json::to_vec(&manifest).context("Failed to serialize attachment manifest")?;
+    let manifest_nonce = derive_blob_nonce("manifest");
+    let reencrypted_manifest = cipher
+        .encrypt(
+            Nonce::from_slice(&manifest_nonce),
+            Payload {
+                msg: &manifest_json,
+                aad: new_export_id,
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("Manifest encryption failed during key rotation: {}", e))?;
+
+    fs::write(output_blobs_dir.join("manifest.enc"), reencrypted_manifest)
+        .context("Failed to rewrite attachment manifest during key rotation")?;
+
+    Ok(())
+}
+
+fn ensure_regular_ciphertext_file(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("Failed to inspect {label} at {}", path.display()))?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        bail!("Refusing to read {label} from symlink: {}", path.display());
+    }
+    if !file_type.is_file() {
+        bail!(
+            "Refusing to read {label} from non-file path: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,5 +854,155 @@ mod tests {
 
         assert_eq!(decrypted.entries.len(), 1);
         assert_eq!(decrypted.entries[0].hash, "abc123");
+    }
+
+    #[test]
+    fn test_reencrypt_existing_blobs_roundtrip() {
+        use tempfile::TempDir;
+
+        let config = AttachmentConfig::enabled();
+        let mut processor = AttachmentProcessor::new(config);
+        let attachment = AttachmentData {
+            filename: "test.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            data: b"test content".to_vec(),
+        };
+        processor.process_attachments(1, &[attachment]).unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let old_dek = [0x42u8; 32];
+        let old_export_id = [0x01u8; 16];
+        let new_dek = [0x24u8; 32];
+        let new_export_id = [0x02u8; 16];
+
+        let manifest = processor
+            .write_encrypted_blobs(temp_dir.path(), &old_dek, &old_export_id)
+            .unwrap();
+
+        reencrypt_blobs_into_dir(
+            temp_dir.path(),
+            temp_dir.path(),
+            &old_dek,
+            &old_export_id,
+            &new_dek,
+            &new_export_id,
+        )
+        .unwrap();
+
+        let blobs_dir = temp_dir.path().join("blobs");
+        let manifest_ciphertext = fs::read(blobs_dir.join("manifest.enc")).unwrap();
+        let decrypted_manifest =
+            decrypt_manifest(&manifest_ciphertext, &new_dek, &new_export_id).unwrap();
+        assert_eq!(decrypted_manifest.entries.len(), 1);
+        assert_eq!(decrypted_manifest.entries[0].hash, manifest.entries[0].hash);
+
+        let blob_ciphertext =
+            fs::read(blobs_dir.join(format!("{}.bin", manifest.entries[0].hash))).unwrap();
+        let blob_plaintext = decrypt_blob(
+            &blob_ciphertext,
+            &new_dek,
+            &new_export_id,
+            &manifest.entries[0].hash,
+        )
+        .unwrap();
+        assert_eq!(blob_plaintext, b"test content");
+        assert!(decrypt_manifest(&manifest_ciphertext, &old_dek, &old_export_id).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_reencrypt_existing_blobs_rejects_symlinked_blobs_directory() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let config = AttachmentConfig::enabled();
+        let mut processor = AttachmentProcessor::new(config);
+        let attachment = AttachmentData {
+            filename: "test.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            data: b"test content".to_vec(),
+        };
+        processor.process_attachments(1, &[attachment]).unwrap();
+
+        let source_archive_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+        let output_archive_dir = TempDir::new().unwrap();
+        let old_dek = [0x42u8; 32];
+        let old_export_id = [0x01u8; 16];
+        let new_dek = [0x24u8; 32];
+        let new_export_id = [0x02u8; 16];
+
+        processor
+            .write_encrypted_blobs(outside_dir.path(), &old_dek, &old_export_id)
+            .unwrap();
+        symlink(
+            outside_dir.path().join("blobs"),
+            source_archive_dir.path().join("blobs"),
+        )
+        .unwrap();
+
+        let err = reencrypt_blobs_into_dir(
+            source_archive_dir.path(),
+            output_archive_dir.path(),
+            &old_dek,
+            &old_export_id,
+            &new_dek,
+            &new_export_id,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("symlinked blobs directory"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_reencrypt_existing_blobs_rejects_symlinked_destination_directory() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let config = AttachmentConfig::enabled();
+        let mut processor = AttachmentProcessor::new(config);
+        let attachment = AttachmentData {
+            filename: "test.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            data: b"test content".to_vec(),
+        };
+        processor.process_attachments(1, &[attachment]).unwrap();
+
+        let source_archive_dir = TempDir::new().unwrap();
+        let output_archive_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+        let old_dek = [0x42u8; 32];
+        let old_export_id = [0x01u8; 16];
+        let new_dek = [0x24u8; 32];
+        let new_export_id = [0x02u8; 16];
+
+        processor
+            .write_encrypted_blobs(source_archive_dir.path(), &old_dek, &old_export_id)
+            .unwrap();
+        fs::create_dir_all(outside_dir.path().join("elsewhere")).unwrap();
+        symlink(
+            outside_dir.path().join("elsewhere"),
+            output_archive_dir.path().join("blobs"),
+        )
+        .unwrap();
+
+        let err = reencrypt_blobs_into_dir(
+            source_archive_dir.path(),
+            output_archive_dir.path(),
+            &old_dek,
+            &old_export_id,
+            &new_dek,
+            &new_export_id,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("symlinked blobs directory"),
+            "unexpected error: {err:#}"
+        );
     }
 }
