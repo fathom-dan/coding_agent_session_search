@@ -30,6 +30,7 @@ import {
 // Module state
 let settingsContainer = null;
 let onSessionReset = null;
+let settingsRenderEpoch = 0;
 
 function getEffectiveStorageMode() {
     const mode = getStorageMode();
@@ -46,6 +47,7 @@ function getEffectiveStorageMode() {
  * @param {Function} options.onSessionReset - Callback when session is reset
  */
 export function initSettings(container, options = {}) {
+    settingsRenderEpoch += 1;
     settingsContainer = container;
     onSessionReset = options.onSessionReset || null;
 
@@ -59,12 +61,23 @@ export function initSettings(container, options = {}) {
 export async function render() {
     if (!settingsContainer) return;
 
+    const epoch = settingsRenderEpoch;
+    const targetContainer = settingsContainer;
+
     const currentMode = getEffectiveStorageMode();
     const opfsAvailable = isOPFSAvailable();
     const opfsEnabled = opfsAvailable && isOpfsEnabled();
     const stats = await getStorageStats();
 
-    settingsContainer.innerHTML = `
+    if (
+        epoch !== settingsRenderEpoch
+        || settingsContainer !== targetContainer
+        || !targetContainer?.isConnected
+    ) {
+        return;
+    }
+
+    targetContainer.innerHTML = `
         <div class="panel settings-panel">
             <header class="panel-header">
                 <h2>Settings</h2>
@@ -258,63 +271,63 @@ export async function render() {
     `;
 
     // Set up event handlers
-    setupEventHandlers();
+    setupEventHandlers(targetContainer);
 }
 
 /**
  * Set up settings event handlers
  */
-function setupEventHandlers() {
+function setupEventHandlers(root) {
     // Storage mode radio buttons
-    const modeRadios = settingsContainer.querySelectorAll('input[name="storage-mode"]');
+    const modeRadios = root.querySelectorAll('input[name="storage-mode"]');
     modeRadios.forEach(radio => {
         radio.addEventListener('change', handleStorageModeChange);
     });
 
     // OPFS toggle
-    const opfsToggle = document.getElementById('opfs-toggle');
+    const opfsToggle = root.querySelector('#opfs-toggle');
     if (opfsToggle) {
         opfsToggle.addEventListener('change', handleOPFSToggle);
     }
 
     // Clear current storage
-    const clearCurrentBtn = document.getElementById('clear-current-cache-btn');
+    const clearCurrentBtn = root.querySelector('#clear-current-cache-btn');
     if (clearCurrentBtn) {
         clearCurrentBtn.addEventListener('click', handleClearCurrentStorage);
     }
 
     // Clear OPFS
-    const clearOPFSBtn = document.getElementById('clear-opfs-btn');
+    const clearOPFSBtn = root.querySelector('#clear-opfs-btn');
     if (clearOPFSBtn) {
         clearOPFSBtn.addEventListener('click', handleClearOPFS);
     }
 
     // Clear SW cache
-    const clearSWBtn = document.getElementById('clear-sw-cache-btn');
+    const clearSWBtn = root.querySelector('#clear-sw-cache-btn');
     if (clearSWBtn) {
         clearSWBtn.addEventListener('click', handleClearSWCache);
     }
 
     // Clear all
-    const clearAllBtn = document.getElementById('clear-all-btn');
+    const clearAllBtn = root.querySelector('#clear-all-btn');
     if (clearAllBtn) {
         clearAllBtn.addEventListener('click', handleClearAll);
     }
 
     // Lock session
-    const lockBtn = document.getElementById('lock-session-btn');
+    const lockBtn = root.querySelector('#lock-session-btn');
     if (lockBtn) {
         lockBtn.addEventListener('click', handleLockSession);
     }
 
     // Reset session
-    const resetBtn = document.getElementById('reset-session-btn');
+    const resetBtn = root.querySelector('#reset-session-btn');
     if (resetBtn) {
         resetBtn.addEventListener('click', handleResetSession);
     }
 
     // Theme select
-    const themeSelect = document.getElementById('theme-select');
+    const themeSelect = root.querySelector('#theme-select');
     if (themeSelect) {
         // Load saved theme
         let savedTheme = 'auto';
@@ -607,8 +620,15 @@ function showNotification(message, type = 'info') {
     }, 3000);
 }
 
+export function cleanupSettings() {
+    settingsRenderEpoch += 1;
+    settingsContainer = null;
+    onSessionReset = null;
+}
+
 // Export module
 export default {
     initSettings,
     render,
+    cleanupSettings,
 };

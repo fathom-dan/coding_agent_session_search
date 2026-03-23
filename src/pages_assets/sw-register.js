@@ -8,6 +8,8 @@
 let registration = null;
 let updateAvailable = false;
 const DEFAULT_SW_MESSAGE_TIMEOUT_MS = 3000;
+const watchedRegistrations = new WeakSet();
+let controllerChangeListenerInstalled = false;
 
 function getCurrentScopeUrl() {
     return new URL('./', window.location.href).href;
@@ -114,6 +116,11 @@ export function hasSharedArrayBuffer() {
  * Set up listener for service worker updates
  */
 function setupUpdateListener(reg) {
+    if (watchedRegistrations.has(reg)) {
+        return;
+    }
+    watchedRegistrations.add(reg);
+
     reg.addEventListener('updatefound', () => {
         const newWorker = reg.installing;
 
@@ -135,10 +142,13 @@ function setupUpdateListener(reg) {
     });
 
     // Listen for controller change (after skipWaiting)
-    navigator.serviceWorker.addEventListener('controllerchange', () => {
-        console.log('[SW] Controller changed');
-        // Could auto-reload here, but better to let user decide
-    });
+    if (!controllerChangeListenerInstalled) {
+        navigator.serviceWorker.addEventListener('controllerchange', () => {
+            console.log('[SW] Controller changed');
+            // Could auto-reload here, but better to let user decide
+        });
+        controllerChangeListenerInstalled = true;
+    }
 }
 
 /**

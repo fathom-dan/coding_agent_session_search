@@ -21,6 +21,9 @@ export const COI_STATE = {
 };
 
 let activeReloadController = null;
+const serviceWorkerActivationCallbacks = new Set();
+let serviceWorkerActivationListenersInstalled = false;
+let serviceWorkerActivationDispatchScheduled = false;
 
 function hashScopeId(input) {
     let hash = 0x811c9dc5;
@@ -544,19 +547,48 @@ export async function initCOIDetection({
  * @param {Function} callback - Called when SW activates
  */
 export function onServiceWorkerActivated(callback) {
-    if ('serviceWorker' in navigator) {
+    if (!('serviceWorker' in navigator) || typeof callback !== 'function') {
+        return () => {};
+    }
+
+    serviceWorkerActivationCallbacks.add(callback);
+
+    if (!serviceWorkerActivationListenersInstalled) {
+        const notifyActivation = (reason) => {
+            if (serviceWorkerActivationDispatchScheduled) {
+                return;
+            }
+
+            serviceWorkerActivationDispatchScheduled = true;
+            queueMicrotask(() => {
+                serviceWorkerActivationDispatchScheduled = false;
+                console.log('[COI] Service worker activation detected:', reason);
+                [...serviceWorkerActivationCallbacks].forEach((registeredCallback) => {
+                    try {
+                        registeredCallback();
+                    } catch (error) {
+                        console.error('[COI] Activation callback failed:', error);
+                    }
+                });
+            });
+        };
+
         navigator.serviceWorker.addEventListener('message', (event) => {
             if (event.data?.type === 'SW_ACTIVATED') {
-                console.log('[COI] Received SW_ACTIVATED message');
-                callback();
+                notifyActivation('message');
             }
         });
 
         navigator.serviceWorker.addEventListener('controllerchange', () => {
-            console.log('[COI] Controller changed');
-            callback();
+            notifyActivation('controllerchange');
         });
+
+        serviceWorkerActivationListenersInstalled = true;
     }
+
+    return () => {
+        serviceWorkerActivationCallbacks.delete(callback);
+    };
 }
 
 // Export default

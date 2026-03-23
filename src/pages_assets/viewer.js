@@ -26,7 +26,7 @@ import { createRouter, getRouter, parseSearchParams, buildConversationPath } fro
 import { getConversationLink, copyConversationLink, isWebShareAvailable, shareConversation } from './share.js';
 import { initStats, renderStatsDashboard, clearStatsCache } from './stats.js';
 import { initStorage, StorageKeys } from './storage.js';
-import { initSettings, render as renderSettings } from './settings.js';
+import { initSettings, render as renderSettings, cleanupSettings } from './settings.js';
 
 // Application state
 const state = {
@@ -42,6 +42,7 @@ let router = null;
 let storageReady = null;
 let settingsReady = false;
 let waitingForDatabaseReady = false;
+let viewerLifecycleEpoch = 0;
 
 // DOM element references
 let elements = {
@@ -118,6 +119,8 @@ function handleDatabaseReady(event) {
  * Initialize views after database is ready
  */
 function initializeViews() {
+    const lifecycleEpoch = ++viewerLifecycleEpoch;
+
     // Clear loading state
     elements.appContent.innerHTML = '';
 
@@ -135,6 +138,9 @@ function initializeViews() {
         console.warn('[Viewer] Storage init failed:', error);
     });
     storageReady.then(() => {
+        if (!state.initialized || lifecycleEpoch !== viewerLifecycleEpoch) {
+            return;
+        }
         initSettings(elements.settingsView, {
             onSessionReset: handleSessionReset,
         });
@@ -264,6 +270,19 @@ function handleRouteChange(route) {
     console.debug('[Viewer] Route change:', route);
 
     const { view, params, query } = route;
+    const leavingConversation = state.view === 'conversation' && view !== 'conversation';
+    const leavingSearch = state.view === 'search' && view !== 'search';
+    const leavingStats = state.view === 'stats' && view !== 'stats';
+
+    if (leavingConversation) {
+        clearViewer();
+    }
+    if (leavingSearch) {
+        clearSearch({ reloadRecent: false });
+    }
+    if (leavingStats) {
+        clearStatsCache();
+    }
 
     switch (view) {
         case 'search':
@@ -481,7 +500,7 @@ function displayStats() {
 function renderSettingsPanel() {
     if (storageReady) {
         storageReady.then(() => {
-            if (settingsReady) {
+            if (settingsReady && state.initialized && state.view === 'settings') {
                 renderSettings();
             }
         });
@@ -713,6 +732,8 @@ function escapeHtml(text) {
  * Clean up resources
  */
 export function cleanup() {
+    viewerLifecycleEpoch += 1;
+
     // Destroy router
     if (router) {
         router.destroy();
@@ -726,6 +747,7 @@ export function cleanup() {
     settingsReady = false;
     state.initialized = false;
 
+    cleanupSettings();
     closeDatabase();
     clearSearch({ reloadRecent: false });
     cleanupConversationViewer();

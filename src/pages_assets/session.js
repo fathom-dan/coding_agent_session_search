@@ -93,6 +93,7 @@ export class SessionManager {
         this.expiryTimeout = null;    // Expiry timer
         this.warningTimeout = null;   // Warning timer
         this.memoryStorage = new MemoryStorage();
+        this.cleanupHandlersInstalled = false;
 
         // Bind methods for event handlers
         this.handleVisibilityChange = this.handleVisibilityChange.bind(this);
@@ -314,16 +315,24 @@ export class SessionManager {
      * Set up cleanup handlers for page visibility and unload
      */
     setupCleanupHandlers() {
+        if (this.cleanupHandlersInstalled) {
+            return;
+        }
         document.addEventListener('visibilitychange', this.handleVisibilityChange);
         window.addEventListener('beforeunload', this.handleBeforeUnload);
+        this.cleanupHandlersInstalled = true;
     }
 
     /**
      * Remove cleanup handlers
      */
     removeCleanupHandlers() {
+        if (!this.cleanupHandlersInstalled) {
+            return;
+        }
         document.removeEventListener('visibilitychange', this.handleVisibilityChange);
         window.removeEventListener('beforeunload', this.handleBeforeUnload);
+        this.cleanupHandlersInstalled = false;
     }
 
     /**

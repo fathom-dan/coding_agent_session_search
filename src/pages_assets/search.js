@@ -40,6 +40,7 @@ let currentPage = 0;
 let searchTimeout = null;
 let onResultSelect = null;
 let virtualList = null; // Virtual list instance for large result sets
+let searchEpoch = 0;
 
 // DOM element references
 let elements = {
@@ -55,6 +56,10 @@ let elements = {
     resultCount: null,
     noResults: null,
 };
+
+function isCurrentSearchEpoch(epoch) {
+    return epoch === searchEpoch;
+}
 
 /**
  * Initialize the search UI
@@ -406,6 +411,7 @@ function updateTimeFilter(value) {
  * Handle search query
  */
 async function handleSearch(query) {
+    const epoch = ++searchEpoch;
     currentQuery = query.trim();
     currentPage = 0;
 
@@ -414,23 +420,29 @@ async function handleSearch(query) {
     try {
         if (!currentQuery) {
             // Empty query - show recent conversations
-            await loadRecentConversations();
+            await loadRecentConversations(epoch);
         } else {
             // FTS5 search
-            await performSearch();
+            await performSearch(epoch);
         }
     } catch (error) {
+        if (!isCurrentSearchEpoch(epoch)) {
+            return;
+        }
         console.error('[Search] Search error:', error);
         showError('Search failed. Please try again.');
     }
 
+    if (!isCurrentSearchEpoch(epoch)) {
+        return;
+    }
     hideLoading();
 }
 
 /**
  * Perform FTS5 search
  */
-async function performSearch() {
+async function performSearch(epoch) {
     const options = {
         limit: SEARCH_CONFIG.PAGE_SIZE,
         offset: currentPage * SEARCH_CONFIG.PAGE_SIZE,
@@ -454,13 +466,17 @@ async function performSearch() {
         });
     }
 
+    if (!isCurrentSearchEpoch(epoch)) {
+        return;
+    }
+
     renderResults();
 }
 
 /**
  * Load recent conversations (no search query)
  */
-async function loadRecentConversations() {
+async function loadRecentConversations(epoch) {
     try {
         let results;
 
@@ -486,8 +502,15 @@ async function loadRecentConversations() {
             rank: 0,
         }));
 
+        if (!isCurrentSearchEpoch(epoch)) {
+            return;
+        }
+
         renderResults();
     } catch (error) {
+        if (!isCurrentSearchEpoch(epoch)) {
+            return;
+        }
         console.error('[Search] Failed to load recent:', error);
         showError('Failed to load conversations');
     }
@@ -689,20 +712,23 @@ function updateResultCount() {
     elements.resultCount.textContent = message;
 
     // Announce to screen readers
-    announceToScreenReader(message);
+    announceToScreenReader(message, searchEpoch);
 }
 
 /**
  * Announce message to screen readers via the live region
  * @param {string} message - Message to announce
  */
-function announceToScreenReader(message) {
+function announceToScreenReader(message, epoch = searchEpoch) {
     const announcer = document.getElementById('search-announcer');
     if (announcer) {
         // Clear and set to trigger announcement
         announcer.textContent = '';
         // Use setTimeout to ensure the clear is processed first
         setTimeout(() => {
+            if (!isCurrentSearchEpoch(epoch)) {
+                return;
+            }
             announcer.textContent = message;
         }, 50);
     }
@@ -851,6 +877,7 @@ export function clearSearch(options = {}) {
     const { reloadRecent = true } = options;
 
     clearTimeout(searchTimeout);
+    searchEpoch += 1;
     currentQuery = '';
     currentFilters = { agent: null, since: null, until: null };
     currentSearchMode = 'auto';
@@ -872,6 +899,10 @@ export function clearSearch(options = {}) {
     }
     if (elements.searchModeIndicator) {
         elements.searchModeIndicator.classList.add('hidden');
+    }
+    const announcer = document.getElementById('search-announcer');
+    if (announcer) {
+        announcer.textContent = '';
     }
 
     // Reset search mode toggle
