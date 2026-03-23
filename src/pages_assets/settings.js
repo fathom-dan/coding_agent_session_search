@@ -416,7 +416,12 @@ async function handleOPFSToggle(e) {
     } else {
         // Switching away from OPFS - clear it first
         try {
-            await clearOPFS();
+            const opfsCleared = await clearOPFS();
+            if (!opfsCleared) {
+                showNotification('Failed to disable OPFS caching because cached files could not be fully cleared', 'error');
+                render();
+                return;
+            }
             setOpfsEnabled(false);
             showNotification('OPFS caching disabled and cleared', 'success');
         } catch (err) {
@@ -438,7 +443,12 @@ async function handleClearCurrentStorage() {
     if (!confirmed) return;
 
     try {
-        await clearCurrentStorage();
+        const storageCleared = await clearCurrentStorage();
+        if (!storageCleared) {
+            showNotification('Failed to clear current storage', 'error');
+            return;
+        }
+
         if (mode === StorageMode.MEMORY && onSessionReset) {
             onSessionReset('clear-current-storage');
             showNotification('Current memory storage cleared and session locked', 'success');
@@ -465,7 +475,12 @@ async function handleClearOPFS() {
     if (!confirmed) return;
 
     try {
-        await clearOPFS();
+        const opfsCleared = await clearOPFS();
+        if (!opfsCleared) {
+            showNotification('Failed to clear OPFS cache', 'error');
+            return;
+        }
+
         showNotification('OPFS cache cleared', 'success');
         render();
     } catch (err) {
@@ -513,7 +528,7 @@ async function handleClearAll() {
     if (!confirmed) return;
 
     try {
-        await clearAllStorage();
+        const storageCleared = await clearAllStorage();
         await setStorageMode(StorageMode.MEMORY);
         setOpfsEnabled(false);
         window.dispatchEvent(new CustomEvent('cass:session-mode-change', { detail: { mode: StorageMode.MEMORY } }));
@@ -522,8 +537,16 @@ async function handleClearAll() {
         }
 
         const cacheCleared = await clearServiceWorkerCache();
-        if (!cacheCleared) {
-            showNotification('Archive data cleared and session locked, but Service Worker cache could not be cleared', 'error');
+        if (!storageCleared || !cacheCleared) {
+            const failedSteps = [];
+            if (!storageCleared) {
+                failedSteps.push('stored data');
+            }
+            if (!cacheCleared) {
+                failedSteps.push('Service Worker cache');
+            }
+
+            showNotification(`Archive data cleared and session locked, but ${failedSteps.join(' and ')} could not be fully cleared`, 'error');
             return;
         }
 
@@ -568,15 +591,18 @@ async function handleResetSession() {
     if (!confirmed) return;
 
     try {
-        await clearAllStorage();
+        const storageCleared = await clearAllStorage();
         if (onSessionReset) {
             onSessionReset('reset');
         }
 
         const cacheCleared = await clearServiceWorkerCache();
         const swUnregistered = await unregisterServiceWorker();
-        if (!cacheCleared || !swUnregistered) {
+        if (!storageCleared || !cacheCleared || !swUnregistered) {
             const failedSteps = [];
+            if (!storageCleared) {
+                failedSteps.push('stored data');
+            }
             if (!cacheCleared) {
                 failedSteps.push('Service Worker cache');
             }
@@ -584,7 +610,7 @@ async function handleResetSession() {
                 failedSteps.push('Service Worker registration');
             }
 
-            showNotification(`Archive data cleared and session locked, but ${failedSteps.join(' and ')} could not be reset`, 'error');
+            showNotification(`Archive data cleared and session locked, but ${failedSteps.join(' and ')} could not be fully reset`, 'error');
             return;
         }
 

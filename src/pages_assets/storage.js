@@ -681,6 +681,7 @@ export async function clearCurrentStorage() {
     const archiveDataPrefix = getArchiveDataPrefix();
     const currentSessionKeys = getCurrentArchiveSessionKeys();
     const currentTofuKey = getCurrentArchiveTofuKey();
+    let cleared = true;
 
     // Writes in session/local modes can fall back to memoryStore if the browser
     // rejects storage access. Clear that archive-scoped fallback copy too.
@@ -715,9 +716,11 @@ export async function clearCurrentStorage() {
             break;
 
         case StorageMode.OPFS:
-            await clearOPFS();
+            cleared = await clearOPFS();
             break;
     }
+
+    return cleared;
 }
 
 /**
@@ -727,10 +730,11 @@ export async function clearOPFS(options = {}) {
     const { allArchives = false } = options;
 
     if (!isOPFSAvailable()) {
-        return;
+        return true;
     }
 
     try {
+        let cleared = true;
         const root = await navigator.storage.getDirectory();
         const currentArchiveDbFiles = new Set(getArchiveOpfsDbFiles());
         const archiveDataPrefix = getArchiveDataPrefix();
@@ -754,12 +758,15 @@ export async function clearOPFS(options = {}) {
                 await root.removeEntry(entry);
             } catch (e) {
                 console.warn('[Storage] Failed to delete OPFS entry:', entry, e);
+                cleared = false;
             }
         }
 
         console.log('[Storage] OPFS cleared:', entries.length, 'entries');
+        return cleared;
     } catch (e) {
         console.error('[Storage] OPFS clear failed:', e);
+        return false;
     }
 }
 
@@ -818,9 +825,10 @@ export async function clearAllStorage(options = {}) {
     }
 
     // Clear OPFS
-    await clearOPFS({ allArchives });
+    const opfsCleared = await clearOPFS({ allArchives });
 
     console.log('[Storage] All storage cleared');
+    return opfsCleared;
 }
 
 /**
