@@ -77,6 +77,47 @@ function parseResultSelection(card) {
     return { conversationId, messageId };
 }
 
+function parseResultIndex(card) {
+    const rawIndex = card?.dataset?.resultIndex ?? '';
+    if (!/^\d+$/.test(rawIndex)) {
+        return null;
+    }
+
+    const index = Number.parseInt(rawIndex, 10);
+    if (!Number.isSafeInteger(index) || index < 0 || index >= currentResults.length) {
+        return null;
+    }
+
+    return index;
+}
+
+function findRenderedResultCard(index) {
+    if (!elements.resultsList || !Number.isSafeInteger(index) || index < 0) {
+        return null;
+    }
+
+    return elements.resultsList.querySelector(`.result-card[data-result-index="${index}"]`);
+}
+
+function focusResultCardAtIndex(index, align = 'start') {
+    if (!Number.isSafeInteger(index) || index < 0 || index >= currentResults.length) {
+        return false;
+    }
+
+    let card = findRenderedResultCard(index);
+    if (!card && virtualList) {
+        virtualList.scrollToIndex(index, align);
+        card = findRenderedResultCard(index);
+    }
+
+    if (!card) {
+        return false;
+    }
+
+    card.focus();
+    return true;
+}
+
 export function buildResultCardId(result, index = 0) {
     const conversationId = String(result?.conversation_id ?? 'unknown');
     const messageId = result?.message_id;
@@ -284,28 +325,28 @@ function setupEventListeners() {
             case 'ArrowDown':
                 e.preventDefault();
                 if (isResultCard) {
-                    // Move to next result
-                    const next = focused.nextElementSibling;
-                    if (next?.classList.contains('result-card')) {
-                        next.focus();
+                    const currentIndex = parseResultIndex(focused);
+                    if (currentIndex !== null) {
+                        focusResultCardAtIndex(currentIndex + 1, 'end');
                     }
                 } else {
-                    // Focus first result
-                    const first = elements.resultsList.querySelector('.result-card');
-                    first?.focus();
+                    focusResultCardAtIndex(0, 'start');
                 }
                 break;
 
             case 'ArrowUp':
                 e.preventDefault();
                 if (isResultCard) {
-                    // Move to previous result
-                    const prev = focused.previousElementSibling;
-                    if (prev?.classList.contains('result-card')) {
-                        prev.focus();
-                    } else {
+                    const currentIndex = parseResultIndex(focused);
+                    if (currentIndex === null) {
+                        break;
+                    }
+
+                    if (currentIndex === 0) {
                         // Move focus back to search input
                         elements.searchInput?.focus();
+                    } else {
+                        focusResultCardAtIndex(currentIndex - 1, 'start');
                     }
                 }
                 break;
@@ -313,16 +354,14 @@ function setupEventListeners() {
             case 'Home':
                 if (isResultCard) {
                     e.preventDefault();
-                    const first = elements.resultsList.querySelector('.result-card');
-                    first?.focus();
+                    focusResultCardAtIndex(0, 'start');
                 }
                 break;
 
             case 'End':
                 if (isResultCard) {
                     e.preventDefault();
-                    const cards = elements.resultsList.querySelectorAll('.result-card');
-                    cards[cards.length - 1]?.focus();
+                    focusResultCardAtIndex(currentResults.length - 1, 'end');
                 }
                 break;
         }
@@ -332,8 +371,7 @@ function setupEventListeners() {
     elements.searchInput?.addEventListener('keydown', (e) => {
         if (e.key === 'ArrowDown') {
             e.preventDefault();
-            const first = elements.resultsList.querySelector('.result-card');
-            first?.focus();
+            focusResultCardAtIndex(0, 'start');
         }
     });
 }
@@ -633,6 +671,7 @@ function createResultCard(result, index) {
     article.className = 'result-card';
     article.dataset.conversationId = result.conversation_id;
     article.dataset.messageId = result.message_id || '';
+    article.dataset.resultIndex = String(index);
     article.tabIndex = 0;
     article.setAttribute('role', 'option');
     article.setAttribute('aria-selected', 'false');
@@ -680,6 +719,7 @@ function createResultCardHtml(result, index) {
             id="${buildResultCardId(result, index)}"
             data-conversation-id="${result.conversation_id}"
             data-message-id="${result.message_id || ''}"
+            data-result-index="${index}"
             tabindex="0"
             role="option"
             aria-selected="false"

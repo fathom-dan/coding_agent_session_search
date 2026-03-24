@@ -885,6 +885,109 @@ mod tests {
     }
 
     #[test]
+    fn test_virtual_list_scroll_to_index_renders_target_range_immediately() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                class MockElement {
+                    constructor() {
+                        this.style = {};
+                        this.dataset = {};
+                        this.children = [];
+                        this.listeners = new Map();
+                        this.clientHeight = 160;
+                        this.scrollTop = 0;
+                        this.innerHTML = '';
+                        this.isConnected = true;
+                        this.className = '';
+                        this.focused = false;
+                    }
+
+                    appendChild(child) {
+                        this.children.push(child);
+                        child.parentElement = this;
+                        child.isConnected = true;
+                        return child;
+                    }
+
+                    remove() {
+                        this.isConnected = false;
+                        if (this.parentElement) {
+                            this.parentElement.children = this.parentElement.children.filter((child) => child !== this);
+                        }
+                    }
+
+                    addEventListener(type, handler) {
+                        this.listeners.set(type, handler);
+                    }
+
+                    removeEventListener(type, handler) {
+                        if (this.listeners.get(type) === handler) {
+                            this.listeners.delete(type);
+                        }
+                    }
+                }
+
+                const originalDocument = globalThis.document;
+                const originalResizeObserver = globalThis.ResizeObserver;
+                const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
+
+                globalThis.document = {
+                    createElement() {
+                        return new MockElement();
+                    },
+                };
+                globalThis.ResizeObserver = class {
+                    constructor(callback) {
+                        this.callback = callback;
+                    }
+                    observe() {}
+                    disconnect() {}
+                };
+                globalThis.requestAnimationFrame = (callback) => {
+                    callback();
+                    return 1;
+                };
+
+                try {
+                    const { VirtualList } = await import('./src/pages_assets/virtual-list.js');
+
+                    const container = new MockElement();
+                    const list = new VirtualList({
+                        container,
+                        itemHeight: 40,
+                        totalCount: 100,
+                        renderItem: (index) => {
+                            const element = new MockElement();
+                            element.dataset.resultIndex = String(index);
+                            return element;
+                        },
+                        overscan: 1,
+                    });
+
+                    if (!list.items.has(0)) {
+                        throw new Error('expected initial render to include the first item');
+                    }
+                    if (list.items.has(50)) {
+                        throw new Error('did not expect target item to be rendered before programmatic scroll');
+                    }
+
+                    list.scrollToIndex(50, 'center');
+
+                    if (!list.items.has(50)) {
+                        throw new Error('expected scrollToIndex to render the target item immediately');
+                    }
+
+                    list.destroy();
+                } finally {
+                    globalThis.document = originalDocument;
+                    globalThis.ResizeObserver = originalResizeObserver;
+                    globalThis.requestAnimationFrame = originalRequestAnimationFrame;
+                }
+            "#,
+        )
+    }
+
+    #[test]
     fn test_auth_qr_scanner_cancel_invalidates_pending_start_and_clears_dom() {
         let auth_js = include_str!("../src/pages_assets/auth.js");
         assert!(
@@ -1155,6 +1258,28 @@ mod tests {
                 && conversation_js.contains("state.ready = false;")
                 && conversation_js.contains("state.available = false;"),
             "conversation attachment readiness should only become terminal after a successful or absent manifest load, not after a transient manifest failure"
+        );
+    }
+
+    #[test]
+    fn test_search_keyboard_navigation_tracks_logical_result_indices() {
+        let search_js = include_str!("../src/pages_assets/search.js");
+        assert!(
+            search_js.contains("function focusResultCardAtIndex(index, align = 'start') {")
+                && search_js.contains("virtualList.scrollToIndex(index, align);")
+                && search_js.contains("return elements.resultsList.querySelector(`.result-card[data-result-index=\"${index}\"]`);"),
+            "search keyboard navigation should resolve result focus by logical index so virtualized results beyond the current DOM window stay reachable"
+        );
+        assert!(
+            search_js.contains("data-result-index=\"${index}\"")
+                && search_js.contains("article.dataset.resultIndex = String(index);"),
+            "both direct and virtual result cards should expose a stable logical index for keyboard navigation"
+        );
+        assert!(
+            search_js.contains("focusResultCardAtIndex(currentIndex + 1, 'end');")
+                && search_js.contains("focusResultCardAtIndex(currentIndex - 1, 'start');")
+                && search_js.contains("focusResultCardAtIndex(currentResults.length - 1, 'end');"),
+            "Arrow/Home/End navigation should move by logical result index instead of only among currently rendered siblings"
         );
     }
 

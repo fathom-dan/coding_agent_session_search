@@ -242,6 +242,8 @@ export class VirtualList {
         }
 
         this.container.scrollTop = Math.max(0, targetTop);
+        this.scrollTop = this.container.scrollTop;
+        this._render();
     }
 
     /**
@@ -597,6 +599,8 @@ export class VariableHeightVirtualList {
         }
 
         this.container.scrollTop = Math.max(0, targetTop);
+        this.scrollTop = this.container.scrollTop;
+        this._render();
     }
 
     /**
