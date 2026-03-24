@@ -680,6 +680,21 @@ function clearCurrentArchivePreferenceKeys(options = {}) {
     }
 }
 
+function clearCurrentArchiveSessionState(currentSessionKeys, currentTofuKey) {
+    const sessionStorageBackend = tryGetSessionStorage();
+    if (sessionStorageBackend) {
+        removeStorageEntries(sessionStorageBackend, (key) => currentSessionKeys.has(key));
+    }
+
+    const localStorageBackend = tryGetLocalStorage();
+    if (localStorageBackend) {
+        removeStorageEntries(localStorageBackend, (key) => (
+            currentSessionKeys.has(key)
+            || key === currentTofuKey
+        ));
+    }
+}
+
 /**
  * Clear all cass storage in current mode
  */
@@ -693,6 +708,7 @@ export async function clearCurrentStorage() {
     // Writes in session/local modes can fall back to memoryStore if the browser
     // rejects storage access. Clear that archive-scoped fallback copy too.
     removeMapEntriesWithPrefix(memoryStore, archiveDataPrefix);
+    clearCurrentArchiveSessionState(currentSessionKeys, currentTofuKey);
 
     switch (currentMode) {
         case StorageMode.MEMORY:
@@ -702,9 +718,7 @@ export async function clearCurrentStorage() {
             {
                 const storage = tryGetSessionStorage();
                 if (storage) {
-                    removeStorageEntries(storage, (key) =>
-                        key.startsWith(archiveDataPrefix) || currentSessionKeys.has(key)
-                    );
+                    removeStorageEntries(storage, (key) => key.startsWith(archiveDataPrefix));
                 }
             }
             break;
@@ -713,11 +727,7 @@ export async function clearCurrentStorage() {
             {
                 const storage = tryGetLocalStorage();
                 if (storage) {
-                    removeStorageEntries(storage, (key) =>
-                        key.startsWith(archiveDataPrefix)
-                        || currentSessionKeys.has(key)
-                        || key === currentTofuKey
-                    );
+                    removeStorageEntries(storage, (key) => key.startsWith(archiveDataPrefix));
                 }
             }
             break;
