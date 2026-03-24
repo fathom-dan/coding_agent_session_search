@@ -585,7 +585,7 @@ fn infer_agent_type(path: &str) -> String {
         "cursor".to_string()
     } else if path.contains(".gemini") {
         "gemini".to_string()
-    } else if path.contains(".pi") {
+    } else if path.contains("/.pi/") || path.ends_with("/.pi") {
         "pi_agent".to_string()
     } else if path.contains(".aider") {
         "aider".to_string()
@@ -600,7 +600,7 @@ fn infer_agent_type(path: &str) -> String {
         "copilot".to_string()
     } else if path.contains(".continue") {
         "continue".to_string()
-    } else if path.contains("sourcegraph.amp") || path.contains("/amp") {
+    } else if path.contains("sourcegraph.amp") || path.contains("/amp/") || path.ends_with("/amp") {
         "amp".to_string()
     } else if path.contains(".clawdbot") {
         "clawdbot".to_string()
