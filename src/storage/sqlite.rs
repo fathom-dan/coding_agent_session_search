@@ -2064,19 +2064,15 @@ const MIGRATION_NAMES: [(i64, &str); 14] = [
 ///   let `MigrationRunner` handle it
 /// - If `schema_version = 0` but tables exist → corrupted state, log warning
 fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
-    // Check if _schema_migrations already exists → already transitioned.
-    let rows = conn
-        .query("SELECT name FROM sqlite_master WHERE type='table' AND name='_schema_migrations';")
-        .with_context(|| "checking for _schema_migrations table")?;
-    if !rows.is_empty() {
+    // Avoid sqlite_master enumeration here. Databases with FTS virtual tables
+    // can trigger frankensqlite parse-recovery on sqlite_master reads, which is
+    // enough to break the transition on otherwise-healthy legacy cass DBs.
+    if conn.query("SELECT version FROM \"_schema_migrations\";").is_ok() {
         return Ok(());
     }
 
     // Check if the meta table exists.
-    let rows = conn
-        .query("SELECT name FROM sqlite_master WHERE type='table' AND name='meta';")
-        .with_context(|| "checking for meta table")?;
-    if rows.is_empty() {
+    if conn.query("SELECT key FROM meta;").is_err() {
         // No meta table → fresh database, let MigrationRunner handle it.
         return Ok(());
     }
@@ -2094,11 +2090,7 @@ fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
 
     if current_version == 0 {
         // Check if tables actually exist (corrupted state: tables present but version=0).
-        let rows = conn
-            .query("SELECT name FROM sqlite_master WHERE type='table' AND name='conversations';")
-            .with_context(|| "checking for conversations table")?;
-
-        if rows.is_empty() {
+        if conn.query("SELECT id FROM conversations LIMIT 1;").is_err() {
             // Truly fresh DB (meta table exists but empty/reset). Let MigrationRunner handle it.
             return Ok(());
         }
@@ -7876,6 +7868,107 @@ mod tests {
             res.is_err(),
             "transition should not create _schema_migrations on fresh DB"
         );
+    }
+
+    #[test]
+    fn franken_transition_with_fts_virtual_table_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_transition_with_fts.db");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '13');
+             CREATE TABLE conversations (id INTEGER PRIMARY KEY);
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                 content,
+                 title,
+                 agent,
+                 workspace,
+                 source_path,
+                 created_at,
+                 content='',
+                 tokenize='porter unicode61'
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = FrankenConnection::open(db_path.to_string_lossy().to_string()).unwrap();
+        transition_from_meta_version(&conn).unwrap();
+
+        let rows = conn
+            .query("SELECT version FROM _schema_migrations ORDER BY version;")
+            .unwrap();
+        let versions: Vec<i64> = rows.iter().filter_map(|r| r.get_typed(0).ok()).collect();
+        assert_eq!(versions, (1..=13).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn franken_storage_open_legacy_v13_with_fts_virtual_table_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_open_legacy_v13_with_fts.db");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '13');
+             CREATE TABLE agents (
+                 id INTEGER PRIMARY KEY,
+                 slug TEXT NOT NULL
+             );
+             CREATE TABLE workspaces (
+                 id INTEGER PRIMARY KEY,
+                 path TEXT NOT NULL
+             );
+             CREATE TABLE conversations (
+                 id INTEGER PRIMARY KEY,
+                 agent_id INTEGER NOT NULL,
+                 workspace_id INTEGER,
+                 title TEXT,
+                 source_path TEXT NOT NULL
+             );
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY,
+                 conversation_id INTEGER NOT NULL,
+                 idx INTEGER NOT NULL,
+                 role TEXT NOT NULL,
+                 author TEXT,
+                 created_at INTEGER,
+                 content TEXT NOT NULL,
+                 extra_json TEXT,
+                 extra_bin BLOB
+             );
+             INSERT INTO agents(id, slug) VALUES (1, 'codex');
+             INSERT INTO workspaces(id, path) VALUES (1, '/data/projects/coding_agent_session_search');
+             INSERT INTO conversations(id, agent_id, workspace_id, title, source_path)
+             VALUES (1, 1, 1, 'legacy session', '/tmp/legacy.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content)
+             VALUES (1, 1, 0, 'user', 'tester', 1710000000000, 'legacy content');
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                 content,
+                 title,
+                 agent,
+                 workspace,
+                 source_path,
+                 created_at,
+                 message_id,
+                 content='',
+                 tokenize='porter unicode61'
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+
+        let rows = storage
+            .raw()
+            .query("SELECT version FROM _schema_migrations ORDER BY version;")
+            .unwrap();
+        let versions: Vec<i64> = rows.iter().filter_map(|r| r.get_typed(0).ok()).collect();
+        assert_eq!(versions, (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>());
     }
 
     #[test]
