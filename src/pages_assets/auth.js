@@ -27,6 +27,8 @@ let nextWorkerRequestId = 1;
 let activeAppInitToken = 0;
 let qrLibraryLoadPromise = null;
 let qrScannerTeardownPromise = null;
+let activeSessionExpiryTs = 0;
+let activeSessionExpiryTimerId = null;
 const LEGACY_SESSION_KEYS = {
     DEK: 'cass_session_dek',
     EXPIRY: 'cass_session_expiry',
@@ -167,7 +169,7 @@ function setupEventListeners() {
         }
 
         if (window.cassSession?.dek) {
-            persistSession(window.cassSession.dek);
+            persistSession(window.cassSession.dek, activeSessionExpiryTs);
         }
     });
 
@@ -177,6 +179,8 @@ function setupEventListeners() {
             void closeQrScanner();
         }
     });
+
+    document.addEventListener('visibilitychange', handleSessionVisibilityChange);
 }
 
 function allocateWorkerRequestId() {
@@ -217,6 +221,63 @@ function clearWorkerKeys() {
     } catch (error) {
         console.warn('Failed to clear worker keys:', error);
     }
+}
+
+function clearActiveSessionExpiryTimer() {
+    if (activeSessionExpiryTimerId !== null) {
+        clearTimeout(activeSessionExpiryTimerId);
+        activeSessionExpiryTimerId = null;
+    }
+}
+
+function clearActiveSessionExpiry() {
+    clearActiveSessionExpiryTimer();
+    activeSessionExpiryTs = 0;
+}
+
+async function expireActiveSession() {
+    if (!window.cassSession?.dek) {
+        clearActiveSessionExpiry();
+        return;
+    }
+
+    await lockArchive({ broadcast: true, action: 'expired' });
+    showError('Your session expired. Please unlock the archive again.');
+}
+
+function scheduleActiveSessionExpiry(expiryTs) {
+    clearActiveSessionExpiryTimer();
+
+    const numericExpiry = Number(expiryTs);
+    if (!Number.isFinite(numericExpiry) || numericExpiry <= 0) {
+        activeSessionExpiryTs = 0;
+        return;
+    }
+
+    activeSessionExpiryTs = Math.trunc(numericExpiry);
+    const remainingMs = activeSessionExpiryTs - Date.now();
+    if (remainingMs <= 0) {
+        void expireActiveSession();
+        return;
+    }
+
+    activeSessionExpiryTimerId = window.setTimeout(() => {
+        activeSessionExpiryTimerId = null;
+        void expireActiveSession();
+    }, remainingMs);
+}
+
+function handleSessionVisibilityChange() {
+    if (document.hidden || activeSessionExpiryTs <= 0) {
+        return;
+    }
+
+    if (Date.now() >= activeSessionExpiryTs) {
+        void expireActiveSession();
+        return;
+    }
+
+    scheduleActiveSessionExpiry(activeSessionExpiryTs);
 }
 
 function broadcastAuthLock(action = 'lock') {
@@ -768,6 +829,7 @@ async function handleWorkerError(error) {
     await closeQrScanner();
     activeUnlockRequestId = null;
     activeDecryptRequestId = null;
+    clearActiveSessionExpiry();
     clearWorkerKeys();
     clearStoredSession();
     window.cassSession = null;
@@ -895,6 +957,7 @@ function handleDecryptFailed(data) {
     enableForm();
     elements.appScreen.classList.add('hidden');
     elements.authScreen.classList.remove('hidden');
+    clearActiveSessionExpiry();
     clearWorkerKeys();
     clearStoredSession();
     window.cassSession = null;
@@ -925,6 +988,7 @@ async function recoverFromAppInitFailure(message, error, initToken = activeAppIn
     await closeQrScanner();
     activeUnlockRequestId = null;
     activeDecryptRequestId = null;
+    clearActiveSessionExpiry();
     clearWorkerKeys();
     clearStoredSession();
     window.cassSession = null;
@@ -1142,6 +1206,7 @@ async function lockArchive(options = {}) {
     await closeQrScanner();
     activeUnlockRequestId = null;
     activeDecryptRequestId = null;
+    clearActiveSessionExpiry();
 
     // Clear session
     window.cassSession = null;
@@ -1269,7 +1334,12 @@ function getSessionStorage(mode) {
     return null;
 }
 
-function persistSession(dekBase64) {
+function persistSession(dekBase64, expiryTs = activeSessionExpiryTs) {
+    const expiry = Number.isFinite(Number(expiryTs)) && Number(expiryTs) > Date.now()
+        ? Math.trunc(Number(expiryTs))
+        : Date.now() + SESSION_CONFIG.DEFAULT_DURATION_MS;
+    scheduleActiveSessionExpiry(expiry);
+
     const mode = getPreferredSessionMode();
     // Remove stale copies from previously selected backends before persisting.
     clearStoredSession();
@@ -1279,7 +1349,6 @@ function persistSession(dekBase64) {
         return;
     }
 
-    const expiry = Date.now() + SESSION_CONFIG.DEFAULT_DURATION_MS;
     const sessionKeys = getSessionKeys();
     try {
         storage.setItem(sessionKeys.DEK, dekBase64);
@@ -1318,6 +1387,7 @@ function restoreSession() {
             dek: dekStored,
             config: config,
         };
+        scheduleActiveSessionExpiry(expiry);
         return true;
     } catch (e) {
         clearStoredSession();

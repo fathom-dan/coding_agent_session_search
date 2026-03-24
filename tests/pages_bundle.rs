@@ -1116,6 +1116,37 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_live_session_expiry_is_enforced_without_extending_on_mode_change() {
+        let auth_js = include_str!("../src/pages_assets/auth.js");
+        assert!(
+            auth_js.contains("let activeSessionExpiryTs = 0;")
+                && auth_js.contains("let activeSessionExpiryTimerId = null;")
+                && auth_js.contains(
+                    "document.addEventListener('visibilitychange', handleSessionVisibilityChange);"
+                ),
+            "auth should track active session expiry in memory and recheck it when the page becomes visible again"
+        );
+        assert!(
+            auth_js.contains("persistSession(window.cassSession.dek, activeSessionExpiryTs);")
+                && auth_js.contains(
+                    "function persistSession(dekBase64, expiryTs = activeSessionExpiryTs) {"
+                ),
+            "changing storage backends during an unlocked session should preserve the existing expiry instead of silently extending it"
+        );
+        assert!(
+            auth_js.contains("scheduleActiveSessionExpiry(expiry);")
+                && auth_js.contains(
+                    "showError('Your session expired. Please unlock the archive again.');"
+                ),
+            "auth should actively enforce live session expiry instead of only checking expiry on page reload"
+        );
+        assert!(
+            auth_js.matches("clearActiveSessionExpiry();").count() >= 4,
+            "auth lock and failure paths should clear the in-memory expiry timer so stale expirations cannot fire later"
+        );
+    }
+
+    #[test]
     fn test_conversation_load_has_error_boundary_for_render_failures() {
         let conversation_js = include_str!("../src/pages_assets/conversation.js");
         assert!(
