@@ -515,6 +515,13 @@ impl<'a> StreamingBatchSender<'a> {
         self.message_count += message_count;
         self.char_count += char_count;
         self.conversations.push(conversation);
+
+        let single_conversation_exceeds_limits = self.conversations.len() == 1
+            && (self.message_count > DEFAULT_STREAMING_BATCH_LIMITS.max_messages
+                || self.char_count > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
+        if single_conversation_exceeds_limits {
+            self.flush();
+        }
     }
 
     fn flush(&mut self) {
@@ -644,6 +651,10 @@ fn spawn_connector_producer(
                         root = %root.path.display(),
                         "remote scan failed: {}", e
                     );
+                    let _ = tx.send(IndexMessage::ScanError {
+                        connector_name: name,
+                        error: format!("remote scan failed for {}: {}", root.path.display(), e),
+                    });
                 }
             }
         }
@@ -867,7 +878,21 @@ fn run_streaming_index(
     remote_roots: Vec<ScanRoot>,
 ) -> Result<()> {
     let connector_factories = get_connector_factories();
+    let buffered_connectors: Vec<&'static str> = connector_factories
+        .iter()
+        .filter_map(|(name, factory)| {
+            let connector = factory();
+            (!connector.supports_streaming_scan()).then_some(*name)
+        })
+        .collect();
     let num_connectors = connector_factories.len();
+
+    if !buffered_connectors.is_empty() {
+        tracing::warn!(
+            connectors = ?buffered_connectors,
+            "streaming index still has buffered connectors that do not implement callback streaming"
+        );
+    }
 
     // Set up progress tracking
     if let Some(p) = &opts.progress {
@@ -3312,7 +3337,9 @@ pub mod persist {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::{NormalizedConversation, NormalizedMessage};
+    use crate::connectors::{
+        Connector, DetectionResult, NormalizedConversation, NormalizedMessage,
+    };
     use crate::sources::provenance::SourceKind;
     use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
     use serial_test::serial;
@@ -3390,6 +3417,41 @@ mod tests {
         }
     }
 
+    struct DetectedRemoteFailureConnector;
+
+    impl Connector for DetectedRemoteFailureConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult {
+                detected: true,
+                evidence: vec!["fixture".to_string()],
+                root_paths: Vec::new(),
+            }
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(Vec::new())
+        }
+
+        fn scan_with_callback(
+            &self,
+            ctx: &crate::connectors::ScanContext,
+            _on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            if ctx.scan_roots.is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("remote exploded"))
+            }
+        }
+    }
+
+    fn detected_remote_failure_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(DetectedRemoteFailureConnector)
+    }
+
     #[test]
     fn next_streaming_batch_splits_large_message_batches() {
         let limits = StreamingBatchLimits {
@@ -3465,6 +3527,47 @@ mod tests {
         assert_eq!(batch2[0].external_id.as_deref(), Some("small"));
         assert_eq!(batch2_messages, 1);
         assert!(next_streaming_batch(&mut iter, limits).is_none());
+    }
+
+    #[test]
+    fn streaming_batch_sender_flushes_single_oversized_conversation_immediately() {
+        let (tx, rx) = bounded(2);
+        let mut sender = StreamingBatchSender::new(&tx, "gemini", false);
+        let oversized = NormalizedMessage {
+            content: "x".repeat(DEFAULT_STREAMING_BATCH_LIMITS.max_chars + 1),
+            ..norm_msg(0, 1_000)
+        };
+        let conversation = norm_conv(Some("huge"), vec![oversized]);
+
+        sender.push(conversation);
+
+        match rx
+            .try_recv()
+            .expect("oversized conversation should flush immediately")
+        {
+            IndexMessage::Batch {
+                connector_name,
+                conversations,
+                message_count,
+                ..
+            } => {
+                assert_eq!(connector_name, "gemini");
+                assert_eq!(conversations.len(), 1);
+                assert_eq!(conversations[0].external_id.as_deref(), Some("huge"));
+                assert_eq!(message_count, 1);
+            }
+            other => panic!(
+                "expected batch for oversized conversation flush, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        assert!(
+            rx.try_recv().is_err(),
+            "sender buffer should be empty after auto-flush"
+        );
+        sender.flush();
+        assert!(rx.try_recv().is_err(), "explicit flush should be a no-op");
     }
 
     #[test]
@@ -3548,6 +3651,52 @@ mod tests {
         assert_eq!(stats.agents_discovered, vec!["claude".to_string()]);
         assert_eq!(stats.total_conversations, 0);
         assert_eq!(stats.total_messages, 0);
+    }
+
+    #[test]
+    fn streaming_producer_records_remote_scan_errors_in_connector_stats() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        let progress = Arc::new(IndexingProgress::default());
+        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+        let remote_root_path = PathBuf::from("/remote/fixture/claude");
+        let handle = spawn_connector_producer(
+            "claude",
+            detected_remote_failure_connector_factory,
+            tx,
+            data_dir,
+            vec![ScanRoot::remote(
+                remote_root_path.clone(),
+                Origin::remote("fixture-host"),
+                Some(crate::sources::config::Platform::Linux),
+            )],
+            None,
+            Some(progress.clone()),
+        );
+
+        let discovered =
+            run_streaming_consumer(rx, 1, &storage, &mut index, &Some(progress.clone()), false)
+                .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(discovered, vec!["claude".to_string()]);
+
+        let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let connector = stats
+            .connectors
+            .iter()
+            .find(|connector| connector.name == "claude")
+            .expect("claude connector stats should exist");
+        assert_eq!(
+            connector.error.as_deref(),
+            Some("remote scan failed for /remote/fixture/claude: remote exploded")
+        );
     }
 
     #[test]
