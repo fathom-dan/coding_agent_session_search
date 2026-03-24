@@ -2067,7 +2067,10 @@ fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
     // Avoid sqlite_master enumeration here. Databases with FTS virtual tables
     // can trigger frankensqlite parse-recovery on sqlite_master reads, which is
     // enough to break the transition on otherwise-healthy legacy cass DBs.
-    if conn.query("SELECT version FROM \"_schema_migrations\";").is_ok() {
+    if conn
+        .query("SELECT version FROM \"_schema_migrations\";")
+        .is_ok()
+    {
         return Ok(());
     }
 
