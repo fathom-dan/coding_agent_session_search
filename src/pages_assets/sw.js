@@ -252,19 +252,6 @@ function addSecurityHeaders(response) {
  * Message event: Handle messages from clients
  */
 self.addEventListener('message', (event) => {
-    const payload = event.data && typeof event.data === 'object' ? event.data : null;
-    if (!payload) {
-        log(LOG.WARN, 'Ignoring malformed message payload');
-        return;
-    }
-
-    const { type, ...data } = payload;
-    if (typeof type !== 'string' || type.length === 0) {
-        log(LOG.WARN, 'Ignoring message without a valid type');
-        return;
-    }
-
-    // Helper to respond - use MessageChannel port if available, otherwise event.source
     const respond = (message) => {
         if (event.ports && event.ports[0]) {
             event.ports[0].postMessage(message);
@@ -272,6 +259,27 @@ self.addEventListener('message', (event) => {
             event.source.postMessage(message);
         }
     };
+
+    const rejectRequest = (error) => {
+        respond({
+            type: 'REQUEST_INVALID',
+            error,
+        });
+    };
+
+    const payload = event.data && typeof event.data === 'object' ? event.data : null;
+    if (!payload) {
+        log(LOG.WARN, 'Ignoring malformed message payload');
+        rejectRequest('Malformed message payload');
+        return;
+    }
+
+    const { type, ...data } = payload;
+    if (typeof type !== 'string' || type.length === 0) {
+        log(LOG.WARN, 'Ignoring message without a valid type');
+        rejectRequest('Message type must be a non-empty string');
+        return;
+    }
 
     switch (type) {
         case 'SKIP_WAITING':
@@ -320,6 +328,7 @@ self.addEventListener('message', (event) => {
 
         default:
             log(LOG.WARN, 'Unknown message type:', type);
+            rejectRequest(`Unknown message type: ${type}`);
     }
 });
 

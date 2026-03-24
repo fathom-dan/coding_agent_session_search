@@ -229,7 +229,9 @@ function showUpdateNotification() {
 
     // Event handlers
     refreshBtn.addEventListener('click', () => {
-        applyUpdate();
+        void applyUpdate().catch((error) => {
+            console.error('[SW] Failed to apply update:', error);
+        });
     });
 
     dismissBtn.addEventListener('click', () => {
@@ -274,16 +276,24 @@ export async function getRegistration() {
  * Unregister the service worker
  */
 export async function unregisterServiceWorker() {
-    const currentRegistration = registration ?? await resolveRegistration();
-    if (currentRegistration) {
-        const unregistered = await currentRegistration.unregister();
-        if (unregistered) {
-            registration = null;
-            console.log('[SW] Unregistered');
-            return true;
-        }
-        console.warn('[SW] Service Worker refused unregister request');
+    if (!('serviceWorker' in navigator)) {
+        registration = null;
+        return true;
     }
+
+    const currentRegistration = registration ?? await resolveRegistration();
+    if (!currentRegistration) {
+        registration = null;
+        return true;
+    }
+
+    const unregistered = await currentRegistration.unregister();
+    if (unregistered) {
+        registration = null;
+        console.log('[SW] Unregistered');
+        return true;
+    }
+    console.warn('[SW] Service Worker refused unregister request');
     return false;
 }
 
@@ -316,10 +326,12 @@ export const swStatus = {
         return 'serviceWorker' in navigator;
     },
     get isRegistered() {
-        return registration !== null || navigator.serviceWorker.controller !== null;
+        return 'serviceWorker' in navigator
+            && (registration !== null || navigator.serviceWorker.controller !== null);
     },
     get isActive() {
-        return navigator.serviceWorker.controller !== null;
+        return 'serviceWorker' in navigator
+            && navigator.serviceWorker.controller !== null;
     },
     get hasSharedArrayBuffer() {
         return hasSharedArrayBuffer();

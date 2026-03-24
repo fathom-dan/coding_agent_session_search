@@ -802,13 +802,38 @@ mod tests {
             sw_js.contains(
                 "const payload = event.data && typeof event.data === 'object' ? event.data : null;"
             ) && sw_js.contains("if (!payload) {")
-                && sw_js.contains("Ignoring malformed message payload"),
-            "service worker message handling should guard against null or non-object payloads before destructuring"
+                && sw_js.contains("Ignoring malformed message payload")
+                && sw_js.contains("rejectRequest('Malformed message payload');"),
+            "service worker message handling should guard against null or non-object payloads before destructuring and fail fast to the caller"
         );
         assert!(
             sw_js.contains("if (typeof type !== 'string' || type.length === 0) {")
-                && sw_js.contains("Ignoring message without a valid type"),
-            "service worker message handling should reject payloads without a valid string message type"
+                && sw_js.contains("Ignoring message without a valid type")
+                && sw_js.contains("rejectRequest('Message type must be a non-empty string');")
+                && sw_js.contains("type: 'REQUEST_INVALID',")
+                && sw_js.contains("rejectRequest(`Unknown message type: ${type}`);"),
+            "service worker message handling should reject invalid or unknown message types without forcing controller RPC callers to time out"
+        );
+    }
+
+    #[test]
+    fn test_sw_register_handles_unsupported_or_missing_registrations_safely() {
+        let sw_register_js = include_str!("../src/pages_assets/sw-register.js");
+        assert!(
+            sw_register_js.contains("void applyUpdate().catch((error) => {")
+                && sw_register_js.contains("console.error('[SW] Failed to apply update:', error);"),
+            "service worker update UI should catch async applyUpdate failures instead of leaking unhandled rejections"
+        );
+        assert!(
+            sw_register_js.contains("if (!('serviceWorker' in navigator)) {")
+                && sw_register_js.contains("if (!currentRegistration) {")
+                && sw_register_js.contains("return true;"),
+            "service worker unregister should treat unsupported or already-unregistered states as successful no-ops"
+        );
+        assert!(
+            sw_register_js.contains("return 'serviceWorker' in navigator\n            && (registration !== null || navigator.serviceWorker.controller !== null);")
+                && sw_register_js.contains("return 'serviceWorker' in navigator\n            && navigator.serviceWorker.controller !== null;"),
+            "service worker status getters should guard navigator.serviceWorker access on unsupported browsers"
         );
     }
 
