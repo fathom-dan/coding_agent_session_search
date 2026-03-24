@@ -28,6 +28,8 @@ let attachmentEpoch = 0;
 
 // Blob cache: hash -> { data: Uint8Array, objectUrl: string|null, size: number }
 const blobCache = new Map();
+const blobLoadPromises = new Map();
+const blobUrlPromises = new Map();
 let cacheSize = 0;
 
 // LRU tracking
@@ -88,7 +90,10 @@ export async function initAttachments(dek, exportId) {
                 manifest = null;
                 isManifestLoaded = shouldCacheManifestAbsence(error);
             }
-            return null;
+            if (shouldCacheManifestAbsence(error)) {
+                return null;
+            }
+            throw error;
         } finally {
             if (manifestLoadEpoch === epoch) {
                 manifestLoadPromise = null;
@@ -195,58 +200,75 @@ export async function loadBlob(hash, dek, exportId) {
     const normalizedHash = normalizeBlobHash(hash);
 
     // Check cache
-    if (blobCache.has(normalizedHash)) {
+    const cached = blobCache.get(normalizedHash);
+    if (cached) {
         updateLru(normalizedHash);
-        return blobCache.get(normalizedHash).data;
+        return cached.data;
     }
 
-    // Fetch encrypted blob
-    const response = await fetch(`./blobs/${normalizedHash}.bin`);
-    if (!response.ok) {
-        throw new Error(`Blob not found: ${normalizedHash}`);
+    const inFlight = blobLoadPromises.get(normalizedHash);
+    if (inFlight?.epoch === epoch) {
+        return inFlight.promise;
     }
 
-    const ciphertext = new Uint8Array(await response.arrayBuffer());
+    let loadPromise;
+    loadPromise = (async () => {
+        // Fetch encrypted blob
+        const response = await fetch(`./blobs/${normalizedHash}.bin`);
+        if (!response.ok) {
+            throw new Error(`Blob not found: ${normalizedHash}`);
+        }
 
-    // Derive nonce using HKDF
-    const nonce = await deriveBlobNonce(normalizedHash);
+        const ciphertext = new Uint8Array(await response.arrayBuffer());
 
-    // Import DEK for decryption
-    const dekKey = await crypto.subtle.importKey(
-        'raw',
-        dek,
-        { name: 'AES-GCM' },
-        false,
-        ['decrypt']
-    );
+        // Derive nonce using HKDF
+        const nonce = await deriveBlobNonce(normalizedHash);
 
-    // Build AAD: export_id || hash_bytes
-    const hashBytes = hexToBytes(normalizedHash);
-    const aad = new Uint8Array(exportId.length + hashBytes.length);
-    aad.set(exportId);
-    aad.set(hashBytes, exportId.length);
+        // Import DEK for decryption
+        const dekKey = await crypto.subtle.importKey(
+            'raw',
+            dek,
+            { name: 'AES-GCM' },
+            false,
+            ['decrypt']
+        );
 
-    // Decrypt
-    const plaintext = await crypto.subtle.decrypt(
-        {
-            name: 'AES-GCM',
-            iv: nonce,
-            additionalData: aad,
-        },
-        dekKey,
-        ciphertext
-    );
+        // Build AAD: export_id || hash_bytes
+        const hashBytes = hexToBytes(normalizedHash);
+        const aad = new Uint8Array(exportId.length + hashBytes.length);
+        aad.set(exportId);
+        aad.set(hashBytes, exportId.length);
 
-    const data = new Uint8Array(plaintext);
+        // Decrypt
+        const plaintext = await crypto.subtle.decrypt(
+            {
+                name: 'AES-GCM',
+                iv: nonce,
+                additionalData: aad,
+            },
+            dekKey,
+            ciphertext
+        );
 
-    if (!isCurrentEpoch(epoch)) {
-        throw createInvalidationError();
-    }
+        const data = new Uint8Array(plaintext);
 
-    // Cache the result
-    cacheBlob(normalizedHash, data);
+        if (!isCurrentEpoch(epoch)) {
+            throw createInvalidationError();
+        }
 
-    return data;
+        // Cache the result
+        cacheBlob(normalizedHash, data);
+
+        return data;
+    })().finally(() => {
+        const current = blobLoadPromises.get(normalizedHash);
+        if (current?.epoch === epoch && current.promise === loadPromise) {
+            blobLoadPromises.delete(normalizedHash);
+        }
+    });
+
+    blobLoadPromises.set(normalizedHash, { epoch, promise: loadPromise });
+    return loadPromise;
 }
 
 /**
@@ -269,24 +291,52 @@ export async function loadBlobAsUrl(hash, mimeType, dek, exportId) {
         return cached.objectUrl;
     }
 
-    // Load the blob data
-    const data = await loadBlob(normalizedHash, dek, exportId);
-
-    // Create object URL
-    const blob = new Blob([data], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-
-    if (!isCurrentEpoch(epoch)) {
-        URL.revokeObjectURL(url);
-        throw createInvalidationError();
+    const inFlight = blobUrlPromises.get(normalizedHash);
+    if (inFlight?.epoch === epoch) {
+        return inFlight.promise;
     }
 
-    // Update cache with URL
-    if (blobCache.has(normalizedHash)) {
-        blobCache.get(normalizedHash).objectUrl = url;
-    }
+    let urlPromise;
+    urlPromise = (async () => {
+        // Load the blob data
+        const data = await loadBlob(normalizedHash, dek, exportId);
 
-    return url;
+        const cachedEntry = blobCache.get(normalizedHash);
+        if (cachedEntry?.objectUrl) {
+            updateLru(normalizedHash);
+            return cachedEntry.objectUrl;
+        }
+
+        // Create object URL
+        const blob = new Blob([data], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+
+        if (!isCurrentEpoch(epoch)) {
+            URL.revokeObjectURL(url);
+            throw createInvalidationError();
+        }
+
+        const cacheEntry = blobCache.get(normalizedHash);
+        if (!cacheEntry) {
+            URL.revokeObjectURL(url);
+            throw createAttachmentError(
+                'Attachment cache entry missing after blob load',
+                'ATTACHMENT_CACHE_INCONSISTENT'
+            );
+        }
+
+        cacheEntry.objectUrl = url;
+        updateLru(normalizedHash);
+        return url;
+    })().finally(() => {
+        const current = blobUrlPromises.get(normalizedHash);
+        if (current?.epoch === epoch && current.promise === urlPromise) {
+            blobUrlPromises.delete(normalizedHash);
+        }
+    });
+
+    blobUrlPromises.set(normalizedHash, { epoch, promise: urlPromise });
+    return urlPromise;
 }
 
 /**
@@ -404,6 +454,11 @@ function validateManifestEntry(entry, index) {
  * Cache a blob with LRU eviction
  */
 function cacheBlob(hash, data) {
+    if (blobCache.has(hash)) {
+        updateLru(hash);
+        return;
+    }
+
     // Check if we need to evict
     while (
         blobCache.size >= CACHE_CONFIG.MAX_ENTRIES ||
@@ -475,6 +530,8 @@ export function reset() {
     manifest = null;
     isManifestLoaded = false;
     manifestLoadPromise = null;
+    blobLoadPromises.clear();
+    blobUrlPromises.clear();
     manifestLoadEpoch = attachmentEpoch;
 }
 

@@ -893,9 +893,122 @@ mod tests {
             "attachment manifest loading should distinguish missing manifests from retryable fetch or parse failures"
         );
         assert!(
-            attachments_js.contains("if (error?.code === 'ATTACHMENT_REQUEST_INVALIDATED') {"),
+            attachments_js.contains("if (shouldCacheManifestAbsence(error)) {")
+                && attachments_js.contains("throw error;")
+                && attachments_js
+                    .contains("if (error?.code === 'ATTACHMENT_REQUEST_INVALIDATED') {"),
             "attachment invalidation handling should use stable error codes instead of brittle string matching"
         );
+    }
+
+    #[test]
+    fn test_conversation_attachment_state_keeps_transient_manifest_failures_retryable() {
+        let conversation_js = include_str!("../src/pages_assets/conversation.js");
+        assert!(
+            conversation_js.contains("state.ready = true;")
+                && conversation_js.contains("return state.available;")
+                && conversation_js
+                    .contains("if (error?.code === 'ATTACHMENT_REQUEST_INVALIDATED') {")
+                && conversation_js.contains("state.ready = false;")
+                && conversation_js.contains("state.available = false;"),
+            "conversation attachment readiness should only become terminal after a successful or absent manifest load, not after a transient manifest failure"
+        );
+    }
+
+    #[test]
+    fn test_attachment_blob_loading_deduplicates_concurrent_requests() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import {
+                    loadBlob,
+                    loadBlobAsUrl,
+                    reset,
+                    getCacheStats,
+                } from './src/pages_assets/attachments.js';
+
+                const hash = 'a'.repeat(64);
+                const dek = new Uint8Array([1, 2, 3, 4]);
+                const exportId = new Uint8Array([5, 6, 7, 8]);
+
+                let fetchCalls = 0;
+                let decryptCalls = 0;
+                let urlCalls = 0;
+
+                const originalFetch = globalThis.fetch;
+                const originalImportKey = globalThis.crypto.subtle.importKey;
+                const originalDeriveBits = globalThis.crypto.subtle.deriveBits;
+                const originalDecrypt = globalThis.crypto.subtle.decrypt;
+                const originalCreateObjectURL = URL.createObjectURL;
+                const originalRevokeObjectURL = URL.revokeObjectURL;
+
+                globalThis.fetch = async (url) => {
+                    fetchCalls += 1;
+                    if (!String(url).endsWith(`/${hash}.bin`)) {
+                        throw new Error(`unexpected fetch url: ${url}`);
+                    }
+                    return {
+                        ok: true,
+                        status: 200,
+                        arrayBuffer: async () => new Uint8Array([9, 8, 7, 6]).buffer,
+                    };
+                };
+
+                globalThis.crypto.subtle.importKey = async () => ({});
+                globalThis.crypto.subtle.deriveBits = async () => new Uint8Array(12).buffer;
+                globalThis.crypto.subtle.decrypt = async () => {
+                    decryptCalls += 1;
+                    await Promise.resolve();
+                    return new Uint8Array([1, 2, 3]).buffer;
+                };
+
+                URL.createObjectURL = () => {
+                    urlCalls += 1;
+                    return `blob:test-${urlCalls}`;
+                };
+                URL.revokeObjectURL = () => {};
+
+                try {
+                    reset();
+
+                    const [blobA, blobB] = await Promise.all([
+                        loadBlob(hash, dek, exportId),
+                        loadBlob(hash, dek, exportId),
+                    ]);
+
+                    if (fetchCalls !== 1 || decryptCalls !== 1) {
+                        throw new Error(`expected one fetch and one decrypt for concurrent blob loads, got fetch=${fetchCalls} decrypt=${decryptCalls}`);
+                    }
+                    if (blobA !== blobB) {
+                        throw new Error('expected concurrent blob loads to share the same cached Uint8Array instance');
+                    }
+
+                    const [urlA, urlB] = await Promise.all([
+                        loadBlobAsUrl(hash, 'image/png', dek, exportId),
+                        loadBlobAsUrl(hash, 'image/png', dek, exportId),
+                    ]);
+
+                    if (urlCalls !== 1) {
+                        throw new Error(`expected one object URL for concurrent URL loads, got ${urlCalls}`);
+                    }
+                    if (urlA !== urlB) {
+                        throw new Error(`expected concurrent URL loads to share one object URL, got ${urlA} vs ${urlB}`);
+                    }
+
+                    const stats = getCacheStats();
+                    if (stats.entries !== 1) {
+                        throw new Error(`expected one cache entry after deduped blob loads, got ${JSON.stringify(stats)}`);
+                    }
+                } finally {
+                    reset();
+                    globalThis.fetch = originalFetch;
+                    globalThis.crypto.subtle.importKey = originalImportKey;
+                    globalThis.crypto.subtle.deriveBits = originalDeriveBits;
+                    globalThis.crypto.subtle.decrypt = originalDecrypt;
+                    URL.createObjectURL = originalCreateObjectURL;
+                    URL.revokeObjectURL = originalRevokeObjectURL;
+                }
+            "#,
+        )
     }
 
     #[test]

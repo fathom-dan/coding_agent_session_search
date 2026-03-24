@@ -198,16 +198,20 @@ async function ensureAttachmentsReady(loadId = activeConversationLoadId) {
         state.dek = dek;
         state.exportId = exportId;
         state.available = Boolean(manifest?.entries?.length);
+        state.ready = true;
+        return state.available;
     } catch (error) {
         if (state !== attachmentState || loadId !== activeConversationLoadId) {
             return false;
         }
+        if (error?.code === 'ATTACHMENT_REQUEST_INVALIDATED') {
+            return false;
+        }
         console.warn('[Conversation] Attachment manifest unavailable:', error);
+        state.ready = false;
         state.available = false;
+        return false;
     }
-
-    state.ready = true;
-    return state.available;
 }
 
 /**
