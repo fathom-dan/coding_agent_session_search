@@ -75,37 +75,56 @@ export function getHomeLink() {
 }
 
 /**
+ * Copy text to the clipboard
+ * @param {string} text - Text to copy
+ * @returns {Promise<boolean>} True if successful
+ */
+export async function copyTextToClipboard(text) {
+    const clipboard = globalThis.navigator?.clipboard;
+    if (clipboard?.writeText) {
+        try {
+            await clipboard.writeText(text);
+            return true;
+        } catch (error) {
+            console.error('[Share] Failed to copy text via Clipboard API:', error);
+        }
+    }
+
+    let textArea = null;
+    try {
+        if (!document.body || typeof document.execCommand !== 'function') {
+            return false;
+        }
+
+        textArea = document.createElement('textarea');
+        textArea.value = text;
+        textArea.setAttribute('readonly', '');
+        textArea.style.position = 'fixed';
+        textArea.style.left = '-9999px';
+        textArea.style.top = '-9999px';
+        textArea.style.opacity = '0';
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+
+        return document.execCommand('copy');
+    } catch (fallbackError) {
+        console.error('[Share] Fallback copy failed:', fallbackError);
+        return false;
+    } finally {
+        if (textArea?.parentNode) {
+            textArea.parentNode.removeChild(textArea);
+        }
+    }
+}
+
+/**
  * Copy a link to the clipboard
  * @param {string} link - Link to copy
  * @returns {Promise<boolean>} True if successful
  */
 export async function copyLinkToClipboard(link) {
-    try {
-        await navigator.clipboard.writeText(link);
-        return true;
-    } catch (error) {
-        console.error('[Share] Failed to copy link:', error);
-
-        // Fallback for older browsers
-        try {
-            const textArea = document.createElement('textarea');
-            textArea.value = link;
-            textArea.style.position = 'fixed';
-            textArea.style.left = '-9999px';
-            textArea.style.top = '-9999px';
-            document.body.appendChild(textArea);
-            textArea.focus();
-            textArea.select();
-
-            const success = document.execCommand('copy');
-            document.body.removeChild(textArea);
-
-            return success;
-        } catch (fallbackError) {
-            console.error('[Share] Fallback copy failed:', fallbackError);
-            return false;
-        }
-    }
+    return copyTextToClipboard(link);
 }
 
 /**
@@ -258,6 +277,7 @@ export default {
     getSettingsLink,
     getStatsLink,
     getHomeLink,
+    copyTextToClipboard,
     copyLinkToClipboard,
     copyConversationLink,
     copySearchLink,

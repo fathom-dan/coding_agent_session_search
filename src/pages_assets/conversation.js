@@ -13,6 +13,7 @@ import {
     initAttachments,
     reset as resetAttachments,
 } from './attachments.js';
+import { copyTextToClipboard } from './share.js';
 import { VariableHeightVirtualList } from './virtual-list.js';
 
 // Virtual scrolling configuration
@@ -58,6 +59,7 @@ let messageVirtualList = null; // Virtual list for long conversations
 let attachmentState = createAttachmentState();
 let activeConversationLoadId = 0;
 let documentKeydownHandler = null;
+let copyFeedbackTimeoutId = null;
 
 // DOM element references
 let elements = {
@@ -708,7 +710,10 @@ async function copyConversation() {
     const text = formatConversationAsText(currentConversation, currentMessages);
 
     try {
-        await navigator.clipboard.writeText(text);
+        const copied = await copyTextToClipboard(text);
+        if (!copied) {
+            throw new Error('Clipboard copy failed');
+        }
         showCopyFeedback('Copied!');
     } catch (error) {
         console.error('[Conversation] Copy failed:', error);
@@ -749,10 +754,22 @@ function formatConversationAsText(conv, messages) {
 function showCopyFeedback(message) {
     const copyBtn = document.getElementById('copy-btn');
     if (copyBtn) {
-        const originalText = copyBtn.innerHTML;
+        if (!copyBtn.dataset.defaultLabel) {
+            copyBtn.dataset.defaultLabel = copyBtn.innerHTML;
+        }
+
+        if (copyFeedbackTimeoutId !== null) {
+            clearTimeout(copyFeedbackTimeoutId);
+            copyFeedbackTimeoutId = null;
+        }
+
+        const defaultLabel = copyBtn.dataset.defaultLabel;
         copyBtn.innerHTML = message;
-        setTimeout(() => {
-            copyBtn.innerHTML = originalText;
+        copyFeedbackTimeoutId = window.setTimeout(() => {
+            if (copyBtn.isConnected) {
+                copyBtn.innerHTML = defaultLabel;
+            }
+            copyFeedbackTimeoutId = null;
         }, 2000);
     }
 }
