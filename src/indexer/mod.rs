@@ -460,26 +460,82 @@ fn next_streaming_batch(
     Some((batch, total_messages))
 }
 
+struct StreamingBatchSender<'a> {
+    tx: &'a Sender<IndexMessage>,
+    connector_name: &'static str,
+    next_batch_is_discovered: bool,
+    conversations: Vec<NormalizedConversation>,
+    message_count: usize,
+    char_count: usize,
+}
+
+impl<'a> StreamingBatchSender<'a> {
+    fn new(
+        tx: &'a Sender<IndexMessage>,
+        connector_name: &'static str,
+        is_discovered: bool,
+    ) -> Self {
+        Self {
+            tx,
+            connector_name,
+            next_batch_is_discovered: is_discovered,
+            conversations: Vec::new(),
+            message_count: 0,
+            char_count: 0,
+        }
+    }
+
+    fn mark_next_batch_discovered(&mut self) {
+        self.next_batch_is_discovered = true;
+    }
+
+    fn push(&mut self, conversation: NormalizedConversation) {
+        let (message_count, char_count) = conversation_batch_footprint(&conversation);
+        let would_exceed_limits = !self.conversations.is_empty()
+            && (self.conversations.len() >= DEFAULT_STREAMING_BATCH_LIMITS.max_conversations
+                || self.message_count.saturating_add(message_count)
+                    > DEFAULT_STREAMING_BATCH_LIMITS.max_messages
+                || self.char_count.saturating_add(char_count)
+                    > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
+        if would_exceed_limits {
+            self.flush();
+        }
+
+        self.message_count += message_count;
+        self.char_count += char_count;
+        self.conversations.push(conversation);
+    }
+
+    fn flush(&mut self) {
+        if self.conversations.is_empty() {
+            return;
+        }
+
+        let message_count = self.message_count;
+        let conversations = std::mem::take(&mut self.conversations);
+        let _ = self.tx.send(IndexMessage::Batch {
+            connector_name: self.connector_name,
+            conversations,
+            is_discovered: self.next_batch_is_discovered,
+            message_count,
+        });
+        self.message_count = 0;
+        self.char_count = 0;
+        self.next_batch_is_discovered = false;
+    }
+}
+
 fn send_conversation_batches(
     tx: &Sender<IndexMessage>,
     connector_name: &'static str,
     conversations: Vec<NormalizedConversation>,
     is_discovered: bool,
 ) {
-    let mut iter = conversations.into_iter().peekable();
-    let mut batch_is_discovered = is_discovered;
-
-    while let Some((batch, message_count)) =
-        next_streaming_batch(&mut iter, DEFAULT_STREAMING_BATCH_LIMITS)
-    {
-        let _ = tx.send(IndexMessage::Batch {
-            connector_name,
-            conversations: batch,
-            is_discovered: batch_is_discovered,
-            message_count,
-        });
-        batch_is_discovered = false;
+    let mut sender = StreamingBatchSender::new(tx, connector_name, is_discovered);
+    for conversation in conversations {
+        sender.push(conversation);
     }
+    sender.flush();
 }
 
 /// Check if streaming indexing is enabled via environment variable.
@@ -522,19 +578,18 @@ fn spawn_connector_producer(
 
             // Scan local sources
             let ctx = crate::connectors::ScanContext::local_default(data_dir.clone(), since_ts);
-            match conn.scan(&ctx) {
-                Ok(mut local_convs) => {
-                    // Inject local provenance
-                    let local_origin = Origin::local();
-                    for conv in &mut local_convs {
-                        inject_provenance(conv, &local_origin);
-                    }
-
-                    if !local_convs.is_empty() {
-                        send_conversation_batches(&tx, name, local_convs, is_discovered);
-                    }
+            let local_origin = Origin::local();
+            let mut batch_sender = StreamingBatchSender::new(&tx, name, is_discovered);
+            match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                inject_provenance(&mut conversation, &local_origin);
+                batch_sender.push(conversation);
+                Ok(())
+            }) {
+                Ok(()) => {
+                    batch_sender.flush();
                 }
                 Err(e) => {
+                    batch_sender.flush();
                     tracing::warn!(connector = name, "local scan failed: {}", e);
                     let _ = tx.send(IndexMessage::ScanError {
                         connector_name: name,
@@ -551,26 +606,27 @@ fn spawn_connector_producer(
                 vec![root.clone()],
                 since_ts,
             );
-            match conn.scan(&ctx) {
-                Ok(mut remote_convs) => {
-                    for conv in &mut remote_convs {
-                        inject_provenance(conv, &root.origin);
-                        apply_workspace_rewrite(conv, root);
-                    }
+            let mut batch_sender = StreamingBatchSender::new(&tx, name, is_discovered);
+            match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                inject_provenance(&mut conversation, &root.origin);
+                apply_workspace_rewrite(&mut conversation, root);
 
-                    // Check if discovered via remote scan
-                    if !was_detected && !remote_convs.is_empty() && !is_discovered {
-                        if let Some(p) = &progress {
-                            p.discovered_agents.fetch_add(1, Ordering::Relaxed);
-                        }
-                        is_discovered = true;
+                if !was_detected && !is_discovered {
+                    if let Some(p) = &progress {
+                        p.discovered_agents.fetch_add(1, Ordering::Relaxed);
                     }
+                    is_discovered = true;
+                    batch_sender.mark_next_batch_discovered();
+                }
 
-                    if !remote_convs.is_empty() {
-                        send_conversation_batches(&tx, name, remote_convs, is_discovered);
-                    }
+                batch_sender.push(conversation);
+                Ok(())
+            }) {
+                Ok(()) => {
+                    batch_sender.flush();
                 }
                 Err(e) => {
+                    batch_sender.flush();
                     tracing::warn!(
                         connector = name,
                         root = %root.path.display(),
