@@ -46,13 +46,13 @@ function getEffectiveStorageMode() {
  * @param {Object} options - Configuration options
  * @param {Function} options.onSessionReset - Callback when session is reset
  */
-export function initSettings(container, options = {}) {
+export async function initSettings(container, options = {}) {
     settingsRenderEpoch += 1;
     settingsContainer = container;
     onSessionReset = options.onSessionReset || null;
 
     // Initial render
-    render();
+    await render();
 }
 
 /**

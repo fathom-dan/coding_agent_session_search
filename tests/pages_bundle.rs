@@ -676,6 +676,14 @@ mod tests {
     fn test_settings_async_handlers_await_rerender() {
         let settings_js = include_str!("../src/pages_assets/settings.js");
         assert!(
+            settings_js.contains("export async function initSettings(container, options = {})"),
+            "settings initialization should be async so the initial render can be awaited"
+        );
+        assert!(
+            settings_js.contains("await render();"),
+            "settings initialization and async handlers should await the async render path"
+        );
+        assert!(
             settings_js.contains("showNotification(`Storage mode changed to ${newMode}`, 'success');\n        await render();"),
             "storage mode changes should await the async settings rerender so rerender failures stay inside the handler error path"
         );
@@ -694,6 +702,51 @@ mod tests {
         assert!(
             settings_js.contains("showNotification('Failed to disable OPFS caching because cached files could not be fully cleared', 'error');\n                await render();"),
             "the partial OPFS-clear path should also await the rerender before returning"
+        );
+
+        let viewer_js = include_str!("../src/pages_assets/viewer.js");
+        assert!(
+            viewer_js.contains("await initSettings(elements.settingsView, {"),
+            "viewer settings bootstrap should await async settings initialization"
+        );
+        assert!(
+            viewer_js.contains("await renderSettings();"),
+            "viewer settings rendering should await async settings rerenders"
+        );
+    }
+
+    #[test]
+    fn test_index_bootstrap_respects_csp_without_inline_module_script() {
+        let index_html = include_str!("../src/pages_assets/index.html");
+        assert!(
+            index_html.contains("script-src 'self' 'wasm-unsafe-eval';"),
+            "pages bundle should keep the strict CSP script policy"
+        );
+        assert!(
+            index_html.contains("id=\"auth-screen\" class=\"auth-container hidden\""),
+            "auth screen should start hidden in markup so startup no longer depends on an inline bootstrap script"
+        );
+        assert!(
+            !index_html.contains("<script type=\"module\">"),
+            "pages bundle should not ship inline module scripts that its own CSP blocks"
+        );
+
+        let auth_js = include_str!("../src/pages_assets/auth.js");
+        assert!(
+            auth_js.contains("import { COI_STATE, getCOIState, initCOIDetection, onServiceWorkerActivated } from './coi-detector.js';"),
+            "COI bootstrap should now live in auth.js"
+        );
+        assert!(
+            auth_js.contains("registerServiceWorker().catch((error) => {")
+                && auth_js.contains("initCOIDetection({")
+                && auth_js.contains("onServiceWorkerActivated(async () => {"),
+            "auth.js should own service-worker registration, COI initialization, and activation rechecks"
+        );
+        assert!(
+            auth_js.contains("}).catch((error) => {")
+                && auth_js.contains("console.error('[App] COI initialization failed:', error);")
+                && auth_js.contains("authScreen?.classList.remove('hidden');"),
+            "COI bootstrap failures should fall back to revealing the auth screen instead of leaving the page blank"
         );
     }
 }

@@ -139,27 +139,7 @@ function initializeViews() {
         return { ok: false, error };
     });
     storageReady.then((result) => {
-        if (lifecycleEpoch !== viewerLifecycleEpoch) {
-            return;
-        }
-
-        if (!result?.ok) {
-            settingsReady = false;
-            return;
-        }
-
-        try {
-            initSettings(elements.settingsView, {
-                onSessionReset: handleSessionReset,
-            });
-            settingsReady = true;
-        } catch (error) {
-            console.error('[Viewer] Failed to initialize settings:', error);
-            settingsReady = false;
-            if (state.initialized && state.view === 'settings') {
-                renderSettingsErrorPanel('Settings could not be initialized for this archive.');
-            }
-        }
+        void initializeSettingsAfterStorageReady(result, lifecycleEpoch);
     });
 
     // Initialize search view
@@ -512,32 +492,64 @@ function displayStats() {
 function renderSettingsPanel() {
     if (storageReady) {
         storageReady.then((result) => {
-            if (!result?.ok) {
-                if (state.initialized && state.view === 'settings') {
-                    renderSettingsErrorPanel('Settings are unavailable because browser storage failed to initialize.');
-                }
-                return;
-            }
-
-            if (settingsReady && state.initialized && state.view === 'settings') {
-                try {
-                    renderSettings();
-                } catch (error) {
-                    console.error('[Viewer] Failed to render settings panel:', error);
-                    renderSettingsErrorPanel('Settings could not be rendered for this archive.');
-                }
-            }
+            void renderSettingsPanelAfterStorageReady(result);
         });
         return;
     }
 
     if (settingsReady) {
-        try {
-            renderSettings();
-        } catch (error) {
-            console.error('[Viewer] Failed to render settings panel:', error);
-            renderSettingsErrorPanel('Settings could not be rendered for this archive.');
+        void renderSettingsPanelNow();
+    }
+}
+
+async function initializeSettingsAfterStorageReady(result, lifecycleEpoch) {
+    if (lifecycleEpoch !== viewerLifecycleEpoch) {
+        return;
+    }
+
+    if (!result?.ok) {
+        settingsReady = false;
+        return;
+    }
+
+    try {
+        await initSettings(elements.settingsView, {
+            onSessionReset: handleSessionReset,
+        });
+        if (lifecycleEpoch !== viewerLifecycleEpoch) {
+            return;
         }
+        settingsReady = true;
+    } catch (error) {
+        console.error('[Viewer] Failed to initialize settings:', error);
+        settingsReady = false;
+        if (state.initialized && state.view === 'settings') {
+            renderSettingsErrorPanel('Settings could not be initialized for this archive.');
+        }
+    }
+}
+
+async function renderSettingsPanelAfterStorageReady(result) {
+    if (!result?.ok) {
+        if (state.initialized && state.view === 'settings') {
+            renderSettingsErrorPanel('Settings are unavailable because browser storage failed to initialize.');
+        }
+        return;
+    }
+
+    if (!settingsReady || !state.initialized || state.view !== 'settings') {
+        return;
+    }
+
+    await renderSettingsPanelNow();
+}
+
+async function renderSettingsPanelNow() {
+    try {
+        await renderSettings();
+    } catch (error) {
+        console.error('[Viewer] Failed to render settings panel:', error);
+        renderSettingsErrorPanel('Settings could not be rendered for this archive.');
     }
 }
 
