@@ -1,6 +1,7 @@
 pub mod redact_secrets;
 pub mod semantic;
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -567,6 +568,16 @@ pub fn streaming_index_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_string(),
+            Err(_) => "non-string panic payload".to_string(),
+        },
+    }
+}
+
 /// Spawn a producer thread that scans a connector and sends batches through the channel.
 ///
 /// Each connector runs in its own thread, scanning local and remote roots.
@@ -821,9 +832,12 @@ fn run_streaming_consumer(
                 }
             }
             Err(_) => {
-                // Channel closed unexpectedly
-                tracing::warn!("streaming channel closed unexpectedly");
-                break;
+                let error = format!(
+                    "streaming indexing aborted: channel closed with {active_producers} producers still active"
+                );
+                tracing::warn!(remaining = active_producers, error = %error);
+                set_progress_last_error(progress.as_ref(), Some(error.clone()));
+                return Err(anyhow::anyhow!(error));
             }
         }
     }
@@ -877,7 +891,28 @@ fn run_streaming_index(
     needs_rebuild: bool,
     remote_roots: Vec<ScanRoot>,
 ) -> Result<()> {
-    let connector_factories = get_connector_factories();
+    run_streaming_index_with_connector_factories(
+        storage,
+        t_index,
+        opts,
+        since_ts,
+        needs_rebuild,
+        remote_roots,
+        get_connector_factories(),
+    )
+}
+
+type ConnectorFactory = fn() -> Box<dyn Connector + Send>;
+
+fn run_streaming_index_with_connector_factories(
+    storage: &FrankenStorage,
+    t_index: &mut TantivyIndex,
+    opts: &IndexOptions,
+    since_ts: Option<i64>,
+    needs_rebuild: bool,
+    remote_roots: Vec<ScanRoot>,
+    connector_factories: Vec<(&'static str, ConnectorFactory)>,
+) -> Result<()> {
     let buffered_connectors: Vec<&'static str> = connector_factories
         .iter()
         .filter_map(|(name, factory)| {
@@ -909,17 +944,20 @@ fn run_streaming_index(
     let (tx, rx) = bounded::<IndexMessage>(STREAMING_CHANNEL_SIZE);
 
     // Spawn producer threads for each connector
-    let handles: Vec<JoinHandle<()>> = connector_factories
+    let handles: Vec<(&'static str, JoinHandle<()>)> = connector_factories
         .into_iter()
         .map(|(name, factory)| {
-            spawn_connector_producer(
+            (
                 name,
-                factory,
-                tx.clone(),
-                opts.data_dir.clone(),
-                remote_roots.clone(),
-                since_ts,
-                opts.progress.clone(),
+                spawn_connector_producer(
+                    name,
+                    factory,
+                    tx.clone(),
+                    opts.data_dir.clone(),
+                    remote_roots.clone(),
+                    since_ts,
+                    opts.progress.clone(),
+                ),
             )
         })
         .collect();
@@ -928,19 +966,50 @@ fn run_streaming_index(
     drop(tx);
 
     // Run consumer on main thread
-    let discovered_names = run_streaming_consumer(
+    let consumer_result = run_streaming_consumer(
         rx,
         num_connectors,
         storage,
         t_index,
         &opts.progress,
         needs_rebuild,
-    )?;
+    );
 
-    // Wait for all producer threads to complete
-    for handle in handles {
-        let _ = handle.join();
+    let mut join_errors = Vec::new();
+    for (name, handle) in handles {
+        if let Err(payload) = handle.join() {
+            let panic_message = panic_payload_message(payload);
+            tracing::error!(connector = name, panic = %panic_message, "streaming producer panicked");
+            join_errors.push(format!("{name}: {panic_message}"));
+        }
     }
+
+    if let Err(error) = consumer_result {
+        if !join_errors.is_empty() {
+            let combined = format!(
+                "{error}; streaming producer thread panicked: {}",
+                join_errors.join("; ")
+            );
+            set_progress_last_error(opts.progress.as_ref(), Some(combined.clone()));
+            return Err(anyhow::anyhow!(combined));
+        }
+        set_progress_last_error(opts.progress.as_ref(), Some(error.to_string()));
+        return Err(error);
+    }
+
+    if !join_errors.is_empty() {
+        let error = format!(
+            "streaming producer thread panicked: {}",
+            join_errors.join("; ")
+        );
+        set_progress_last_error(opts.progress.as_ref(), Some(error.clone()));
+        return Err(anyhow::anyhow!(error));
+    }
+
+    let discovered_names = match consumer_result {
+        Ok(names) => names,
+        Err(_) => unreachable!("handled above"),
+    };
 
     // Update discovered agent names in progress tracker
     if let Some(p) = &opts.progress
@@ -2264,7 +2333,7 @@ fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Res
     Ok(())
 }
 
-fn update_watch_last_error(progress: Option<&Arc<IndexingProgress>>, error: Option<String>) {
+fn set_progress_last_error(progress: Option<&Arc<IndexingProgress>>, error: Option<String>) {
     let Some(progress) = progress else {
         return;
     };
@@ -2283,7 +2352,7 @@ fn finalize_watch_reindex_result(
 ) -> usize {
     match result {
         Ok(indexed) => {
-            update_watch_last_error(progress, None);
+            set_progress_last_error(progress, None);
             detector.record_scan(indexed);
             indexed
         }
@@ -2292,7 +2361,7 @@ fn finalize_watch_reindex_result(
             if let Some(progress) = progress {
                 progress.phase.store(0, Ordering::Relaxed);
             }
-            update_watch_last_error(progress, Some(format!("{context}: {error}")));
+            set_progress_last_error(progress, Some(format!("{context}: {error}")));
             detector.record_scan(0);
             0
         }
@@ -3452,6 +3521,37 @@ mod tests {
         Box::new(DetectedRemoteFailureConnector)
     }
 
+    struct PanicConnector;
+
+    impl Connector for PanicConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult {
+                detected: true,
+                evidence: vec!["fixture".to_string()],
+                root_paths: Vec::new(),
+            }
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(Vec::new())
+        }
+
+        fn scan_with_callback(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+            _on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            panic!("connector panic during local scan");
+        }
+    }
+
+    fn panic_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(PanicConnector)
+    }
+
     #[test]
     fn next_streaming_batch_splits_large_message_batches() {
         let limits = StreamingBatchLimits {
@@ -3696,6 +3796,61 @@ mod tests {
         assert_eq!(
             connector.error.as_deref(),
             Some("remote scan failed for /remote/fixture/claude: remote exploded")
+        );
+    }
+
+    #[test]
+    fn streaming_index_fails_closed_when_producer_panics() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        let progress = Arc::new(IndexingProgress::default());
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir,
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: Some(progress.clone()),
+            watch_interval_secs: 30,
+        };
+
+        let error = run_streaming_index_with_connector_factories(
+            &storage,
+            &mut index,
+            &opts,
+            None,
+            false,
+            Vec::new(),
+            vec![("claude", panic_connector_factory)],
+        )
+        .expect_err("producer panic should abort streaming indexing");
+        let message = error.to_string();
+        assert!(
+            message.contains("streaming producer thread panicked"),
+            "panic should surface in the returned error: {message}"
+        );
+        assert!(
+            message.contains("claude: connector panic during local scan"),
+            "returned error should name the failing connector and panic: {message}"
+        );
+        assert_eq!(
+            progress
+                .last_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref(),
+            Some(message.as_str()),
+            "progress tracker should expose the real panic instead of pretending indexing succeeded"
         );
     }
 
