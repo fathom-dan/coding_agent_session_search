@@ -556,8 +556,8 @@ async function loadRecentConversations(epoch = searchEpoch) {
  */
 function renderResults() {
     if (currentResults.length === 0) {
+        destroyVirtualResultsView();
         showNoResults();
-        destroyVirtualList();
         return;
     }
 
@@ -578,7 +578,7 @@ function renderResults() {
  */
 function renderVirtualResults() {
     // Destroy previous virtual list if exists
-    destroyVirtualList();
+    destroyVirtualResultsView();
 
     // Clear container and set up for virtual scrolling
     elements.resultsList.innerHTML = '';
@@ -603,12 +603,7 @@ function renderVirtualResults() {
  * @private
  */
 function renderDirectResults() {
-    destroyVirtualList();
-
-    // Reset container styling
-    elements.resultsList.style.height = '';
-    elements.resultsList.style.minHeight = '';
-    elements.resultsList.style.maxHeight = '';
+    destroyVirtualResultsView();
 
     const html = currentResults.map((result, index) => createResultCardHtml(result, index)).join('');
     elements.resultsList.innerHTML = html;
@@ -722,6 +717,21 @@ function destroyVirtualList() {
     }
 }
 
+function resetResultsListLayout() {
+    if (!elements.resultsList) {
+        return;
+    }
+
+    elements.resultsList.style.height = '';
+    elements.resultsList.style.minHeight = '';
+    elements.resultsList.style.maxHeight = '';
+}
+
+function destroyVirtualResultsView() {
+    destroyVirtualList();
+    resetResultsListLayout();
+}
+
 /**
  * Update result count display and announce to screen readers
  */
@@ -799,6 +809,8 @@ function hideNoResults() {
  * Show error message
  */
 function showError(message) {
+    destroyVirtualResultsView();
+    hideNoResults();
     elements.resultsList.innerHTML = `
         <div class="search-error">
             <span class="error-icon">⚠️</span>
@@ -916,7 +928,7 @@ export function clearSearch(options = {}) {
     currentPage = 0;
 
     // Clean up virtual list if it exists
-    destroyVirtualList();
+    destroyVirtualResultsView();
     hideLoading();
 
     if (elements.searchInput) {

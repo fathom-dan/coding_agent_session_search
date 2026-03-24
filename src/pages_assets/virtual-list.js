@@ -345,6 +345,8 @@ export class VariableHeightVirtualList {
         this.items = new Map(); // index -> element
         this.lastVisibleRange = { start: -1, end: -1 };
         this.destroyed = false;
+        this._scrollFramePending = false;
+        this._scrollFrameId = null;
 
         this._init();
     }
@@ -376,7 +378,19 @@ export class VariableHeightVirtualList {
 
         // Scroll handler
         this._scrollHandler = () => {
-            requestAnimationFrame(() => this._onScroll());
+            if (this.destroyed || this._scrollFramePending) {
+                return;
+            }
+
+            this._scrollFramePending = true;
+            this._scrollFrameId = requestAnimationFrame(() => {
+                this._scrollFramePending = false;
+                this._scrollFrameId = null;
+                if (this.destroyed) {
+                    return;
+                }
+                this._onScroll();
+            });
         };
         this.container.addEventListener('scroll', this._scrollHandler, { passive: true });
 
@@ -622,6 +636,12 @@ export class VariableHeightVirtualList {
         if (this._scrollHandler) {
             this.container.removeEventListener('scroll', this._scrollHandler);
         }
+
+        if (this._scrollFrameId !== null && typeof cancelAnimationFrame === 'function') {
+            cancelAnimationFrame(this._scrollFrameId);
+            this._scrollFrameId = null;
+        }
+        this._scrollFramePending = false;
 
         for (const [, element] of this.items) {
             element.remove();

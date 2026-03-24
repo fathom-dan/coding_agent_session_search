@@ -642,6 +642,249 @@ mod tests {
     }
 
     #[test]
+    fn test_search_cleanup_paths_reset_virtual_results_presentation() {
+        let search_js = include_str!("../src/pages_assets/search.js");
+        assert!(
+            search_js.contains("function destroyVirtualResultsView() {")
+                && search_js.contains("destroyVirtualList();")
+                && search_js.contains("resetResultsListLayout();"),
+            "search should centralize virtual-results teardown so error/reset paths do not leave stale virtual list state behind"
+        );
+        assert!(
+            search_js.contains("destroyVirtualResultsView();\n        showNoResults();")
+                && search_js.contains("destroyVirtualResultsView();\n    hideNoResults();")
+                && search_js.contains("destroyVirtualResultsView();\n    hideLoading();"),
+            "search no-results, error, and clear/reset paths should all tear down virtual-results presentation"
+        );
+    }
+
+    #[test]
+    fn test_restored_session_reinstalls_cleanup_handlers() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                class EventTargetMock {
+                    constructor() {
+                        this.listeners = new Map();
+                        this.hidden = false;
+                        this.location = { href: 'https://example.com/archive/index.html#/' };
+                    }
+
+                    addEventListener(type, handler) {
+                        const handlers = this.listeners.get(type) || new Set();
+                        handlers.add(handler);
+                        this.listeners.set(type, handlers);
+                    }
+
+                    removeEventListener(type, handler) {
+                        const handlers = this.listeners.get(type);
+                        if (!handlers) {
+                            return;
+                        }
+                        handlers.delete(handler);
+                        if (handlers.size === 0) {
+                            this.listeners.delete(type);
+                        }
+                    }
+
+                    listenerCount(type) {
+                        return this.listeners.get(type)?.size || 0;
+                    }
+
+                    resetListeners() {
+                        this.listeners.clear();
+                    }
+                }
+
+                class StorageMock {
+                    constructor() {
+                        this.data = new Map();
+                    }
+
+                    getItem(key) {
+                        return this.data.has(key) ? this.data.get(key) : null;
+                    }
+
+                    setItem(key, value) {
+                        this.data.set(key, String(value));
+                    }
+
+                    removeItem(key) {
+                        this.data.delete(key);
+                    }
+
+                    clear() {
+                        this.data.clear();
+                    }
+                }
+
+                const originalWindow = globalThis.window;
+                const originalDocument = globalThis.document;
+                const originalLocalStorage = globalThis.localStorage;
+                const originalSessionStorage = globalThis.sessionStorage;
+                const originalBtoa = globalThis.btoa;
+                const originalAtob = globalThis.atob;
+
+                globalThis.window = new EventTargetMock();
+                globalThis.document = new EventTargetMock();
+                globalThis.localStorage = new StorageMock();
+                globalThis.sessionStorage = new StorageMock();
+                globalThis.btoa = (value) => Buffer.from(value, 'binary').toString('base64');
+                globalThis.atob = (value) => Buffer.from(value, 'base64').toString('binary');
+
+                try {
+                    const { SessionManager, SESSION_CONFIG } = await import('./src/pages_assets/session.js');
+
+                    const seedManager = new SessionManager({
+                        storage: SESSION_CONFIG.STORAGE_SESSION,
+                        duration: 60_000,
+                    });
+                    await seedManager.startSession(new Uint8Array([1, 2, 3, 4]), true);
+
+                    const persistedEntries = new Map(globalThis.sessionStorage.data);
+                    seedManager.endSession();
+
+                    globalThis.sessionStorage.data = new Map(persistedEntries);
+                    globalThis.document.resetListeners();
+                    globalThis.window.resetListeners();
+
+                    const restoredManager = new SessionManager({
+                        storage: SESSION_CONFIG.STORAGE_SESSION,
+                        duration: 60_000,
+                    });
+
+                    const restoredDek = await restoredManager.restoreSession();
+                    if (!(restoredDek instanceof Uint8Array) || restoredDek.length !== 4) {
+                        throw new Error('expected restoreSession to return the persisted DEK');
+                    }
+
+                    if (globalThis.document.listenerCount('visibilitychange') !== 1) {
+                        throw new Error(`expected one visibilitychange handler after restore, got ${globalThis.document.listenerCount('visibilitychange')}`);
+                    }
+
+                    if (globalThis.window.listenerCount('beforeunload') !== 1) {
+                        throw new Error(`expected one beforeunload handler after restore, got ${globalThis.window.listenerCount('beforeunload')}`);
+                    }
+
+                    restoredManager.endSession();
+                } finally {
+                    globalThis.window = originalWindow;
+                    globalThis.document = originalDocument;
+                    globalThis.localStorage = originalLocalStorage;
+                    globalThis.sessionStorage = originalSessionStorage;
+                    globalThis.btoa = originalBtoa;
+                    globalThis.atob = originalAtob;
+                }
+            "#,
+        )
+    }
+
+    #[test]
+    fn test_variable_virtual_list_coalesces_scroll_frames() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                class MockElement {
+                    constructor() {
+                        this.style = {};
+                        this.dataset = {};
+                        this.children = [];
+                        this.listeners = new Map();
+                        this.clientHeight = 400;
+                        this.scrollTop = 0;
+                        this.innerHTML = '';
+                        this.isConnected = true;
+                        this.className = '';
+                        this.offsetHeight = 80;
+                    }
+
+                    appendChild(child) {
+                        this.children.push(child);
+                        child.isConnected = true;
+                        return child;
+                    }
+
+                    remove() {
+                        this.isConnected = false;
+                    }
+
+                    addEventListener(type, handler) {
+                        this.listeners.set(type, handler);
+                    }
+
+                    removeEventListener(type, handler) {
+                        if (this.listeners.get(type) === handler) {
+                            this.listeners.delete(type);
+                        }
+                    }
+                }
+
+                const originalDocument = globalThis.document;
+                const originalResizeObserver = globalThis.ResizeObserver;
+                const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
+                const originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
+
+                const queuedFrames = [];
+                globalThis.document = {
+                    createElement() {
+                        return new MockElement();
+                    },
+                };
+                globalThis.ResizeObserver = class {
+                    constructor(callback) {
+                        this.callback = callback;
+                    }
+                    observe() {}
+                    disconnect() {}
+                };
+                globalThis.requestAnimationFrame = (callback) => {
+                    queuedFrames.push(callback);
+                    return queuedFrames.length;
+                };
+                globalThis.cancelAnimationFrame = () => {};
+
+                try {
+                    const { VariableHeightVirtualList } = await import('./src/pages_assets/virtual-list.js');
+
+                    const container = new MockElement();
+                    const list = new VariableHeightVirtualList({
+                        container,
+                        totalCount: 100,
+                        estimatedItemHeight: 60,
+                        renderItem: () => new MockElement(),
+                    });
+
+                    queuedFrames.length = 0;
+                    const scrollHandler = container.listeners.get('scroll');
+                    if (typeof scrollHandler !== 'function') {
+                        throw new Error('expected virtual list to register a scroll handler');
+                    }
+
+                    scrollHandler();
+                    scrollHandler();
+                    scrollHandler();
+
+                    if (queuedFrames.length !== 1) {
+                        throw new Error(`expected one queued animation frame for repeated scroll events, got ${queuedFrames.length}`);
+                    }
+
+                    queuedFrames.shift()();
+                    scrollHandler();
+
+                    if (queuedFrames.length !== 1) {
+                        throw new Error(`expected scroll coalescing state to reset after a frame drains, got ${queuedFrames.length}`);
+                    }
+
+                    list.destroy();
+                } finally {
+                    globalThis.document = originalDocument;
+                    globalThis.ResizeObserver = originalResizeObserver;
+                    globalThis.requestAnimationFrame = originalRequestAnimationFrame;
+                    globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
+                }
+            "#,
+        )
+    }
+
+    #[test]
     fn test_auth_qr_scanner_cancel_invalidates_pending_start_and_clears_dom() {
         let auth_js = include_str!("../src/pages_assets/auth.js");
         assert!(

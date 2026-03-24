@@ -174,6 +174,7 @@ export class SessionManager {
 
             // Reset timers with remaining time
             this.setTimers(expiry);
+            this.setupCleanupHandlers();
 
             console.log(`[Session] Restored, expires at ${new Date(expiry).toISOString()}`);
             return dek;
