@@ -2491,7 +2491,7 @@ impl ResizeEvidenceSummary {
 #[derive(Clone, Debug, Default)]
 pub struct DetailFindState {
     pub query: String,
-    pub matches: Vec<u16>,
+    pub matches: Vec<u32>,
     pub current: usize,
 }
 
@@ -3965,6 +3965,11 @@ fn build_detail_find_bar_line(
         return ftui::text::Line::from_spans(spans);
     }
 
+    let display_current = if cached_match_count == 0 {
+        0
+    } else {
+        find.current.min(cached_match_count.saturating_sub(1)) + 1
+    };
     let match_segments: Vec<(String, ftui::Style)> = if cached_match_count == 0 {
         vec![
             (" (".to_string(), match_inactive_style),
@@ -3975,7 +3980,7 @@ fn build_detail_find_bar_line(
     } else {
         vec![
             (" (".to_string(), match_inactive_style),
-            ((find.current + 1).to_string(), match_active_style),
+            (display_current.to_string(), match_active_style),
             (format!("/{cached_match_count}"), match_inactive_style),
             (")".to_string(), match_inactive_style),
         ]
@@ -4444,35 +4449,35 @@ pub struct CassApp {
 
     // -- Detail view ------------------------------------------------------
     /// Scroll position in the detail pane.
-    pub detail_scroll: u16,
+    pub detail_scroll: u32,
     /// Total content lines in the detail pane (set during render).
-    pub detail_content_lines: Cell<u16>,
+    pub detail_content_lines: Cell<u32>,
     /// Visible height of the detail pane viewport (set during render).
-    pub detail_visible_height: Cell<u16>,
+    pub detail_visible_height: Cell<u32>,
     /// Line offsets of each message header in the Messages tab (set during render).
     /// Each entry is `(line_offset, role)` for message-level navigation.
-    pub detail_message_offsets: RefCell<Vec<(u16, crate::model::types::MessageRole)>>,
+    pub detail_message_offsets: RefCell<Vec<(u32, crate::model::types::MessageRole)>>,
     /// Active tab in the detail pane.
     pub detail_tab: DetailTab,
     /// Inline find state within the detail pane.
     pub detail_find: Option<DetailFindState>,
     /// Cache for find-in-detail match line numbers (written during rendering).
-    pub detail_find_matches_cache: RefCell<Vec<u16>>,
+    pub detail_find_matches_cache: RefCell<Vec<u32>>,
     /// Message line numbers (1-indexed) for search hits in the active session.
     /// Used to highlight context and drive hit-to-hit navigation in detail modal.
     pub detail_session_hit_lines: Vec<usize>,
     /// Rendered line offsets for session hits in the Messages tab.
-    pub detail_session_hit_offsets_cache: RefCell<Vec<u16>>,
+    pub detail_session_hit_offsets_cache: RefCell<Vec<u32>>,
     /// Active index in `detail_session_hit_lines`.
     pub detail_session_hit_current: usize,
     /// When true, the next Messages render will schedule an auto-scroll to `detail_session_hit_current`.
     pub detail_session_hit_scroll_pending: Cell<bool>,
     /// Pending scroll target computed during render, applied on the next `Tick`.
-    pub detail_pending_scroll_to: Cell<Option<u16>>,
+    pub detail_pending_scroll_to: Cell<Option<u32>>,
     /// Whether the detail drill-in modal is open.
     pub show_detail_modal: bool,
     /// Scroll position within the detail modal.
-    pub modal_scroll: u16,
+    pub modal_scroll: u32,
     /// Cached conversation for the currently selected result.
     pub cached_detail: Option<(String, ConversationView)>,
     /// Whether word-wrap is enabled in the detail pane.
@@ -8441,7 +8446,7 @@ impl CassApp {
             .enumerate()
             .map(|(idx, line)| (*line, idx + 1))
             .collect();
-        let mut session_hit_offsets: Vec<u16> = Vec::with_capacity(session_hit_total);
+        let mut session_hit_offsets: Vec<u32> = Vec::with_capacity(session_hit_total);
         let session_hit_badge_style = styles.style(style_system::STYLE_QUERY_HIGHLIGHT).bold();
         let session_hit_active_style = styles.style(style_system::STYLE_DETAIL_FIND_MATCH_ACTIVE);
         let current_session_hit_rank = if session_hit_total > 0 {
@@ -8542,14 +8547,11 @@ impl CassApp {
 
             let msg_count = cv.messages.len();
             let subtle_style = styles.style(style_system::STYLE_TEXT_SUBTLE);
-            let mut msg_offsets: Vec<(u16, crate::model::types::MessageRole)> =
+            let mut msg_offsets: Vec<(u32, crate::model::types::MessageRole)> =
                 Vec::with_capacity(msg_count);
             for (msg_idx, msg) in cv.messages.iter().enumerate() {
                 // Record line offset for message-level navigation
-                msg_offsets.push((
-                    (lines.len().min(u16::MAX as usize)) as u16,
-                    msg.role.clone(),
-                ));
+                msg_offsets.push((lines.len() as u32, msg.role.clone()));
                 let msg_line_from_idx = (msg.idx >= 0).then_some((msg.idx as usize) + 1);
                 let msg_line_from_pos = msg_idx + 1;
                 let msg_is_session_hit = msg_line_from_idx
@@ -8604,7 +8606,7 @@ impl CassApp {
                     ""
                 };
                 if msg_is_session_hit {
-                    session_hit_offsets.push((lines.len().min(u16::MAX as usize)) as u16);
+                    session_hit_offsets.push(lines.len() as u32);
                 }
                 let header_gutter = if msg_is_current_session_hit {
                     "\u{258c}\u{25b6}"
@@ -9046,7 +9048,7 @@ impl CassApp {
         query: &str,
         current_match: usize,
         styles: &StyleContext,
-    ) -> Vec<u16> {
+    ) -> Vec<u32> {
         let highlight_style = if styles.options.color_profile.supports_color() {
             styles.style(style_system::STYLE_DETAIL_FIND_MATCH_INACTIVE)
         } else {
@@ -9081,7 +9083,7 @@ impl CassApp {
         query_terms_lower.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         query_terms_lower.dedup();
 
-        let mut match_positions: Vec<u16> = Vec::new();
+        let mut match_positions: Vec<u32> = Vec::new();
         let mut match_idx = 0usize;
 
         for (line_no, line) in lines.iter_mut().enumerate() {
@@ -9145,7 +9147,7 @@ impl CassApp {
                         };
 
                         rebuilt.push(ftui::text::Span::styled(text[pos..end].to_string(), merged));
-                        match_positions.push(line_no.min(u16::MAX as usize) as u16);
+                        match_positions.push(line_no as u32);
                         match_idx += 1;
                         pos = end;
                         continue;
@@ -10036,7 +10038,7 @@ impl CassApp {
                     Self::apply_find_highlight(&mut lines, &find.query, find.current, styles);
                 // Deduplicate: match_positions has one entry per occurrence; we want
                 // unique line numbers for navigation.
-                let mut unique_lines: Vec<u16> = Vec::new();
+                let mut unique_lines: Vec<u32> = Vec::new();
                 for &ln in &matches {
                     if unique_lines.last() != Some(&ln) {
                         unique_lines.push(ln);
@@ -10053,9 +10055,8 @@ impl CassApp {
             let total_lines = lines.len();
 
             // Store content metrics for scroll clamping in update handlers
-            self.detail_content_lines
-                .set((total_lines.min(u16::MAX as usize)) as u16);
-            self.detail_visible_height.set(content_area.height);
+            self.detail_content_lines.set(total_lines as u32);
+            self.detail_visible_height.set(content_area.height as u32);
 
             // Clamp scroll
             let effective_scroll = scroll.min(total_lines.saturating_sub(1));
@@ -15912,8 +15913,9 @@ impl super::ftui_adapter::Model for CassApp {
                     .detail_content_lines
                     .get()
                     .saturating_sub(self.detail_visible_height.get());
-                let new_scroll = (self.detail_scroll as i32 + delta).clamp(0, max_scroll as i32);
-                self.detail_scroll = new_scroll as u16;
+                let new_scroll =
+                    (self.detail_scroll as i64 + delta as i64).clamp(0, max_scroll as i64);
+                self.detail_scroll = new_scroll as u32;
                 ftui::Cmd::none()
             }
             CassMsg::PageScrolled { delta } => {
@@ -15922,9 +15924,9 @@ impl super::ftui_adapter::Model for CassApp {
                         .detail_content_lines
                         .get()
                         .saturating_sub(self.detail_visible_height.get());
-                    let new_scroll =
-                        (self.detail_scroll as i32 + (delta * 20)).clamp(0, max_scroll as i32);
-                    self.detail_scroll = new_scroll as u16;
+                    let new_scroll = (self.detail_scroll as i64 + (delta as i64 * 20))
+                        .clamp(0, max_scroll as i64);
+                    self.detail_scroll = new_scroll as u32;
                 } else if let Some(pane) = self.panes.get_mut(self.active_pane) {
                     let total = pane.hits.len();
                     if total == 0 {
@@ -16309,8 +16311,11 @@ impl super::ftui_adapter::Model for CassApp {
                 // Sync matches from render cache before navigating
                 if let Some(ref mut find) = self.detail_find {
                     let cached = self.detail_find_matches_cache.borrow();
-                    if !cached.is_empty() {
-                        find.matches = cached.clone();
+                    find.matches = cached.clone();
+                    if find.matches.is_empty() {
+                        find.current = 0;
+                    } else if find.current >= find.matches.len() {
+                        find.current = find.matches.len().saturating_sub(1);
                     }
                 }
                 if let Some(ref mut find) = self.detail_find
@@ -26917,6 +26922,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn detail_find_navigation_clears_stale_matches_when_render_cache_is_empty() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::DetailFindToggled);
+        if let Some(ref mut find) = app.detail_find {
+            find.query = "test".to_string();
+            find.matches = vec![10, 30, 50];
+            find.current = 2;
+        }
+        app.detail_scroll = 40;
+        app.detail_find_matches_cache.borrow_mut().clear();
+
+        let _ = app.update(CassMsg::DetailFindNavigated { forward: true });
+
+        let find = app
+            .detail_find
+            .as_ref()
+            .expect("detail find should remain active");
+        assert!(find.matches.is_empty(), "stale matches should be cleared");
+        assert_eq!(
+            find.current, 0,
+            "current index should reset when matches vanish"
+        );
+        assert_eq!(
+            app.detail_scroll, 40,
+            "navigation should not jump when there are no rendered matches"
+        );
+    }
+
     /// Helper: populate cached_detail with messages containing a keyword for find tests.
     fn set_detail_with_keyword(app: &mut CassApp, keyword: &str) {
         let mut cv = make_test_conversation_view();
@@ -27350,6 +27384,54 @@ mod tests {
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0], 0);
         assert_eq!(matches[1], 2);
+    }
+
+    #[test]
+    fn detail_find_highlight_preserves_large_line_offsets() {
+        let styles = StyleContext::from_options(crate::ui::style_system::StyleOptions::default());
+        let mut lines: Vec<ftui::text::Line<'static>> = (0..70_000)
+            .map(|idx| {
+                if idx == 69_999 {
+                    ftui::text::Line::raw("needle".to_string())
+                } else {
+                    ftui::text::Line::raw("filler".to_string())
+                }
+            })
+            .collect();
+
+        let matches = CassApp::apply_find_highlight(&mut lines, "needle", 0, &styles);
+
+        assert_eq!(matches, vec![69_999]);
+    }
+
+    #[test]
+    fn detail_find_bar_line_clamps_stale_current_to_cached_match_count() {
+        let find = DetailFindState {
+            query: "needle".to_string(),
+            matches: vec![2, 4, 7],
+            current: 9,
+        };
+        let line = build_detail_find_bar_line(
+            &find,
+            2,
+            80,
+            ftui::Style::default(),
+            ftui::Style::default(),
+            ftui::Style::default(),
+        );
+        let plain: String = line
+            .spans()
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            plain.contains("(2/2)"),
+            "stale current index should clamp to cached match count, got '{plain}'"
+        );
+        assert!(
+            !plain.contains("(10/2)"),
+            "find bar should not render impossible stale match counters"
+        );
     }
 
     #[test]
