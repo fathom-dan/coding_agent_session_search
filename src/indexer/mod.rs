@@ -3,7 +3,6 @@ pub mod semantic;
 
 use std::collections::HashMap;
 use std::fs;
-use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,6 +31,9 @@ use crate::sources::provenance::{Origin, Source};
 use crate::sources::sync::path_to_safe_dirname;
 use crate::storage::sqlite::{FrankenStorage, MigrationError};
 use semantic::{EmbeddingInput, SemanticIndexer};
+
+#[cfg(test)]
+use std::iter::Peekable;
 
 /// Type alias for batch classification map: (ConnectorKind, Path) -> (ScanRoot, MinTS, MaxTS)
 type BatchClassificationMap =
@@ -403,6 +405,8 @@ pub enum IndexMessage {
         connector_name: &'static str,
         /// Time spent scanning this connector (ms)
         scan_ms: u64,
+        /// Whether this connector was discovered even if it produced no batches
+        is_discovered: bool,
     },
 }
 
@@ -430,6 +434,7 @@ fn conversation_batch_footprint(conv: &NormalizedConversation) -> (usize, usize)
     (message_count, char_count)
 }
 
+#[cfg(test)]
 fn next_streaming_batch(
     conversations: &mut Peekable<std::vec::IntoIter<NormalizedConversation>>,
     limits: StreamingBatchLimits,
@@ -467,6 +472,12 @@ struct StreamingBatchSender<'a> {
     conversations: Vec<NormalizedConversation>,
     message_count: usize,
     char_count: usize,
+}
+
+fn remember_discovered_connector(discovered_names: &mut Vec<String>, connector_name: &'static str) {
+    if !discovered_names.iter().any(|name| name == connector_name) {
+        discovered_names.push(connector_name.to_string());
+    }
 }
 
 impl<'a> StreamingBatchSender<'a> {
@@ -525,6 +536,7 @@ impl<'a> StreamingBatchSender<'a> {
     }
 }
 
+#[cfg(test)]
 fn send_conversation_batches(
     tx: &Sender<IndexMessage>,
     connector_name: &'static str,
@@ -648,6 +660,7 @@ fn spawn_connector_producer(
         let _ = tx.send(IndexMessage::Done {
             connector_name: name,
             scan_ms,
+            is_discovered,
         });
     })
 }
@@ -716,8 +729,8 @@ fn run_streaming_consumer(
                 }
 
                 // Track discovered agent names
-                if is_discovered && !discovered_names.contains(&connector_name.to_string()) {
-                    discovered_names.push(connector_name.to_string());
+                if is_discovered {
+                    remember_discovered_connector(&mut discovered_names, connector_name);
                 }
 
                 // Ingest the batch
@@ -763,6 +776,7 @@ fn run_streaming_consumer(
             Ok(IndexMessage::Done {
                 connector_name,
                 scan_ms,
+                is_discovered,
             }) => {
                 active_producers -= 1;
 
@@ -774,6 +788,10 @@ fn run_streaming_consumer(
                         ..Default::default()
                     });
                 stats.scan_ms = scan_ms;
+
+                if is_discovered {
+                    remember_discovered_connector(&mut discovered_names, connector_name);
+                }
 
                 // If we haven't switched to indexing phase yet, this Done message represents
                 // a completed scan step. Increment current to show scanning progress.
@@ -3498,6 +3516,38 @@ mod tests {
             }
             _ => panic!("expected second message to be a batch"),
         }
+    }
+
+    #[test]
+    fn streaming_consumer_preserves_discovered_connector_with_no_batches() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        let progress = Arc::new(IndexingProgress::default());
+        let (tx, rx) = bounded(2);
+
+        tx.send(IndexMessage::Done {
+            connector_name: "claude",
+            scan_ms: 42,
+            is_discovered: true,
+        })
+        .unwrap();
+        drop(tx);
+
+        let discovered =
+            run_streaming_consumer(rx, 1, &storage, &mut index, &Some(progress.clone()), false)
+                .unwrap();
+
+        assert_eq!(discovered, vec!["claude".to_string()]);
+        let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(stats.agents_discovered, vec!["claude".to_string()]);
+        assert_eq!(stats.total_conversations, 0);
+        assert_eq!(stats.total_messages, 0);
     }
 
     #[test]
