@@ -501,7 +501,7 @@ impl<'a> StreamingBatchSender<'a> {
         self.next_batch_is_discovered = true;
     }
 
-    fn push(&mut self, conversation: NormalizedConversation) {
+    fn push(&mut self, conversation: NormalizedConversation) -> Result<()> {
         let (message_count, char_count) = conversation_batch_footprint(&conversation);
         let would_exceed_limits = !self.conversations.is_empty()
             && (self.conversations.len() >= DEFAULT_STREAMING_BATCH_LIMITS.max_conversations
@@ -510,7 +510,7 @@ impl<'a> StreamingBatchSender<'a> {
                 || self.char_count.saturating_add(char_count)
                     > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
         if would_exceed_limits {
-            self.flush();
+            self.flush()?;
         }
 
         self.message_count += message_count;
@@ -521,26 +521,35 @@ impl<'a> StreamingBatchSender<'a> {
             && (self.message_count > DEFAULT_STREAMING_BATCH_LIMITS.max_messages
                 || self.char_count > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
         if single_conversation_exceeds_limits {
-            self.flush();
+            self.flush()?;
         }
+
+        Ok(())
     }
 
-    fn flush(&mut self) {
+    fn flush(&mut self) -> Result<()> {
         if self.conversations.is_empty() {
-            return;
+            return Ok(());
         }
 
         let message_count = self.message_count;
         let conversations = std::mem::take(&mut self.conversations);
-        let _ = self.tx.send(IndexMessage::Batch {
-            connector_name: self.connector_name,
-            conversations,
-            is_discovered: self.next_batch_is_discovered,
-            message_count,
-        });
+        self.tx
+            .send(IndexMessage::Batch {
+                connector_name: self.connector_name,
+                conversations,
+                is_discovered: self.next_batch_is_discovered,
+                message_count,
+            })
+            .map_err(|_| {
+                anyhow::Error::new(StreamingConsumerDisconnected {
+                    connector_name: self.connector_name,
+                })
+            })?;
         self.message_count = 0;
         self.char_count = 0;
         self.next_batch_is_discovered = false;
+        Ok(())
     }
 }
 
@@ -553,9 +562,13 @@ fn send_conversation_batches(
 ) {
     let mut sender = StreamingBatchSender::new(tx, connector_name, is_discovered);
     for conversation in conversations {
-        sender.push(conversation);
+        sender
+            .push(conversation)
+            .expect("test batch sender should deliver to in-memory receiver");
     }
-    sender.flush();
+    sender
+        .flush()
+        .expect("test batch sender should flush to in-memory receiver");
 }
 
 /// Check if streaming indexing is enabled via environment variable.
@@ -576,6 +589,29 @@ fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
             Err(_) => "non-string panic payload".to_string(),
         },
     }
+}
+
+#[derive(Debug)]
+struct StreamingConsumerDisconnected {
+    connector_name: &'static str,
+}
+
+impl std::fmt::Display for StreamingConsumerDisconnected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "streaming consumer disconnected while sending batch for {}",
+            self.connector_name
+        )
+    }
+}
+
+impl std::error::Error for StreamingConsumerDisconnected {}
+
+fn is_streaming_consumer_disconnected(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<StreamingConsumerDisconnected>()
+        .is_some()
 }
 
 /// Spawn a producer thread that scans a connector and sends batches through the channel.
@@ -612,14 +648,37 @@ fn spawn_connector_producer(
             let mut batch_sender = StreamingBatchSender::new(&tx, name, is_discovered);
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
                 inject_provenance(&mut conversation, &local_origin);
-                batch_sender.push(conversation);
-                Ok(())
+                batch_sender.push(conversation)
             }) {
                 Ok(()) => {
-                    batch_sender.flush();
+                    if let Err(error) = batch_sender.flush() {
+                        if is_streaming_consumer_disconnected(&error) {
+                            tracing::info!(
+                                connector = name,
+                                "streaming consumer disconnected; stopping producer"
+                            );
+                            return;
+                        }
+                        tracing::warn!(connector = name, "local flush failed: {}", error);
+                        let _ = tx.send(IndexMessage::ScanError {
+                            connector_name: name,
+                            error: format!("local flush failed: {error}"),
+                        });
+                    }
                 }
                 Err(e) => {
-                    batch_sender.flush();
+                    if let Err(flush_error) = batch_sender.flush()
+                        && !is_streaming_consumer_disconnected(&flush_error)
+                    {
+                        tracing::warn!(connector = name, "local flush failed: {}", flush_error);
+                    }
+                    if is_streaming_consumer_disconnected(&e) {
+                        tracing::info!(
+                            connector = name,
+                            "streaming consumer disconnected; stopping producer"
+                        );
+                        return;
+                    }
                     tracing::warn!(connector = name, "local scan failed: {}", e);
                     let _ = tx.send(IndexMessage::ScanError {
                         connector_name: name,
@@ -649,14 +708,51 @@ fn spawn_connector_producer(
                     batch_sender.mark_next_batch_discovered();
                 }
 
-                batch_sender.push(conversation);
-                Ok(())
+                batch_sender.push(conversation)
             }) {
                 Ok(()) => {
-                    batch_sender.flush();
+                    if let Err(error) = batch_sender.flush() {
+                        if is_streaming_consumer_disconnected(&error) {
+                            tracing::info!(
+                                connector = name,
+                                "streaming consumer disconnected; stopping producer"
+                            );
+                            return;
+                        }
+                        tracing::warn!(
+                            connector = name,
+                            root = %root.path.display(),
+                            "remote flush failed: {}",
+                            error
+                        );
+                        let _ = tx.send(IndexMessage::ScanError {
+                            connector_name: name,
+                            error: format!(
+                                "remote flush failed for {}: {}",
+                                root.path.display(),
+                                error
+                            ),
+                        });
+                    }
                 }
                 Err(e) => {
-                    batch_sender.flush();
+                    if let Err(flush_error) = batch_sender.flush()
+                        && !is_streaming_consumer_disconnected(&flush_error)
+                    {
+                        tracing::warn!(
+                            connector = name,
+                            root = %root.path.display(),
+                            "remote flush failed: {}",
+                            flush_error
+                        );
+                    }
+                    if is_streaming_consumer_disconnected(&e) {
+                        tracing::info!(
+                            connector = name,
+                            "streaming consumer disconnected; stopping producer"
+                        );
+                        return;
+                    }
                     tracing::warn!(
                         connector = name,
                         root = %root.path.display(),
@@ -3552,6 +3648,59 @@ mod tests {
         Box::new(PanicConnector)
     }
 
+    static DISCONNECT_TEST_COUNTER: Mutex<Option<Arc<AtomicUsize>>> = Mutex::new(None);
+
+    struct DisconnectAwareConnector;
+
+    impl Connector for DisconnectAwareConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult {
+                detected: true,
+                evidence: vec!["fixture".to_string()],
+                root_paths: Vec::new(),
+            }
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(Vec::new())
+        }
+
+        fn scan_with_callback(
+            &self,
+            ctx: &crate::connectors::ScanContext,
+            on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            let counter = DISCONNECT_TEST_COUNTER
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("disconnect test counter should be configured");
+            let scope = if ctx.scan_roots.is_empty() {
+                "local"
+            } else {
+                "remote"
+            };
+
+            for idx in 0..3 {
+                counter.fetch_add(1, Ordering::Relaxed);
+                let oversized = NormalizedMessage {
+                    content: "x".repeat(DEFAULT_STREAMING_BATCH_LIMITS.max_chars + 1),
+                    ..norm_msg(idx, 2_000 + idx)
+                };
+                on_conversation(norm_conv(Some(scope), vec![oversized]))?;
+            }
+
+            Ok(())
+        }
+    }
+
+    fn disconnect_aware_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(DisconnectAwareConnector)
+    }
+
     #[test]
     fn next_streaming_batch_splits_large_message_batches() {
         let limits = StreamingBatchLimits {
@@ -3639,7 +3788,9 @@ mod tests {
         };
         let conversation = norm_conv(Some("huge"), vec![oversized]);
 
-        sender.push(conversation);
+        sender
+            .push(conversation)
+            .expect("oversized conversation should still flush even in tests");
 
         match rx
             .try_recv()
@@ -3666,7 +3817,7 @@ mod tests {
             rx.try_recv().is_err(),
             "sender buffer should be empty after auto-flush"
         );
-        sender.flush();
+        sender.flush().unwrap();
         assert!(rx.try_recv().is_err(), "explicit flush should be a no-op");
     }
 
@@ -3852,6 +4003,48 @@ mod tests {
             Some(message.as_str()),
             "progress tracker should expose the real panic instead of pretending indexing succeeded"
         );
+    }
+
+    #[test]
+    fn streaming_producer_stops_after_consumer_disconnect() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        *DISCONNECT_TEST_COUNTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(counter.clone());
+
+        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+        drop(rx);
+
+        let handle = spawn_connector_producer(
+            "claude",
+            disconnect_aware_connector_factory,
+            tx,
+            data_dir,
+            vec![ScanRoot::remote(
+                PathBuf::from("/remote/fixture/claude"),
+                Origin::remote("fixture-host"),
+                Some(crate::sources::config::Platform::Linux),
+            )],
+            None,
+            None,
+        );
+
+        handle
+            .join()
+            .expect("producer should stop cleanly after consumer disconnect");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "producer should stop after the first failed batch send instead of chewing through local and remote scans"
+        );
+
+        *DISCONNECT_TEST_COUNTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     #[test]
