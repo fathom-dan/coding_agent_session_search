@@ -1858,51 +1858,19 @@ pub fn run_index(
             );
         }
 
-        // Get last scan timestamp for incremental indexing.
-        // If full rebuild or force_rebuild, scan everything (since_ts = None).
-        // Otherwise, only scan files modified since last successful scan.
-        let since_ts = if opts.full || needs_rebuild {
-            None
-        } else {
-            storage
-                .get_last_scan_ts()
-                .unwrap_or(None)
-                .map(|ts| ts.saturating_sub(1))
-        };
-
-        if since_ts.is_some() {
-            tracing::info!(since_ts = ?since_ts, "incremental_scan: using last_scan_ts");
-        } else {
-            tracing::info!("full_scan: no last_scan_ts or rebuild requested");
+        let rebuild_from_canonical_only = opts.full
+            && initial_canonical_sessions_before_salvage > 0
+            && !storage_rebuilt
+            && !opened_fresh_for_full;
+        if rebuild_from_canonical_only {
+            tracing::info!(
+                db_path = %opts.db_path.display(),
+                conversations = initial_canonical_sessions_before_salvage,
+                "skipping raw source rescan during full rebuild because the canonical database is already populated"
+            );
         }
 
-        // Choose between streaming indexing (Opt 8.2) and batch indexing
-        if streaming_index_enabled() {
-            tracing::info!("using streaming indexing (Opt 8.2)");
-            run_streaming_index(
-                &storage,
-                &mut t_index,
-                &opts,
-                since_ts,
-                needs_rebuild,
-                remote_roots.clone(),
-            )?;
-        } else {
-            tracing::info!("using batch indexing (streaming disabled via CASS_STREAMING_INDEX=0)");
-            run_batch_index(
-                &storage,
-                &mut t_index,
-                &opts,
-                since_ts,
-                needs_rebuild,
-                remote_roots.clone(),
-            )?;
-        }
-        performed_scan = true;
-
-        t_index.commit()?;
-
-        if opts.full || historical_salvage.messages_imported > 0 {
+        if rebuild_from_canonical_only {
             let total_conversations = storage.count_sessions_in_range(None, None, None, None)?.0;
             drop(t_index);
             rebuild_tantivy_from_db(
@@ -1912,6 +1880,65 @@ pub fn run_index(
                 opts.progress.clone(),
             )?;
             t_index = TantivyIndex::open_or_create(&index_path)?;
+        } else {
+            // Get last scan timestamp for incremental indexing.
+            // If full rebuild or force_rebuild, scan everything (since_ts = None).
+            // Otherwise, only scan files modified since last successful scan.
+            let since_ts = if opts.full || needs_rebuild {
+                None
+            } else {
+                storage
+                    .get_last_scan_ts()
+                    .unwrap_or(None)
+                    .map(|ts| ts.saturating_sub(1))
+            };
+
+            if since_ts.is_some() {
+                tracing::info!(since_ts = ?since_ts, "incremental_scan: using last_scan_ts");
+            } else {
+                tracing::info!("full_scan: no last_scan_ts or rebuild requested");
+            }
+
+            // Choose between streaming indexing (Opt 8.2) and batch indexing
+            if streaming_index_enabled() {
+                tracing::info!("using streaming indexing (Opt 8.2)");
+                run_streaming_index(
+                    &storage,
+                    &mut t_index,
+                    &opts,
+                    since_ts,
+                    needs_rebuild,
+                    remote_roots.clone(),
+                )?;
+            } else {
+                tracing::info!(
+                    "using batch indexing (streaming disabled via CASS_STREAMING_INDEX=0)"
+                );
+                run_batch_index(
+                    &storage,
+                    &mut t_index,
+                    &opts,
+                    since_ts,
+                    needs_rebuild,
+                    remote_roots.clone(),
+                )?;
+            }
+            performed_scan = true;
+
+            t_index.commit()?;
+
+            if opts.full || historical_salvage.messages_imported > 0 {
+                let total_conversations =
+                    storage.count_sessions_in_range(None, None, None, None)?.0;
+                drop(t_index);
+                rebuild_tantivy_from_db(
+                    &opts.db_path,
+                    &opts.data_dir,
+                    usize::try_from(total_conversations.max(0)).unwrap_or(usize::MAX),
+                    opts.progress.clone(),
+                )?;
+                t_index = TantivyIndex::open_or_create(&index_path)?;
+            }
         }
 
         t_index
