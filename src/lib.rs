@@ -47,6 +47,41 @@ fn read_watch_once_paths_env() -> Option<Vec<std::path::PathBuf>> {
         .filter(|v| !v.is_empty())
 }
 
+fn with_frankensqlite_connection<T, F>(
+    db_path: &Path,
+    context: &str,
+    op: F,
+) -> std::result::Result<T, frankensqlite::FrankenError>
+where
+    F: FnOnce(&frankensqlite::Connection) -> std::result::Result<T, frankensqlite::FrankenError>,
+{
+    let mut conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+    let result = op(&conn);
+    let close_result = conn.close_in_place();
+    match (result, close_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(value), Err(close_err)) => {
+            warn!(
+                error = %close_err,
+                db_path = %db_path.display(),
+                "{context}: close_in_place failed; falling back to best-effort close"
+            );
+            conn.close_best_effort_in_place();
+            Ok(value)
+        }
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(close_err)) => {
+            warn!(
+                error = %close_err,
+                db_path = %db_path.display(),
+                "{context}: close_in_place failed after error; falling back to best-effort close"
+            );
+            conn.close_best_effort_in_place();
+            Err(err)
+        }
+    }
+}
+
 /// Command-line interface.
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -11938,7 +11973,6 @@ fn run_index_with_data(
     json: bool,
     idempotency_key: Option<String>,
 ) -> CliResult<()> {
-    use frankensqlite::Connection;
     use frankensqlite::compat::{ConnectionExt, RowExt};
     use std::time::Instant;
 
@@ -11974,46 +12008,45 @@ fn run_index_with_data(
     };
 
     // Check for cached idempotency result
-    if let Some(key) = &idempotency_key
-        && let Ok(conn) = Connection::open(db_path.to_string_lossy().as_ref())
-    {
-        // Ensure idempotency_keys table exists
-        if let Err(e) = conn.execute(
-            "CREATE TABLE IF NOT EXISTS idempotency_keys (
-                key TEXT PRIMARY KEY,
-                params_hash TEXT NOT NULL,
-                result_json TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL
-            )",
-        ) {
-            tracing::warn!("Failed to create idempotency_keys table: {e}");
-        }
+    if let Some(key) = &idempotency_key {
+        let cached = with_frankensqlite_connection(
+            &db_path,
+            "checking index idempotency cache",
+            |conn| {
+                if let Err(e) = conn.execute(
+                    "CREATE TABLE IF NOT EXISTS idempotency_keys (
+                        key TEXT PRIMARY KEY,
+                        params_hash TEXT NOT NULL,
+                        result_json TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        expires_at INTEGER NOT NULL
+                    )",
+                ) {
+                    tracing::warn!("Failed to create idempotency_keys table: {e}");
+                }
 
-        // Clean expired keys
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        if let Err(e) = conn.execute_compat(
-            "DELETE FROM idempotency_keys WHERE expires_at < ?1",
-            frankensqlite::params![now_ms],
-        ) {
-            tracing::warn!("Failed to clean expired idempotency keys: {e}");
-        }
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                if let Err(e) = conn.execute_compat(
+                    "DELETE FROM idempotency_keys WHERE expires_at < ?1",
+                    frankensqlite::params![now_ms],
+                ) {
+                    tracing::warn!("Failed to clean expired idempotency keys: {e}");
+                }
 
-        // Look up existing key
-        let cached: Option<(String, String)> = conn
-            .query_row_map(
-                "SELECT params_hash, result_json FROM idempotency_keys WHERE key = ?1 AND expires_at > ?2",
-                frankensqlite::params![key.as_str(), now_ms],
-                |r: &frankensqlite::Row| Ok((r.get_typed(0)?, r.get_typed(1)?)),
-            )
-            .ok();
+                let cached: Option<(String, String)> = conn
+                    .query_row_map(
+                        "SELECT params_hash, result_json FROM idempotency_keys WHERE key = ?1 AND expires_at > ?2",
+                        frankensqlite::params![key.as_str(), now_ms],
+                        |r: &frankensqlite::Row| Ok((r.get_typed(0)?, r.get_typed(1)?)),
+                    )
+                    .ok();
+                Ok(cached)
+            },
+        );
 
-        if let Some((stored_hash, result_json)) = cached {
-            // Verify params match
+        if let Ok(Some((stored_hash, result_json))) = cached {
             if stored_hash == params_hash.to_string() {
-                // Return cached result
                 if let Some(fmt) = structured_format {
-                    // Parse and augment with cached flag
                     if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&result_json) {
                         val["cached"] = serde_json::json!(true);
                         val["idempotency_key"] = serde_json::json!(key);
@@ -12028,7 +12061,6 @@ fn run_index_with_data(
                     return Ok(());
                 }
             } else {
-                // Parameter mismatch - return error
                 return Err(CliError {
                     code: 5,
                     kind: "idempotency_mismatch",
@@ -12037,7 +12069,8 @@ fn run_index_with_data(
                         key
                     ),
                     hint: Some(
-                        "Use a different idempotency key or wait for the existing one to expire (24h)".to_string(),
+                        "Use a different idempotency key or wait for the existing one to expire (24h)"
+                            .to_string(),
                     ),
                     retryable: false,
                 });
@@ -12321,25 +12354,20 @@ fn run_index_with_data(
     } else if let Some(fmt) = structured_format {
         // Get stats after successful indexing
         let (conversations, messages) =
-            if let Ok(conn) = Connection::open(db_path.to_string_lossy().as_ref()) {
-                let convs: i64 = conn
-                    .query_row_map(
-                        "SELECT COUNT(*) FROM conversations",
-                        &[],
-                        |r: &frankensqlite::Row| r.get_typed(0),
-                    )
-                    .unwrap_or(0);
-                let msgs: i64 = conn
-                    .query_row_map(
-                        "SELECT COUNT(*) FROM messages",
-                        &[],
-                        |r: &frankensqlite::Row| r.get_typed(0),
-                    )
-                    .unwrap_or(0);
-                (convs, msgs)
-            } else {
-                (0, 0)
-            };
+            with_frankensqlite_connection(&db_path, "collecting index result counts", |conn| {
+                let convs: i64 = conn.query_row_map(
+                    "SELECT COUNT(*) FROM conversations",
+                    &[],
+                    |r: &frankensqlite::Row| r.get_typed(0),
+                )?;
+                let msgs: i64 = conn.query_row_map(
+                    "SELECT COUNT(*) FROM messages",
+                    &[],
+                    |r: &frankensqlite::Row| r.get_typed(0),
+                )?;
+                Ok((convs, msgs))
+            })
+            .unwrap_or((0, 0));
         let mut payload = serde_json::json!({
             "success": true,
             "elapsed_ms": elapsed_ms,
@@ -12366,17 +12394,22 @@ fn run_index_with_data(
             payload["idempotency_key"] = serde_json::json!(key);
             payload["cached"] = serde_json::json!(false);
 
-            if let Ok(conn) = Connection::open(db_path.to_string_lossy().as_ref()) {
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                let expires_ms = now_ms + 24 * 60 * 60 * 1000; // 24 hours
-                let result_json = serde_json::to_string(&payload).unwrap_or_default();
-                let hash_str = params_hash.to_string();
-                if let Err(e) = conn.execute_compat(
-                    "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    frankensqlite::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
-                ) {
-                    tracing::warn!("Failed to store idempotency key: {e}");
-                }
+            if let Err(e) = with_frankensqlite_connection(
+                &db_path,
+                "storing index idempotency result",
+                |conn| {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let expires_ms = now_ms + 24 * 60 * 60 * 1000; // 24 hours
+                    let result_json = serde_json::to_string(&payload).unwrap_or_default();
+                    let hash_str = params_hash.to_string();
+                    conn.execute_compat(
+                        "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        frankensqlite::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
+                    )?;
+                    Ok(())
+                },
+            ) {
+                tracing::warn!("Failed to store idempotency key: {e}");
             }
         }
 

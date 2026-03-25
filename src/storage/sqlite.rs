@@ -414,6 +414,14 @@ impl FrankenConnectionManager {
     }
 }
 
+impl Drop for FrankenConnectionManager {
+    fn drop(&mut self) {
+        for reader in &mut self.readers {
+            reader.get_mut().0.close_best_effort_in_place();
+        }
+    }
+}
+
 /// RAII guard for a writer connection.
 ///
 /// Provides access to a [`FrankenStorage`] for write operations.
@@ -445,6 +453,7 @@ impl Drop for WriterGuard<'_> {
             // Best-effort rollback — connection may already be in autocommit
             let _ = self.storage.raw().execute("ROLLBACK;");
         }
+        self.storage.close_best_effort_in_place();
         // Release writer token
         let _ = self.mgr.writer_tokens.0.send(());
     }
@@ -2192,7 +2201,12 @@ impl FrankenStorage {
         let storage = Self { conn };
         storage.run_migrations()?;
         if !db_existed {
-            drop(storage);
+            storage.close().with_context(|| {
+                format!(
+                    "closing freshly migrated frankensqlite db before FTS bootstrap: {}",
+                    path.display()
+                )
+            })?;
             materialize_fresh_fts_schema_via_rusqlite(path)?;
             let conn = FrankenConnection::open(&path_str)
                 .with_context(|| format!("reopening frankensqlite db at {}", path.display()))?;
@@ -2240,6 +2254,10 @@ impl FrankenStorage {
         self.conn
             .close()
             .with_context(|| "closing frankensqlite connection")
+    }
+
+    pub fn close_best_effort_in_place(&mut self) {
+        self.conn.close_best_effort_in_place();
     }
 
     /// Access the raw frankensqlite connection.
@@ -8136,7 +8154,7 @@ mod tests {
 
         let storage = SqliteStorage::open(&db_path).unwrap();
         assert!(db_path.exists());
-        drop(storage);
+        storage.close().unwrap();
     }
 
     #[test]

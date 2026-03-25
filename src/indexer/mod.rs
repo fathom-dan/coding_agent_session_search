@@ -2097,7 +2097,8 @@ pub fn run_index(
     if opts.watch || opts.watch_once_paths.is_some() {
         let opts_clone = opts.clone();
         let state = Mutex::new(load_watch_state(&opts.data_dir));
-        let storage = Mutex::new(storage);
+        let storage = Arc::new(Mutex::new(storage));
+        let storage_for_watch = Arc::clone(&storage);
         let t_index = Mutex::new(t_index);
 
         // Semantic embedding cooldown state for watch mode.
@@ -2133,7 +2134,7 @@ pub fn run_index(
         // Clone detector for the callback
         let detector_clone = stale_detector.clone();
 
-        watch_sources(
+        let watch_result = watch_sources(
             opts.watch_once_paths.clone(),
             watch_roots.clone(),
             event_channel,
@@ -2157,7 +2158,7 @@ pub fn run_index(
                         all_root_paths,
                         roots,
                         &state,
-                        &storage,
+                        &storage_for_watch,
                         &t_index,
                         true,
                     );
@@ -2169,7 +2170,15 @@ pub fn run_index(
                     )
                 } else {
                     let indexed = finalize_watch_reindex_result(
-                        reindex_paths(&opts_clone, paths, roots, &state, &storage, &t_index, false),
+                        reindex_paths(
+                            &opts_clone,
+                            paths,
+                            roots,
+                            &state,
+                            &storage_for_watch,
+                            &t_index,
+                            false,
+                        ),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
                         "watch incremental reindex",
@@ -2199,7 +2208,7 @@ pub fn run_index(
                         match incremental_semantic_embed(
                             &embedder_id,
                             &data_dir_for_semantic,
-                            &storage,
+                            &storage_for_watch,
                         ) {
                             Ok(0) => {} // no new messages to embed
                             Ok(n) => {
@@ -2222,10 +2231,58 @@ pub fn run_index(
                     }
                 }
             },
-        )?;
+        );
+
+        let close_result =
+            release_watch_storage_after_index(storage, &opts.db_path, "watch indexing session");
+        if let Err(err) = watch_result {
+            if let Err(close_err) = close_result {
+                tracing::warn!(
+                    error = %close_err,
+                    db_path = %opts.db_path.display(),
+                    "failed to close canonical db cleanly after watch indexing error"
+                );
+            }
+            return Err(err);
+        }
+        close_result?;
+        return Ok(());
     }
 
-    Ok(())
+    close_storage_after_index(storage, &opts.db_path, "index run")
+}
+
+fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &str) -> Result<()> {
+    storage.close().with_context(|| {
+        format!(
+            "closing canonical db after {context}: {}",
+            db_path.display()
+        )
+    })
+}
+
+fn release_watch_storage_after_index(
+    storage: Arc<Mutex<FrankenStorage>>,
+    db_path: &Path,
+    context: &str,
+) -> Result<()> {
+    let storage = Arc::try_unwrap(storage).map_err(|_| {
+        anyhow::anyhow!(
+            "watch indexing retained extra canonical db handles while closing {}",
+            db_path.display()
+        )
+    })?;
+    match storage.into_inner() {
+        Ok(storage) => close_storage_after_index(storage, db_path, context),
+        Err(poisoned) => {
+            let mut storage = poisoned.into_inner();
+            storage.close_best_effort_in_place();
+            Err(anyhow::anyhow!(
+                "storage mutex poisoned while closing canonical db after {context}: {}",
+                db_path.display()
+            ))
+        }
+    }
 }
 
 /// Perform incremental semantic embedding for messages added since the last
@@ -3983,52 +4040,76 @@ pub mod persist {
                     )
                 })?;
                 apply_begin_concurrent_writer_tuning(&franken);
-                let mut outcomes = Vec::with_capacity(chunk.len());
-                let mut agent_cache: HashMap<String, i64> = HashMap::new();
-                let mut workspace_cache: HashMap<std::path::PathBuf, i64> = HashMap::new();
+                let result: Result<Vec<(usize, InsertOutcome)>> = (|| {
+                    let mut outcomes = Vec::with_capacity(chunk.len());
+                    let mut agent_cache: HashMap<String, i64> = HashMap::new();
+                    let mut workspace_cache: HashMap<std::path::PathBuf, i64> = HashMap::new();
 
-                for (offset, conv) in chunk.iter().enumerate() {
-                    let idx = chunk_idx * chunk_size + offset;
+                    for (offset, conv) in chunk.iter().enumerate() {
+                        let idx = chunk_idx * chunk_size + offset;
 
-                    // Wrap the entire ensure_agent + ensure_workspace +
-                    // insert_conversation_tree sequence in the retry loop, since
-                    // ensure_agent/workspace also write and can hit page conflicts.
-                    let agent_slug = conv.agent_slug.clone();
-                    let workspace = conv.workspace.clone();
-                    let internal = map_to_internal(conv);
+                        // Wrap the entire ensure_agent + ensure_workspace +
+                        // insert_conversation_tree sequence in the retry loop, since
+                        // ensure_agent/workspace also write and can hit page conflicts.
+                        let agent_slug = conv.agent_slug.clone();
+                        let workspace = conv.workspace.clone();
+                        let internal = map_to_internal(conv);
 
-                    let outcome = with_concurrent_retry(max_retries, || {
-                        let agent_id = if let Some(id) = agent_cache.get(&agent_slug) {
-                            *id
-                        } else {
-                            let agent = Agent {
-                                id: None,
-                                slug: agent_slug.clone(),
-                                name: agent_slug.clone(),
-                                version: None,
-                                kind: AgentKind::Cli,
-                            };
-                            let id = franken.ensure_agent(&agent)?;
-                            agent_cache.insert(agent_slug.clone(), id);
-                            id
-                        };
-                        let workspace_id = if let Some(ws) = &workspace {
-                            if let Some(id) = workspace_cache.get(ws) {
-                                Some(*id)
+                        let outcome = with_concurrent_retry(max_retries, || {
+                            let agent_id = if let Some(id) = agent_cache.get(&agent_slug) {
+                                *id
                             } else {
-                                let id = franken.ensure_workspace(ws, None)?;
-                                workspace_cache.insert(ws.clone(), id);
-                                Some(id)
-                            }
-                        } else {
-                            None
-                        };
-                        franken.insert_conversation_tree(agent_id, workspace_id, &internal)
-                    })?;
-                    outcomes.push((idx, outcome));
-                }
+                                let agent = Agent {
+                                    id: None,
+                                    slug: agent_slug.clone(),
+                                    name: agent_slug.clone(),
+                                    version: None,
+                                    kind: AgentKind::Cli,
+                                };
+                                let id = franken.ensure_agent(&agent)?;
+                                agent_cache.insert(agent_slug.clone(), id);
+                                id
+                            };
+                            let workspace_id = if let Some(ws) = &workspace {
+                                if let Some(id) = workspace_cache.get(ws) {
+                                    Some(*id)
+                                } else {
+                                    let id = franken.ensure_workspace(ws, None)?;
+                                    workspace_cache.insert(ws.clone(), id);
+                                    Some(id)
+                                }
+                            } else {
+                                None
+                            };
+                            franken.insert_conversation_tree(agent_id, workspace_id, &internal)
+                        })?;
+                        outcomes.push((idx, outcome));
+                    }
 
-                Ok(outcomes)
+                    Ok(outcomes)
+                })();
+                let close_result = franken.close().with_context(|| {
+                    format!(
+                        "closing frankensqlite writer for begin-concurrent mode: {}",
+                        db_path.display()
+                    )
+                });
+                match result {
+                    Ok(outcomes) => {
+                        close_result?;
+                        Ok(outcomes)
+                    }
+                    Err(err) => {
+                        if let Err(close_err) = close_result {
+                            tracing::warn!(
+                                error = %close_err,
+                                db_path = %db_path.display(),
+                                "failed to close begin-concurrent writer cleanly after index error"
+                            );
+                        }
+                        Err(err)
+                    }
+                }
             })
             .collect();
 
@@ -6137,7 +6218,7 @@ mod tests {
 
         // Explicitly drop resources to release locks before cleanup
         drop(t_index);
-        drop(storage);
+        storage.into_inner().unwrap().close().unwrap();
         drop(state);
 
         if let Some(prev) = prev {
