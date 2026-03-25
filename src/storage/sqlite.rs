@@ -14,6 +14,7 @@ use frankensqlite::{
     migrate::MigrationRunner,
 };
 use rusqlite::OptionalExtension as RusqliteOptionalExtension;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -954,7 +955,35 @@ CREATE TABLE snippets (
 );
 ";
 const HISTORICAL_SALVAGE_LEDGER_VERSION: u32 = 2;
+const HISTORICAL_SALVAGE_PROGRESS_VERSION: u32 = 1;
 const SOURCE_PATH_MERGE_START_TOLERANCE_MS: i64 = 5 * 60 * 1000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalBundleProgress {
+    progress_version: u32,
+    path: String,
+    bytes: u64,
+    modified_at_ms: i64,
+    method: String,
+    last_completed_source_row_id: i64,
+    conversations_imported: usize,
+    messages_imported: usize,
+    updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct HistoricalBatchEntry {
+    source_row_id: i64,
+    agent_id: i64,
+    workspace_id: Option<i64>,
+    conversation: Conversation,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct HistoricalBatchImportTotals {
+    inserted_source_rows: usize,
+    inserted_messages: usize,
+}
 
 fn historical_bundle_root_paths(db_path: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
@@ -3458,7 +3487,33 @@ impl FrankenStorage {
         Ok(())
     }
 
+    fn historical_bundle_key_hash(
+        version: u32,
+        bundle: &HistoricalDatabaseBundle,
+        include_bundle_stats: bool,
+    ) -> String {
+        let signature = if include_bundle_stats {
+            format!(
+                "{}:{}:{}:{}",
+                version,
+                bundle.root_path.display(),
+                bundle.total_bytes,
+                bundle.modified_at_ms
+            )
+        } else {
+            format!("{}:{}", version, bundle.root_path.display())
+        };
+        blake3::hash(signature.as_bytes()).to_hex().to_string()
+    }
+
     fn historical_bundle_meta_key(bundle: &HistoricalDatabaseBundle) -> String {
+        format!(
+            "historical_bundle_salvaged:{}",
+            Self::historical_bundle_key_hash(HISTORICAL_SALVAGE_LEDGER_VERSION, bundle, false)
+        )
+    }
+
+    fn historical_bundle_legacy_meta_key(bundle: &HistoricalDatabaseBundle) -> String {
         let signature = format!(
             "{}:{}:{}:{}",
             HISTORICAL_SALVAGE_LEDGER_VERSION,
@@ -3472,20 +3527,120 @@ impl FrankenStorage {
         )
     }
 
+    fn historical_bundle_progress_key(bundle: &HistoricalDatabaseBundle) -> String {
+        format!(
+            "historical_bundle_progress:{}",
+            Self::historical_bundle_key_hash(HISTORICAL_SALVAGE_PROGRESS_VERSION, bundle, false)
+        )
+    }
+
+    fn historical_bundle_legacy_progress_key(bundle: &HistoricalDatabaseBundle) -> String {
+        let signature = format!(
+            "{}:{}:{}:{}",
+            HISTORICAL_SALVAGE_PROGRESS_VERSION,
+            bundle.root_path.display(),
+            bundle.total_bytes,
+            bundle.modified_at_ms
+        );
+        format!(
+            "historical_bundle_progress:{}",
+            blake3::hash(signature.as_bytes()).to_hex()
+        )
+    }
+
     fn historical_bundle_already_imported(
         &self,
         bundle: &HistoricalDatabaseBundle,
     ) -> Result<bool> {
-        let key = Self::historical_bundle_meta_key(bundle);
-        let existing: Option<String> = self
-            .conn
-            .query_row_map(
-                "SELECT value FROM meta WHERE key = ?1",
-                fparams![key.as_str()],
-                |row| row.get_typed(0),
-            )
-            .optional()?;
-        Ok(existing.is_some())
+        for key in [
+            Self::historical_bundle_meta_key(bundle),
+            Self::historical_bundle_legacy_meta_key(bundle),
+        ] {
+            let existing: Option<String> = self
+                .conn
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    fparams![key.as_str()],
+                    |row| row.get_typed(0),
+                )
+                .optional()?;
+            if existing.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn load_historical_bundle_progress(
+        &self,
+        bundle: &HistoricalDatabaseBundle,
+    ) -> Result<Option<HistoricalBundleProgress>> {
+        for key in [
+            Self::historical_bundle_progress_key(bundle),
+            Self::historical_bundle_legacy_progress_key(bundle),
+        ] {
+            let raw: Option<String> = self
+                .conn
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    fparams![key.as_str()],
+                    |row| row.get_typed(0),
+                )
+                .optional()?;
+            let Some(raw) = raw else {
+                continue;
+            };
+            let parsed: HistoricalBundleProgress =
+                serde_json::from_str(&raw).with_context(|| {
+                    format!(
+                        "parsing historical salvage progress checkpoint for {}",
+                        bundle.root_path.display()
+                    )
+                })?;
+            if parsed.progress_version == HISTORICAL_SALVAGE_PROGRESS_VERSION {
+                return Ok(Some(parsed));
+            }
+        }
+        Ok(None)
+    }
+
+    fn record_historical_bundle_progress(
+        &self,
+        bundle: &HistoricalDatabaseBundle,
+        method: &str,
+        last_completed_source_row_id: i64,
+        conversations_imported: usize,
+        messages_imported: usize,
+    ) -> Result<()> {
+        let key = Self::historical_bundle_progress_key(bundle);
+        let value = HistoricalBundleProgress {
+            progress_version: HISTORICAL_SALVAGE_PROGRESS_VERSION,
+            path: bundle.root_path.display().to_string(),
+            bytes: bundle.total_bytes,
+            modified_at_ms: bundle.modified_at_ms,
+            method: method.to_string(),
+            last_completed_source_row_id,
+            conversations_imported,
+            messages_imported,
+            updated_at_ms: Self::now_millis(),
+        };
+        let value_str = serde_json::to_string(&value)?;
+        self.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![key.as_str(), value_str.as_str()],
+        )?;
+        Ok(())
+    }
+
+    fn clear_historical_bundle_progress(&self, bundle: &HistoricalDatabaseBundle) -> Result<()> {
+        for key in [
+            Self::historical_bundle_progress_key(bundle),
+            Self::historical_bundle_legacy_progress_key(bundle),
+        ] {
+            self.conn
+                .execute_compat("DELETE FROM meta WHERE key = ?1", fparams![key.as_str()])?;
+        }
+        Ok(())
     }
 
     fn record_historical_bundle_import(
@@ -3512,6 +3667,105 @@ impl FrankenStorage {
             fparams![key.as_str(), value_str.as_str()],
         )?;
         Ok(())
+    }
+
+    fn historical_import_error_is_split_retryable(err: &anyhow::Error) -> bool {
+        const RETRYABLE_PATTERNS: &[&str] = &[
+            "out of memory",
+            "string or blob too big",
+            "too many sql variables",
+        ];
+        err.chain().any(|cause| {
+            let rendered = cause.to_string().to_ascii_lowercase();
+            RETRYABLE_PATTERNS
+                .iter()
+                .any(|pattern| rendered.contains(pattern))
+        })
+    }
+
+    fn split_historical_batch_entry_messages(
+        entry: &HistoricalBatchEntry,
+    ) -> Option<(HistoricalBatchEntry, HistoricalBatchEntry)> {
+        if entry.conversation.messages.len() < 2 {
+            return None;
+        }
+        let split_at = entry.conversation.messages.len() / 2;
+        if split_at == 0 || split_at >= entry.conversation.messages.len() {
+            return None;
+        }
+
+        let mut left = entry.clone();
+        left.conversation.messages = entry.conversation.messages[..split_at].to_vec();
+
+        let mut right = entry.clone();
+        right.conversation.messages = entry.conversation.messages[split_at..].to_vec();
+
+        Some((left, right))
+    }
+
+    fn import_historical_batch_with_retry<F>(
+        entries: &[HistoricalBatchEntry],
+        insert_batch: &mut F,
+    ) -> Result<HistoricalBatchImportTotals>
+    where
+        F: FnMut(&[HistoricalBatchEntry]) -> Result<HistoricalBatchImportTotals>,
+    {
+        match insert_batch(entries) {
+            Ok(totals) => Ok(totals),
+            Err(err) if Self::historical_import_error_is_split_retryable(&err) => {
+                if entries.len() > 1 {
+                    let mid = entries.len() / 2;
+                    tracing::warn!(
+                        batch_entries = entries.len(),
+                        split_left = mid,
+                        split_right = entries.len() - mid,
+                        error = %err,
+                        "historical salvage batch failed; retrying in smaller sub-batches"
+                    );
+                    let left =
+                        Self::import_historical_batch_with_retry(&entries[..mid], insert_batch)?;
+                    let right =
+                        Self::import_historical_batch_with_retry(&entries[mid..], insert_batch)?;
+                    return Ok(HistoricalBatchImportTotals {
+                        inserted_source_rows: left.inserted_source_rows
+                            + right.inserted_source_rows,
+                        inserted_messages: left.inserted_messages + right.inserted_messages,
+                    });
+                }
+
+                if let Some(entry) = entries.first() {
+                    if let Some((left, right)) = Self::split_historical_batch_entry_messages(entry)
+                    {
+                        tracing::warn!(
+                            source_row_id = entry.source_row_id,
+                            message_count = entry.conversation.messages.len(),
+                            error = %err,
+                            "historical salvage conversation failed; retrying in smaller message slices"
+                        );
+                        let left_totals = Self::import_historical_batch_with_retry(
+                            std::slice::from_ref(&left),
+                            insert_batch,
+                        )?;
+                        let right_totals = Self::import_historical_batch_with_retry(
+                            std::slice::from_ref(&right),
+                            insert_batch,
+                        )?;
+                        return Ok(HistoricalBatchImportTotals {
+                            inserted_source_rows: usize::from(
+                                left_totals.inserted_source_rows > 0
+                                    || right_totals.inserted_source_rows > 0,
+                            ),
+                            inserted_messages: left_totals
+                                .inserted_messages
+                                .saturating_add(right_totals.inserted_messages),
+                        });
+                    }
+                }
+
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn import_historical_sources(&self, source_conn: &rusqlite::Connection) -> Result<()> {
@@ -3550,6 +3804,8 @@ impl FrankenStorage {
 
     fn import_historical_conversations(
         &self,
+        bundle: &HistoricalDatabaseBundle,
+        salvage_method: &str,
         source_conn: &rusqlite::Connection,
     ) -> Result<(usize, usize)> {
         let batch_limits = historical_import_batch_limits();
@@ -3560,6 +3816,11 @@ impl FrankenStorage {
             .into_iter()
             .map(|source| source.id)
             .collect();
+        let resume_progress = self.load_historical_bundle_progress(bundle)?;
+        let resume_after_row_id = resume_progress
+            .as_ref()
+            .map(|progress| progress.last_completed_source_row_id)
+            .filter(|row_id| *row_id > 0);
 
         tracing::info!(
             target: "cass::historical_salvage",
@@ -3567,10 +3828,22 @@ impl FrankenStorage {
             batch_messages = batch_limits.messages,
             batch_payload_chars = batch_limits.payload_chars,
             cache_enabled,
+            resume_after_row_id,
             "configured historical salvage batch limits"
         );
 
-        let mut conv_stmt = source_conn.prepare(
+        if let Some(progress) = &resume_progress {
+            tracing::info!(
+                target: "cass::historical_salvage",
+                path = %bundle.root_path.display(),
+                resume_after_row_id = progress.last_completed_source_row_id,
+                prior_conversations_imported = progress.conversations_imported,
+                prior_messages_imported = progress.messages_imported,
+                "resuming historical salvage bundle from durable checkpoint"
+            );
+        }
+
+        let conv_sql = if resume_after_row_id.is_some() {
             "SELECT
                 c.id,
                 a.slug,
@@ -3587,8 +3860,28 @@ impl FrankenStorage {
              FROM conversations c
              JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
-             ORDER BY c.id",
-        )?;
+             WHERE c.id > ?1
+             ORDER BY c.id"
+        } else {
+            "SELECT
+                c.id,
+                a.slug,
+                w.path,
+                c.external_id,
+                c.title,
+                c.source_path,
+                c.started_at,
+                c.ended_at,
+                c.approx_tokens,
+                c.metadata_json,
+                c.source_id,
+                c.origin_host
+             FROM conversations c
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             ORDER BY c.id"
+        };
+        let mut conv_stmt = source_conn.prepare(conv_sql)?;
         let mut message_stmt = source_conn.prepare(
             "SELECT idx, role, author, created_at, content, extra_json
              FROM messages
@@ -3596,17 +3889,27 @@ impl FrankenStorage {
              ORDER BY idx",
         )?;
 
-        let mut rows = conv_stmt.query([])?;
-        let mut imported_conversations = 0usize;
-        let mut imported_messages = 0usize;
-        let mut pending_batch: Vec<(i64, Option<i64>, Conversation)> = Vec::new();
+        let mut rows = if let Some(last_completed_source_row_id) = resume_after_row_id {
+            conv_stmt.query(rusqlite::params![last_completed_source_row_id])?
+        } else {
+            conv_stmt.query([])?
+        };
+        let mut imported_conversations = resume_progress
+            .as_ref()
+            .map(|progress| progress.conversations_imported)
+            .unwrap_or(0);
+        let mut imported_messages = resume_progress
+            .as_ref()
+            .map(|progress| progress.messages_imported)
+            .unwrap_or(0);
+        let mut pending_batch: Vec<HistoricalBatchEntry> = Vec::new();
         let mut pending_batch_messages = 0usize;
         let mut pending_batch_chars = 0usize;
         let mut pending_batch_first_row_id: Option<i64> = None;
         let mut pending_batch_last_row_id: Option<i64> = None;
 
         let flush_batch = |storage: &FrankenStorage,
-                           batch: &mut Vec<(i64, Option<i64>, Conversation)>,
+                           batch: &mut Vec<HistoricalBatchEntry>,
                            pending_messages: &mut usize,
                            pending_chars: &mut usize,
                            first_row_id: &mut Option<i64>,
@@ -3640,25 +3943,46 @@ impl FrankenStorage {
                 "flushing historical salvage batch"
             );
 
-            let borrowed_batch: Vec<(i64, Option<i64>, &Conversation)> = batch
-                .iter()
-                .map(|(agent_id, workspace_id, conversation)| {
-                    (*agent_id, *workspace_id, conversation)
-                })
-                .collect();
-            let outcomes = storage
-                .insert_conversations_batched(&borrowed_batch)
-                .with_context(|| {
-                    format!(
-                        "inserting historical salvage batch source rows {:?}..{:?}",
-                        batch_first_row_id, batch_last_row_id
-                    )
-                })?;
-            for outcome in outcomes {
-                if !outcome.inserted_indices.is_empty() {
-                    *imported_conversations += 1;
-                    *imported_messages += outcome.inserted_indices.len();
-                }
+            let mut insert_batch =
+                |entries: &[HistoricalBatchEntry]| -> Result<HistoricalBatchImportTotals> {
+                    let borrowed_batch: Vec<(i64, Option<i64>, &Conversation)> = entries
+                        .iter()
+                        .map(|entry| (entry.agent_id, entry.workspace_id, &entry.conversation))
+                        .collect();
+                    let outcomes = storage
+                        .insert_conversations_batched(&borrowed_batch)
+                        .with_context(|| {
+                            let first_source_row_id =
+                                entries.first().map(|entry| entry.source_row_id);
+                            let last_source_row_id =
+                                entries.last().map(|entry| entry.source_row_id);
+                            format!(
+                                "inserting historical salvage batch source rows {:?}..{:?}",
+                                first_source_row_id, last_source_row_id
+                            )
+                        })?;
+                    let mut totals = HistoricalBatchImportTotals::default();
+                    for outcome in outcomes {
+                        if !outcome.inserted_indices.is_empty() {
+                            totals.inserted_source_rows += 1;
+                            totals.inserted_messages += outcome.inserted_indices.len();
+                        }
+                    }
+                    Ok(totals)
+                };
+            let totals =
+                Self::import_historical_batch_with_retry(batch.as_slice(), &mut insert_batch)?;
+            *imported_conversations =
+                (*imported_conversations).saturating_add(totals.inserted_source_rows);
+            *imported_messages = (*imported_messages).saturating_add(totals.inserted_messages);
+            if let Some(last_completed_row_id) = batch_last_row_id {
+                storage.record_historical_bundle_progress(
+                    bundle,
+                    salvage_method,
+                    last_completed_row_id,
+                    *imported_conversations,
+                    *imported_messages,
+                )?;
             }
             tracing::info!(
                 target: "cass::historical_salvage",
@@ -3810,7 +4134,12 @@ impl FrankenStorage {
             pending_batch_messages =
                 pending_batch_messages.saturating_add(conversation_message_count);
             pending_batch_chars = pending_batch_chars.saturating_add(conversation_chars);
-            pending_batch.push((agent_id, workspace_id, conversation));
+            pending_batch.push(HistoricalBatchEntry {
+                source_row_id: conversation_row_id,
+                agent_id,
+                workspace_id,
+                conversation,
+            });
 
             if pending_batch.len() >= batch_limits.conversations
                 || pending_batch_messages >= batch_limits.messages
@@ -3869,6 +4198,7 @@ impl FrankenStorage {
 
         for bundle in ordered_bundles {
             if self.historical_bundle_already_imported(&bundle)? {
+                self.clear_historical_bundle_progress(&bundle)?;
                 continue;
             }
 
@@ -3881,13 +4211,14 @@ impl FrankenStorage {
 
             self.import_historical_sources(&source.conn)?;
             let (imported_conversations, imported_messages) =
-                self.import_historical_conversations(&source.conn)?;
+                self.import_historical_conversations(&bundle, source.method, &source.conn)?;
             self.record_historical_bundle_import(
                 &bundle,
                 source.method,
                 imported_conversations,
                 imported_messages,
             )?;
+            self.clear_historical_bundle_progress(&bundle)?;
 
             outcome.bundles_imported += 1;
             outcome.conversations_imported += imported_conversations;
@@ -9949,6 +10280,203 @@ mod tests {
             .map(|msg| msg.idx)
             .collect();
         assert_eq!(shared_indices, vec![0, 1, 2]);
+
+        let second = storage.salvage_historical_databases(&canonical_db).unwrap();
+        assert_eq!(second.bundles_imported, 0);
+        assert_eq!(second.messages_imported, 0);
+    }
+
+    #[test]
+    fn historical_salvage_retry_splits_single_conversation_until_it_fits() {
+        use crate::model::types::{Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let mut attempts: Vec<Vec<usize>> = Vec::new();
+        let entry = HistoricalBatchEntry {
+            source_row_id: 77,
+            agent_id: 1,
+            workspace_id: None,
+            conversation: Conversation {
+                id: None,
+                agent_slug: "gemini".into(),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                external_id: Some("conv-77".into()),
+                title: Some("Large recovered conversation".into()),
+                source_path: PathBuf::from("/tmp/history.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_999),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: (0..4)
+                    .map(|idx| Message {
+                        id: None,
+                        idx,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_000 + idx),
+                        content: format!("message-{idx}"),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    })
+                    .collect(),
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            },
+        };
+
+        let totals = SqliteStorage::import_historical_batch_with_retry(
+            std::slice::from_ref(&entry),
+            &mut |batch| {
+                attempts.push(
+                    batch
+                        .iter()
+                        .map(|entry| entry.conversation.messages.len())
+                        .collect(),
+                );
+                let total_messages: usize = batch
+                    .iter()
+                    .map(|entry| entry.conversation.messages.len())
+                    .sum();
+                if total_messages > 1 {
+                    Err(anyhow!("out of memory"))
+                } else {
+                    Ok(HistoricalBatchImportTotals {
+                        inserted_source_rows: batch.len(),
+                        inserted_messages: total_messages,
+                    })
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            totals,
+            HistoricalBatchImportTotals {
+                inserted_source_rows: 1,
+                inserted_messages: 4,
+            }
+        );
+        assert_eq!(attempts.first().cloned(), Some(vec![4]));
+        assert!(
+            attempts.iter().filter(|sizes| sizes == &&vec![1]).count() >= 4,
+            "expected recursive fallback to reach one-message slices"
+        );
+    }
+
+    #[test]
+    fn salvage_historical_databases_resumes_from_progress_checkpoint() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        fn seed_historical_db(db_path: &Path, conversations: &[Conversation]) {
+            if let Some(parent) = db_path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            let storage = SqliteStorage::open(db_path).unwrap();
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("0.2.3".into()),
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            for conv in conversations {
+                storage
+                    .insert_conversation_tree(agent_id, None, conv)
+                    .unwrap();
+            }
+        }
+
+        fn make_conv(source_path: &str, idx_seed: i64) -> Conversation {
+            Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                external_id: Some(format!("conv-{idx_seed}")),
+                title: Some(format!("Recovered {idx_seed}")),
+                source_path: PathBuf::from(source_path),
+                started_at: Some(1_700_000_000_000 + idx_seed),
+                ended_at: Some(1_700_000_000_100 + idx_seed),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_000 + idx_seed),
+                    content: format!("message-{idx_seed}"),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        let backup_db = dir
+            .path()
+            .join("backups/agent_search.db.20260322T020200.bak");
+        let storage = SqliteStorage::open(&canonical_db).unwrap();
+        let conv_a = make_conv("/tmp/one.jsonl", 1);
+        let conv_b = make_conv("/tmp/two.jsonl", 2);
+        let conv_c = make_conv("/tmp/three.jsonl", 3);
+        seed_historical_db(
+            &backup_db,
+            &[conv_a.clone(), conv_b.clone(), conv_c.clone()],
+        );
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        storage
+            .insert_conversation_tree(agent_id, None, &conv_a)
+            .unwrap();
+
+        let bundle = discover_historical_database_bundles(&canonical_db)
+            .into_iter()
+            .find(|bundle| bundle.root_path == backup_db)
+            .unwrap();
+        let first_row_id: i64 = rusqlite::Connection::open(&backup_db)
+            .unwrap()
+            .query_row(
+                "SELECT id FROM conversations WHERE source_path = ?1",
+                ["/tmp/one.jsonl"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        storage
+            .record_historical_bundle_progress(&bundle, "direct-readonly", first_row_id, 50, 99)
+            .unwrap();
+
+        let outcome = storage.salvage_historical_databases(&canonical_db).unwrap();
+        assert_eq!(outcome.bundles_imported, 1);
+        assert_eq!(outcome.conversations_imported, 52);
+        assert_eq!(outcome.messages_imported, 101);
+        assert_eq!(storage.list_conversations(10, 0).unwrap().len(), 3);
+
+        let progress_key = SqliteStorage::historical_bundle_progress_key(&bundle);
+        let progress_left: Option<String> = storage
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![progress_key.as_str()],
+                |row| row.get_typed(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            progress_left.is_none(),
+            "completed salvage should clear bundle progress"
+        );
 
         let second = storage.salvage_historical_databases(&canonical_db).unwrap();
         assert_eq!(second.bundles_imported, 0);
