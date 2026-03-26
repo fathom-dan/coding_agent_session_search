@@ -6669,8 +6669,26 @@ impl FrankenStorage {
         let mut last_conversation_id = 0_i64;
         let mut conversation_batch_count = 0_usize;
         let mut conversations_processed = 0_usize;
+        let mut messages_processed = 0_usize;
+        let mut message_batch_count = 0_usize;
         let mut raw_entries_flushed = 0_usize;
         let mut expanded_entries_flushed = 0_usize;
+        let message_scan_sql = if use_message_metrics {
+            "SELECT m.conversation_id, m.idx, mm.content_chars
+             FROM messages m
+             JOIN message_metrics mm ON mm.message_id = m.id
+             WHERE m.conversation_id BETWEEN ?1 AND ?2
+               AND (m.conversation_id > ?3 OR (m.conversation_id = ?3 AND m.idx > ?4))
+             ORDER BY m.conversation_id, m.idx
+             LIMIT ?5"
+        } else {
+            "SELECT m.conversation_id, m.idx, COALESCE(LENGTH(CAST(m.content AS BLOB)), 0)
+             FROM messages m
+             WHERE m.conversation_id BETWEEN ?1 AND ?2
+               AND (m.conversation_id > ?3 OR (m.conversation_id = ?3 AND m.idx > ?4))
+             ORDER BY m.conversation_id, m.idx
+             LIMIT ?5"
+        };
 
         loop {
             let conversation_rows = match self.conn.query_with_params(
@@ -6704,6 +6722,8 @@ impl FrankenStorage {
             }
 
             let mut aggregate = StatsAggregator::new();
+            let mut conversation_batch_meta: Vec<(i64, i64, String, String)> =
+                Vec::with_capacity(conversation_rows.len());
             for row in &conversation_rows {
                 let conversation_id: i64 = row.get_typed(0)?;
                 let started_at: Option<i64> = row.get_typed(1)?;
@@ -6712,6 +6732,7 @@ impl FrankenStorage {
                 last_conversation_id = conversation_id;
                 let day_id = started_at.map(Self::day_id_from_millis).unwrap_or(0);
                 aggregate.record_delta(&agent_slug, &source_id, day_id, 1, 0, 0);
+                conversation_batch_meta.push((conversation_id, day_id, agent_slug, source_id));
                 conversations_processed += 1;
             }
 
@@ -6732,90 +6753,100 @@ impl FrankenStorage {
                     "daily_stats rebuild conversation scan progress"
                 );
             }
-        }
+            if conversation_batch_meta.is_empty() {
+                continue;
+            }
 
-        let mut last_message_id = 0_i64;
-        let mut messages_processed = 0_usize;
-        let mut message_batch_count = 0_usize;
-        let message_scan_sql = if use_message_metrics {
-            "SELECT mm.message_id, c.started_at, a.slug, c.source_id, mm.content_chars
-             FROM message_metrics mm
-             JOIN messages m ON m.id = mm.message_id
-             JOIN conversations c ON m.conversation_id = c.id
-             JOIN agents a ON c.agent_id = a.id
-             WHERE mm.message_id > ?1
-             ORDER BY mm.message_id
-             LIMIT ?2"
-        } else {
-            "SELECT m.id, c.started_at, a.slug, c.source_id, COALESCE(LENGTH(CAST(m.content AS BLOB)), 0)
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
-             JOIN agents a ON c.agent_id = a.id
-             WHERE m.id > ?1
-             ORDER BY m.id
-             LIMIT ?2"
-        };
+            let first_conversation_id = conversation_batch_meta
+                .first()
+                .map(|row| row.0)
+                .unwrap_or(0);
+            let last_conversation_id_in_batch =
+                conversation_batch_meta.last().map(|row| row.0).unwrap_or(0);
+            let mut conversation_meta: HashMap<i64, (i64, String, String)> =
+                HashMap::with_capacity(conversation_batch_meta.len());
+            for (conversation_id, day_id, agent_slug, source_id) in conversation_batch_meta {
+                conversation_meta.insert(conversation_id, (day_id, agent_slug, source_id));
+            }
 
-        loop {
-            let message_rows = match self.conn.query_with_params(
-                message_scan_sql,
-                &params_from_iter([
-                    ParamValue::from(last_message_id),
-                    ParamValue::from(message_batch_size as i64),
-                ]),
-            ) {
-                Ok(rows) => rows,
-                Err(err) if is_out_of_memory_error(&err) && message_batch_size > 1 => {
-                    let previous_batch_size = message_batch_size;
-                    message_batch_size = (message_batch_size / 2).max(1);
-                    tracing::warn!(
-                        previous_batch_size,
-                        message_batch_size,
-                        last_message_id,
-                        "daily_stats message scan ran out of memory; retrying with smaller batch"
-                    );
-                    continue;
+            let mut cursor_conversation_id = first_conversation_id;
+            let mut cursor_message_idx = -1_i64;
+            loop {
+                let message_rows = match self.conn.query_with_params(
+                    message_scan_sql,
+                    &params_from_iter([
+                        ParamValue::from(first_conversation_id),
+                        ParamValue::from(last_conversation_id_in_batch),
+                        ParamValue::from(cursor_conversation_id),
+                        ParamValue::from(cursor_message_idx),
+                        ParamValue::from(message_batch_size as i64),
+                    ]),
+                ) {
+                    Ok(rows) => rows,
+                    Err(err) if is_out_of_memory_error(&err) && message_batch_size > 1 => {
+                        let previous_batch_size = message_batch_size;
+                        message_batch_size = (message_batch_size / 2).max(1);
+                        tracing::warn!(
+                            previous_batch_size,
+                            message_batch_size,
+                            first_conversation_id,
+                            last_conversation_id_in_batch,
+                            cursor_conversation_id,
+                            cursor_message_idx,
+                            "daily_stats message scan ran out of memory; retrying with smaller batch"
+                        );
+                        continue;
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+                if message_rows.is_empty() {
+                    break;
                 }
-                Err(err) => return Err(err.into()),
-            };
-            if message_rows.is_empty() {
-                break;
-            }
 
-            let mut aggregate = StatsAggregator::new();
-            for row in &message_rows {
-                let message_id: i64 = row.get_typed(0)?;
-                let started_at: Option<i64> = row.get_typed(1)?;
-                let agent_slug: String = row.get_typed(2)?;
-                let source_id: String = row.get_typed(3)?;
-                let content_len: i64 = row.get_typed(4)?;
-                last_message_id = message_id;
-                let day_id = started_at.map(Self::day_id_from_millis).unwrap_or(0);
-                aggregate.record_delta(&agent_slug, &source_id, day_id, 0, 1, content_len);
-                messages_processed += 1;
-            }
+                let mut aggregate = StatsAggregator::new();
+                for row in &message_rows {
+                    let conversation_id: i64 = row.get_typed(0)?;
+                    let message_idx: i64 = row.get_typed(1)?;
+                    let content_len: i64 = row.get_typed(2)?;
+                    cursor_conversation_id = conversation_id;
+                    cursor_message_idx = message_idx;
+                    let (day_id, agent_slug, source_id) =
+                        conversation_meta.get(&conversation_id).ok_or_else(|| {
+                            anyhow!(
+                                "daily_stats message scan returned conversation {} outside active batch {}..={}",
+                                conversation_id,
+                                first_conversation_id,
+                                last_conversation_id_in_batch
+                            )
+                        })?;
+                    aggregate.record_delta(agent_slug, source_id, *day_id, 0, 1, content_len);
+                    messages_processed += 1;
+                }
 
-            message_batch_count += 1;
-            raw_entries_flushed += aggregate.raw_entry_count();
-            let entries = aggregate.expand();
-            expanded_entries_flushed += entries.len();
-            if !entries.is_empty() {
-                franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
-            }
-            if message_batch_count % 50 == 0 {
-                tracing::info!(
-                    target: "cass::perf::daily_stats",
-                    messages_processed,
-                    batches = message_batch_count,
-                    batch_size = message_batch_size,
-                    source = if use_message_metrics {
-                        "message_metrics"
-                    } else {
-                        "messages"
-                    },
-                    last_message_id,
-                    "daily_stats rebuild message scan progress"
-                );
+                message_batch_count += 1;
+                raw_entries_flushed += aggregate.raw_entry_count();
+                let entries = aggregate.expand();
+                expanded_entries_flushed += entries.len();
+                if !entries.is_empty() {
+                    franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
+                }
+                if message_batch_count % 50 == 0 {
+                    tracing::info!(
+                        target: "cass::perf::daily_stats",
+                        messages_processed,
+                        batches = message_batch_count,
+                        batch_size = message_batch_size,
+                        source = if use_message_metrics {
+                            "message_metrics"
+                        } else {
+                            "messages"
+                        },
+                        cursor_conversation_id,
+                        cursor_message_idx,
+                        last_conversation_id_in_batch,
+                        "daily_stats rebuild message scan progress"
+                    );
+                }
             }
         }
 
