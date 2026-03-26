@@ -578,71 +578,6 @@ pub const FTS5_REGISTER_SQL: &str = "\
 pub const FTS5_DELETE_ALL_SQL: &str =
     "INSERT INTO fts_messages(fts_messages) VALUES('delete-all');";
 
-/// Register the `fts_messages` FTS5 virtual table on a frankensqlite
-/// [`Connection`](FrankenConnection).
-///
-/// WARNING: this is schema-mutating. On migrated databases whose legacy
-/// `fts_messages` entry still lives at `rootpage=0`, frankensqlite may not see
-/// that table during schema load, and `CREATE VIRTUAL TABLE IF NOT EXISTS ...`
-/// can persist an extra sqlite_master row instead of behaving like a no-op.
-///
-/// Only call this from deliberate repair or rebuild flows, never from routine
-/// read/open paths.
-pub fn register_fts5_on_connection(
-    conn: &FrankenConnection,
-) -> std::result::Result<(), frankensqlite::FrankenError> {
-    conn.execute(FTS5_REGISTER_SQL).map(|_| ())
-}
-
-/// Rebuild the `fts_messages` table from the canonical messages/conversations
-/// tables using a frankensqlite connection.
-pub(crate) fn rebuild_fts_on_connection(conn: &FrankenConnection) -> Result<()> {
-    let total_count: i64 = conn.query_row_map(
-        "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id JOIN agents a ON c.agent_id = a.id LEFT JOIN workspaces w ON c.workspace_id = w.id",
-        &[],
-        |r: &FrankenRow| r.get_typed(0),
-    )?;
-    let batch_size: i64 = 10_000;
-    let mut offset: i64 = 0;
-
-    conn.execute_batch("DROP TABLE IF EXISTS fts_messages;")?;
-    register_fts5_on_connection(conn)?;
-
-    conn.execute_batch("BEGIN;")?;
-    let result = (|| -> Result<()> {
-        while offset < total_count {
-            info!(
-                "Rebuilding FTS: {}/{} rows...",
-                offset.min(total_count),
-                total_count
-            );
-            conn.execute_batch(&format!(
-                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-                 SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
-                 FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 JOIN agents a ON c.agent_id = a.id
-                 LEFT JOIN workspaces w ON c.workspace_id = w.id
-                 ORDER BY m.rowid
-                 LIMIT {} OFFSET {};",
-                batch_size, offset
-            ))?;
-            offset += batch_size;
-        }
-        conn.execute_batch("COMMIT;")?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = conn.execute_batch("ROLLBACK;");
-    } else {
-        info!(
-            "Rebuilding FTS: {}/{} rows complete.",
-            total_count, total_count
-        );
-    }
-    result
-}
-
 pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Result<()> {
     {
         let conn = rusqlite::Connection::open(db_path).with_context(|| {
@@ -707,6 +642,153 @@ pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Resul
     tx.commit()
         .with_context(|| format!("committing fresh FTS schema in {}", db_path.display()))?;
     Ok(())
+}
+
+pub(crate) fn rebuild_fts_via_rusqlite(db_path: &Path) -> Result<usize> {
+    {
+        let conn = rusqlite::Connection::open(db_path).with_context(|| {
+            format!(
+                "opening rusqlite db at {} for FTS schema cleanup",
+                db_path.display()
+            )
+        })?;
+        conn.execute_batch(
+            "PRAGMA busy_timeout = 30000;
+             PRAGMA writable_schema = ON;
+             DELETE FROM sqlite_master WHERE name LIKE 'fts_messages%';
+             PRAGMA writable_schema = OFF;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .with_context(|| {
+            format!(
+                "clearing existing FTS schema rows before rebuild in {}",
+                db_path.display()
+            )
+        })?;
+    }
+
+    let mut conn = rusqlite::Connection::open(db_path).with_context(|| {
+        format!(
+            "reopening rusqlite db at {} for FTS rebuild",
+            db_path.display()
+        )
+    })?;
+    conn.execute_batch("PRAGMA busy_timeout = 30000;")
+        .with_context(|| {
+            format!(
+                "configuring rusqlite busy timeout for FTS rebuild at {}",
+                db_path.display()
+            )
+        })?;
+
+    let tx = conn.transaction().with_context(|| {
+        format!(
+            "starting rusqlite FTS rebuild transaction for {}",
+            db_path.display()
+        )
+    })?;
+    tx.execute_batch(FTS5_REGISTER_SQL)
+        .with_context(|| format!("creating fresh FTS schema in {}", db_path.display()))?;
+    let inserted = tx
+        .execute(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
+             FROM messages m
+             JOIN conversations c ON m.conversation_id = c.id
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             ORDER BY m.rowid",
+            [],
+        )
+        .with_context(|| format!("populating rebuilt FTS rows in {}", db_path.display()))?;
+    tx.commit()
+        .with_context(|| format!("committing rebuilt FTS rows in {}", db_path.display()))?;
+    Ok(inserted)
+}
+
+fn fast_forward_schema_v13_fts_via_rusqlite(db_path: &Path) -> Result<bool> {
+    if !db_path.exists() {
+        return Ok(false);
+    }
+
+    let schema_version = {
+        let conn = rusqlite::Connection::open(db_path).with_context(|| {
+            format!(
+                "opening rusqlite db at {} for schema-13 preflight",
+                db_path.display()
+            )
+        })?;
+        conn.execute_batch("PRAGMA busy_timeout = 30000;")
+            .with_context(|| {
+                format!(
+                    "configuring rusqlite busy timeout for schema-13 preflight at {}",
+                    db_path.display()
+                )
+            })?;
+        read_meta_schema_version(&conn)?
+    };
+
+    if schema_version != Some(13) {
+        return Ok(false);
+    }
+
+    let inserted = rebuild_fts_via_rusqlite(db_path)?;
+    let conn = rusqlite::Connection::open(db_path).with_context(|| {
+        format!(
+            "reopening rusqlite db at {} after schema-13 FTS preflight",
+            db_path.display()
+        )
+    })?;
+    conn.execute_batch("PRAGMA busy_timeout = 30000;")
+        .with_context(|| {
+            format!(
+                "configuring busy timeout after schema-13 FTS preflight at {}",
+                db_path.display()
+            )
+        })?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
+        rusqlite::params![CURRENT_SCHEMA_VERSION.to_string()],
+    )
+    .with_context(|| {
+        format!(
+            "marking schema_version={} after rusqlite FTS preflight in {}",
+            CURRENT_SCHEMA_VERSION,
+            db_path.display()
+        )
+    })?;
+
+    let migration_table_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_schema_migrations'",
+            [],
+            |row| row.get(0),
+        )
+        .with_context(|| {
+            format!(
+                "checking for _schema_migrations after rusqlite FTS preflight in {}",
+                db_path.display()
+            )
+        })?;
+    if migration_table_exists > 0 {
+        conn.execute(
+            "INSERT OR IGNORE INTO _schema_migrations(version, name) VALUES(?1, 'fts_contentless')",
+            rusqlite::params![CURRENT_SCHEMA_VERSION],
+        )
+        .with_context(|| {
+            format!(
+                "recording fts_contentless migration after rusqlite FTS preflight in {}",
+                db_path.display()
+            )
+        })?;
+    }
+
+    tracing::info!(
+        db_path = %db_path.display(),
+        inserted_fts_rows = inserted,
+        "fast-forwarded schema-13 FTS migration via rusqlite before frankensqlite open"
+    );
+    Ok(true)
 }
 
 /// Create a uniquely named backup of the database file.
@@ -811,6 +893,33 @@ pub(crate) fn move_database_bundle(
     }
 
     Ok(moved)
+}
+
+fn copy_database_bundle(source_root: &Path, destination_root: &Path) -> Result<()> {
+    fs::copy(source_root, destination_root).with_context(|| {
+        format!(
+            "copying database bundle {} -> {}",
+            source_root.display(),
+            destination_root.display()
+        )
+    })?;
+
+    for suffix in ["-wal", "-shm"] {
+        let source_sidecar = database_sidecar_path(source_root, suffix);
+        if !source_sidecar.exists() {
+            continue;
+        }
+        let destination_sidecar = database_sidecar_path(destination_root, suffix);
+        fs::copy(&source_sidecar, &destination_sidecar).with_context(|| {
+            format!(
+                "copying database bundle sidecar {} -> {}",
+                source_sidecar.display(),
+                destination_sidecar.display()
+            )
+        })?;
+    }
+
+    Ok(())
 }
 
 /// Helper to safely remove a database file and its potential WAL/SHM sidecars.
@@ -1117,10 +1226,31 @@ pub(crate) fn discover_historical_database_bundles(
         .filter(|bundle| bundle.total_bytes > 0)
         .collect();
 
+    fn bundle_priority(path: &Path) -> i32 {
+        let path_str = path.to_string_lossy();
+        if path_str.contains("/repair-lab/replay-") {
+            return 5;
+        }
+        if path_str.contains("/repair-lab/") {
+            return 4;
+        }
+        if path_str.contains("/snapshots/") {
+            return 3;
+        }
+        if path_str.contains(".corrupt.") || path_str.contains("failed-baseline-seed") {
+            return 0;
+        }
+        1
+    }
+
     bundles.sort_by(|left, right| {
+        bundle_priority(&right.root_path)
+            .cmp(&bundle_priority(&left.root_path))
+            .then_with(|| {
         right
             .supports_direct_readonly
             .cmp(&left.supports_direct_readonly)
+            })
             .then_with(|| right.total_bytes.cmp(&left.total_bytes))
             .then_with(|| right.modified_at_ms.cmp(&left.modified_at_ms))
             .then_with(|| right.root_path.cmp(&left.root_path))
@@ -1332,12 +1462,107 @@ fn historical_bundle_counts(conn: &rusqlite::Connection) -> Result<(usize, usize
     ))
 }
 
-fn clear_seeded_runtime_meta(storage: &FrankenStorage) -> Result<()> {
-    storage.conn.execute_compat(
+fn clear_seeded_runtime_meta_via_rusqlite(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute(
         "DELETE FROM meta
          WHERE key LIKE 'historical_bundle_salvaged:%'
             OR key IN ('last_scan_ts', 'last_indexed_at', 'last_embedded_message_id')",
-        fparams![],
+        [],
+    )?;
+    Ok(())
+}
+
+fn record_historical_bundle_import_via_rusqlite(
+    conn: &rusqlite::Connection,
+    bundle: &HistoricalDatabaseBundle,
+    method: &str,
+    conversations_imported: usize,
+    messages_imported: usize,
+) -> Result<()> {
+    let key = FrankenStorage::historical_bundle_meta_key(bundle);
+    let value = serde_json::json!({
+        "salvage_version": HISTORICAL_SALVAGE_LEDGER_VERSION,
+        "path": bundle.root_path.display().to_string(),
+        "bytes": bundle.total_bytes,
+        "modified_at_ms": bundle.modified_at_ms,
+        "method": method,
+        "conversations_imported": conversations_imported,
+        "messages_imported": messages_imported,
+        "recorded_at_ms": FrankenStorage::now_millis(),
+    });
+    let value_str = serde_json::to_string(&value)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        rusqlite::params![key, value_str],
+    )?;
+    Ok(())
+}
+
+fn finalize_seeded_canonical_bundle_via_rusqlite(
+    canonical_db_path: &Path,
+    bundle: &HistoricalDatabaseBundle,
+    conversations_imported: usize,
+    messages_imported: usize,
+) -> Result<()> {
+    let schema_version = {
+        let conn = rusqlite::Connection::open(canonical_db_path).with_context(|| {
+            format!(
+                "opening seeded canonical database for post-seed finalization: {}",
+                canonical_db_path.display()
+            )
+        })?;
+        conn.execute_batch("PRAGMA busy_timeout = 30000;")
+            .with_context(|| {
+                format!(
+                    "configuring busy timeout for seeded canonical database {}",
+                    canonical_db_path.display()
+                )
+            })?;
+        read_meta_schema_version(&conn)?
+    };
+
+    if let Some(version) = schema_version
+        && version < CURRENT_SCHEMA_VERSION
+    {
+        if version != 13 {
+            anyhow::bail!(
+                "seeded canonical bundle schema_version {version} cannot be finalized automatically"
+            );
+        }
+        rebuild_fts_via_rusqlite(canonical_db_path)?;
+    }
+
+    let conn = rusqlite::Connection::open(canonical_db_path).with_context(|| {
+        format!(
+            "reopening seeded canonical database for runtime-meta cleanup: {}",
+            canonical_db_path.display()
+        )
+    })?;
+    conn.execute_batch("PRAGMA busy_timeout = 30000;")
+        .with_context(|| {
+            format!(
+                "configuring post-seed busy timeout for {}",
+                canonical_db_path.display()
+            )
+        })?;
+
+    clear_seeded_runtime_meta_via_rusqlite(&conn)?;
+
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
+        rusqlite::params![CURRENT_SCHEMA_VERSION.to_string()],
+    )?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO _schema_migrations(version, name) VALUES(?1, 'fts_contentless')",
+        rusqlite::params![CURRENT_SCHEMA_VERSION],
+    )?;
+    record_historical_bundle_import_via_rusqlite(
+        &conn,
+        bundle,
+        "baseline-bulk-sql-copy",
+        conversations_imported,
+        messages_imported,
     )?;
     Ok(())
 }
@@ -1367,109 +1592,8 @@ fn seed_canonical_from_historical_bundle_via_bulk_copy(
     })?;
     let tempdir = tempfile::TempDir::new_in(canonical_parent)
         .context("creating temporary baseline seed directory")?;
-    let working_db = tempdir.path().join("baseline-seed-working.db");
     let staged_seed_db = tempdir.path().join("baseline-seed-output.db");
-
-    fs::copy(&bundle.root_path, &working_db).with_context(|| {
-        format!(
-            "copying historical bundle {} to working seed clone {}",
-            bundle.root_path.display(),
-            working_db.display()
-        )
-    })?;
-    for suffix in ["-wal", "-shm"] {
-        let src = database_sidecar_path(&bundle.root_path, suffix);
-        if !src.exists() {
-            continue;
-        }
-        let dest = database_sidecar_path(&working_db, suffix);
-        fs::copy(&src, &dest).with_context(|| {
-            format!(
-                "copying historical bundle sidecar {} to working seed clone {}",
-                src.display(),
-                dest.display()
-            )
-        })?;
-    }
-
-    let conn = rusqlite::Connection::open(&working_db).with_context(|| {
-        format!(
-            "opening working seed clone with rusqlite: {}",
-            working_db.display()
-        )
-    })?;
-    conn.execute_batch(
-        "PRAGMA busy_timeout = 30000;
-         PRAGMA writable_schema = ON;",
-    )
-    .with_context(|| format!("configuring busy timeout for {}", working_db.display()))?;
-
-    if let Some(schema_version) = read_meta_schema_version(&conn)? {
-        if schema_version < CURRENT_SCHEMA_VERSION {
-            if schema_version != 13 {
-                anyhow::bail!(
-                    "historical seed bundle schema_version {schema_version} is too old for baseline import"
-                );
-            }
-            conn.execute_batch("DELETE FROM sqlite_master WHERE name LIKE 'fts_messages%';")
-                .with_context(|| {
-                    format!(
-                        "clearing legacy FTS schema entries from working seed clone {}",
-                        working_db.display()
-                    )
-                })?;
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-                .with_context(|| {
-                    format!(
-                        "checkpointing working seed clone after legacy FTS cleanup: {}",
-                        working_db.display()
-                    )
-                })?;
-        }
-    }
-    conn.execute_batch("PRAGMA writable_schema = OFF;")
-        .with_context(|| format!("disabling writable_schema for {}", working_db.display()))?;
-
-    conn.execute(
-        "VACUUM INTO ?1",
-        [staged_seed_db.to_string_lossy().as_ref()],
-    )
-    .with_context(|| {
-        format!(
-            "vacuuming cleaned working seed clone into staged baseline seed database {}",
-            staged_seed_db.display()
-        )
-    })?;
-
-    let seeded = rusqlite::Connection::open_with_flags(
-        &staged_seed_db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| {
-        format!(
-            "opening staged baseline seed database after vacuum import: {}",
-            staged_seed_db.display()
-        )
-    })?;
-    let duplicate_fts_entries: i64 = seeded
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-            [],
-            |row| row.get(0),
-        )
-        .with_context(|| {
-            format!(
-                "counting fts_messages sqlite_master rows after staged baseline seed import: {}",
-                staged_seed_db.display()
-            )
-        })?;
-    if duplicate_fts_entries > 1 {
-        anyhow::bail!(
-            "vacuum baseline seed preserved {duplicate_fts_entries} sqlite_master entries for fts_messages in {}",
-            staged_seed_db.display()
-        );
-    }
-    drop(seeded);
+    copy_database_bundle(&bundle.root_path, &staged_seed_db)?;
 
     if canonical_db_path.exists() {
         remove_database_files(canonical_db_path).with_context(|| {
@@ -1479,9 +1603,9 @@ fn seed_canonical_from_historical_bundle_via_bulk_copy(
             )
         })?;
     }
-    fs::rename(&staged_seed_db, canonical_db_path).with_context(|| {
+    move_database_bundle(&staged_seed_db, canonical_db_path).with_context(|| {
         format!(
-            "promoting staged historical seed database {} into canonical path {}",
+            "promoting staged historical seed database bundle {} into canonical path {}",
             staged_seed_db.display(),
             canonical_db_path.display()
         )
@@ -1519,19 +1643,20 @@ pub(crate) fn seed_canonical_from_best_historical_bundle(
             continue;
         }
 
-        let seeded = FrankenStorage::open(canonical_db_path).with_context(|| {
-            format!(
-                "opening seeded canonical database after bulk baseline import: {}",
-                canonical_db_path.display()
-            )
-        })?;
-        clear_seeded_runtime_meta(&seeded)?;
-        seeded.record_historical_bundle_import(
+        if let Err(err) = finalize_seeded_canonical_bundle_via_rusqlite(
+            canonical_db_path,
             &bundle,
-            "baseline-bulk-sql-copy",
             conversations_imported,
             messages_imported,
-        )?;
+        ) {
+            tracing::warn!(
+                path = %bundle.root_path.display(),
+                error = %err,
+                "finalizing bulk baseline seed import from historical bundle failed; trying next candidate"
+            );
+            last_seed_error = Some(err);
+            continue;
+        }
 
         tracing::info!(
             path = %bundle.root_path.display(),
@@ -2216,6 +2341,9 @@ impl FrankenStorage {
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating db directory {}", parent.display()))?;
         }
+        if db_existed {
+            fast_forward_schema_v13_fts_via_rusqlite(path)?;
+        }
 
         let path_str = path.to_string_lossy().to_string();
         let conn = FrankenConnection::open(&path_str)
@@ -2232,7 +2360,6 @@ impl FrankenStorage {
             materialize_fresh_fts_schema_via_rusqlite(path)?;
             let conn = FrankenConnection::open(&path_str)
                 .with_context(|| format!("reopening frankensqlite db at {}", path.display()))?;
-            let _ = conn.execute(FTS5_REGISTER_SQL);
             let storage = Self { conn };
             storage.apply_config()?;
             return Ok(storage);
@@ -2250,9 +2377,6 @@ impl FrankenStorage {
         let path_str = path.to_string_lossy().to_string();
         let conn = FrankenConnection::open(&path_str)
             .with_context(|| format!("opening frankensqlite writer at {}", path.display()))?;
-        // FrankenSQLite skips virtual-table entries (rootpage=0); re-register
-        // FTS5 so INSERT into fts_messages works on writer connections.
-        let _ = conn.execute(FTS5_REGISTER_SQL);
         let storage = Self { conn };
         storage.apply_config()?;
         Ok(storage)
@@ -4649,7 +4773,8 @@ impl FrankenStorage {
 
     /// Rebuild the FTS5 index from scratch (chunked to avoid OOM on large databases, #110).
     pub fn rebuild_fts(&self) -> Result<()> {
-        rebuild_fts_on_connection(&self.conn)
+        let db_path = self.database_path()?;
+        rebuild_fts_via_rusqlite(&db_path).map(|_| ())
     }
 
     /// Fetch all messages for embedding generation.
@@ -5973,8 +6098,19 @@ fn franken_batch_insert_fts(tx: &FrankenTransaction<'_>, entries: &[FtsEntry]) -
             param_values.push(ParamValue::from(entry.created_at));
         }
 
-        tx.execute_compat(&sql, &param_values)?;
-        inserted += chunk.len();
+        match tx.execute_compat(&sql, &param_values) {
+            Ok(_) => {
+                inserted += chunk.len();
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    chunk_docs = chunk.len(),
+                    "frankensqlite FTS batch insert failed; deferring repair to final rusqlite FTS rebuild"
+                );
+                return Ok(inserted);
+            }
+        }
     }
 
     Ok(inserted)
@@ -11691,7 +11827,11 @@ mod tests {
         assert_eq!(first_messages.len(), 2);
         assert_eq!(first_messages[0].content, "first-a");
         assert_eq!(first_messages[1].content, "first-b");
-        assert!(first_messages.iter().all(|message| message.extra_json.is_null()));
+        assert!(
+            first_messages
+                .iter()
+                .all(|message| message.extra_json.is_null())
+        );
 
         let second_messages = lexical.get(&second_id).expect("second conversation");
         assert_eq!(second_messages.len(), 1);

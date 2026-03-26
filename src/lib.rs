@@ -9032,29 +9032,7 @@ fn probe_doctor_fts_table(
 fn recreate_fts_table_via_rusqlite(
     db_path: &std::path::Path,
 ) -> std::result::Result<usize, String> {
-    let mut conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
-    conn.execute_batch("PRAGMA busy_timeout = 30000;")
-        .map_err(|e| e.to_string())?;
-
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    tx.execute_batch("DROP TABLE IF EXISTS fts_messages;")
-        .map_err(|e| e.to_string())?;
-    tx.execute_batch(crate::storage::sqlite::FTS5_REGISTER_SQL)
-        .map_err(|e| e.to_string())?;
-    let inserted = tx
-        .execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
-             JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id
-             ORDER BY m.rowid",
-            [],
-        )
-        .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(inserted)
+    crate::storage::sqlite::rebuild_fts_via_rusqlite(db_path).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

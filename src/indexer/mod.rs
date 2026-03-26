@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use frankensqlite::compat::{ConnectionExt, OptionalExtension, ParamValue, RowExt};
 use fs2::FileExt;
 use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher, recommended_watcher};
@@ -740,6 +740,55 @@ fn should_salvage_historical_databases(
     canonical_sessions_before_salvage: usize,
 ) -> bool {
     storage_rebuilt || canonical_sessions_before_salvage == 0
+}
+
+fn count_meta_entries_like(storage: &FrankenStorage, pattern: &str) -> Result<i64> {
+    storage
+        .raw()
+        .query_row_map(
+            "SELECT COUNT(*) FROM meta WHERE key LIKE ?1",
+            &[ParamValue::from(pattern)],
+            |row| row.get_typed(0),
+        )
+        .context(format!("counting meta rows matching {pattern}"))
+}
+
+fn full_rebuild_requires_historical_restart(
+    storage: &FrankenStorage,
+    db_path: &Path,
+    canonical_sessions_before_salvage: usize,
+) -> Result<bool> {
+    let bundle_count = crate::storage::sqlite::discover_historical_database_bundles(db_path).len();
+    if bundle_count == 0 {
+        return Ok(false);
+    }
+
+    let in_progress = count_meta_entries_like(storage, "historical_bundle_progress:%")? > 0;
+    if in_progress {
+        return Ok(true);
+    }
+
+    let imported = count_meta_entries_like(storage, "historical_bundle_salvaged:%")?;
+    let schema_version: Option<String> = storage
+        .raw()
+        .query_row_map(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )
+        .optional()
+        .context("reading canonical meta.schema_version during full rebuild restart probe")?;
+    let fts_rows: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )
+        .context("counting canonical fts_messages rows during full rebuild restart probe")?;
+
+    Ok(canonical_sessions_before_salvage > 0
+        && (imported == 0 || schema_version.as_deref() != Some("14") || fts_rows != 1))
 }
 
 fn lexical_rebuild_db_state(
@@ -1859,9 +1908,30 @@ pub fn run_index(
     let (storage, storage_rebuilt, opened_fresh_for_full) =
         open_storage_for_index(&opts.db_path, opts.full)?;
     let mut storage = storage;
+    let mut storage_rebuilt = storage_rebuilt;
+    let mut opened_fresh_for_full = opened_fresh_for_full;
     persist::apply_index_writer_busy_timeout(&storage);
     let index_path = index_dir(&opts.data_dir)?;
-    let initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
+    let mut initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
+    if opts.full
+        && !opened_fresh_for_full
+        && full_rebuild_requires_historical_restart(
+            &storage,
+            &opts.db_path,
+            initial_canonical_sessions_before_salvage,
+        )?
+    {
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            conversations = initial_canonical_sessions_before_salvage,
+            "full rebuild detected incomplete historical salvage state; restarting from a fresh canonical database"
+        );
+        storage = reopen_fresh_storage_for_full_rebuild(storage, &opts.db_path)?;
+        storage_rebuilt = true;
+        opened_fresh_for_full = true;
+        persist::apply_index_writer_busy_timeout(&storage);
+        initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
+    }
     let canonical_only_full_rebuild = opts.full
         && initial_canonical_sessions_before_salvage > 0
         && !storage_rebuilt
@@ -1970,12 +2040,11 @@ pub fn run_index(
         }
 
         let canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
-        let should_salvage_historical = should_salvage_historical_databases(
-            storage_rebuilt,
-            canonical_sessions_before_salvage,
-        );
+        let should_salvage_historical =
+            should_salvage_historical_databases(storage_rebuilt, canonical_sessions_before_salvage);
         let historical_salvage: HistoricalSalvageOutcome = if should_salvage_historical {
             let mut outcome = HistoricalSalvageOutcome::default();
+            let mut seeded_historical_baseline = false;
             if canonical_sessions_before_salvage == 0 {
                 let (reopened_storage, seed_outcome) =
                     maybe_seed_empty_canonical_from_historical_bundle(storage, &opts.db_path)?;
@@ -1983,9 +2052,17 @@ pub fn run_index(
                 persist::apply_index_writer_busy_timeout(&storage);
                 if let Some(seed_outcome) = seed_outcome {
                     outcome.accumulate(seed_outcome);
+                    seeded_historical_baseline = true;
                 }
             }
-            outcome.accumulate(storage.salvage_historical_databases(&opts.db_path)?);
+            if !seeded_historical_baseline {
+                outcome.accumulate(storage.salvage_historical_databases(&opts.db_path)?);
+            } else {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    "skipping incremental historical salvage because a baseline bundle seed already populated the canonical database"
+                );
+            }
             outcome
         } else {
             tracing::info!(
@@ -2009,7 +2086,9 @@ pub fn run_index(
             && !opened_fresh_for_full
             && historical_salvage.conversations_imported == 0;
 
-        if historical_salvage.conversations_imported > 0 || (opts.full && !rebuild_from_canonical_only) {
+        if historical_salvage.conversations_imported > 0
+            || (opts.full && !rebuild_from_canonical_only)
+        {
             repair_daily_stats_if_drifted(&storage, &opts.db_path)?;
         }
 
@@ -2239,6 +2318,21 @@ pub fn run_index(
         )
     })?;
     tracing::info!(now_ms, "updated last_indexed_at for status display");
+
+    if opts.full {
+        let rebuilt_rows = crate::storage::sqlite::rebuild_fts_via_rusqlite(&opts.db_path)
+            .with_context(|| {
+                format!(
+                    "rebuilding stock-compatible FTS table after full index run for {}",
+                    opts.db_path.display()
+                )
+            })?;
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            rebuilt_rows,
+            "rebuilt stock-compatible FTS table after full index run"
+        );
+    }
 
     reset_progress_to_idle(opts.progress.as_ref());
 
@@ -2698,12 +2792,21 @@ fn maybe_seed_empty_canonical_from_historical_bundle(
     })?;
     match seed_canonical_from_best_historical_bundle(db_path) {
         Ok(result) => {
-            let reopened = FrankenStorage::open(db_path).with_context(|| {
-                format!(
-                    "reopening canonical database after baseline historical seed attempt: {}",
-                    db_path.display()
-                )
-            })?;
+            let reopened = if result.is_some() {
+                FrankenStorage::open_writer(db_path).with_context(|| {
+                    format!(
+                        "reopening canonical database after baseline historical seed attempt without rerunning migrations: {}",
+                        db_path.display()
+                    )
+                })?
+            } else {
+                FrankenStorage::open(db_path).with_context(|| {
+                    format!(
+                        "reopening canonical database after baseline historical seed attempt: {}",
+                        db_path.display()
+                    )
+                })?
+            };
             Ok((reopened, result))
         }
         Err(err) => {
@@ -2869,13 +2972,12 @@ pub(crate) fn rebuild_tantivy_from_db(
     let mut conversations_since_commit = 0usize;
     let mut messages_since_commit = 0usize;
     let mut message_bytes_since_commit = 0usize;
-    let commit_rebuild_progress = |
-        offset: i64,
-        processed_conversations: usize,
-        indexed_docs: usize,
-        rebuild_state: &mut LexicalRebuildState,
-        t_index: &mut TantivyIndex,
-    | -> Result<()> {
+    let commit_rebuild_progress = |offset: i64,
+                                   processed_conversations: usize,
+                                   indexed_docs: usize,
+                                   rebuild_state: &mut LexicalRebuildState,
+                                   t_index: &mut TantivyIndex|
+     -> Result<()> {
         rebuild_state.record_pending_commit(
             offset,
             processed_conversations,
@@ -3355,7 +3457,6 @@ fn reset_storage(storage: &FrankenStorage, db_path: &Path) -> Result<()> {
         .raw()
         .execute_batch("DROP TABLE IF EXISTS fts_messages;");
     crate::storage::sqlite::materialize_fresh_fts_schema_via_rusqlite(db_path)?;
-    crate::storage::sqlite::register_fts5_on_connection(storage.raw())?;
     Ok(())
 }
 
