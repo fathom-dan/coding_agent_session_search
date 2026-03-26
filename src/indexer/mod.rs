@@ -579,6 +579,35 @@ fn lexical_rebuild_commit_interval_conversations() -> usize {
         .unwrap_or(1_000)
 }
 
+fn lexical_rebuild_commit_interval_messages() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(5_000)
+}
+
+fn lexical_rebuild_commit_interval_message_bytes() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16 * 1024 * 1024)
+}
+
+fn should_commit_lexical_rebuild(
+    conversations_since_commit: usize,
+    messages_since_commit: usize,
+    message_bytes_since_commit: usize,
+    commit_interval_conversations: usize,
+    commit_interval_messages: usize,
+    commit_interval_message_bytes: usize,
+) -> bool {
+    conversations_since_commit >= commit_interval_conversations
+        || messages_since_commit >= commit_interval_messages
+        || message_bytes_since_commit >= commit_interval_message_bytes
+}
+
 fn write_json_pretty_atomically<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -704,6 +733,13 @@ fn count_total_conversations_exact(storage: &FrankenStorage) -> Result<usize> {
         )
         .context("counting canonical conversations for lexical rebuild state")?;
     Ok(usize::try_from(total_conversations.max(0)).unwrap_or(usize::MAX))
+}
+
+fn should_salvage_historical_databases(
+    storage_rebuilt: bool,
+    canonical_sessions_before_salvage: usize,
+) -> bool {
+    storage_rebuilt || canonical_sessions_before_salvage == 0
 }
 
 fn lexical_rebuild_db_state(
@@ -1826,6 +1862,10 @@ pub fn run_index(
     persist::apply_index_writer_busy_timeout(&storage);
     let index_path = index_dir(&opts.data_dir)?;
     let initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
+    let canonical_only_full_rebuild = opts.full
+        && initial_canonical_sessions_before_salvage > 0
+        && !storage_rebuilt
+        && !opened_fresh_for_full;
     let resume_lexical_rebuild = if initial_canonical_sessions_before_salvage > 0 {
         let db_state = lexical_rebuild_db_state(&storage, &opts.db_path)?;
         has_pending_lexical_rebuild(&index_path, &db_state)?
@@ -1835,8 +1875,14 @@ pub fn run_index(
     if opts.full && !resume_lexical_rebuild {
         clear_lexical_rebuild_state(&index_path)?;
     }
-    if opts.full {
+    if opts.full && !canonical_only_full_rebuild {
         repair_daily_stats_if_drifted(&storage, &opts.db_path)?;
+    } else if canonical_only_full_rebuild {
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            conversations = initial_canonical_sessions_before_salvage,
+            "deferring daily_stats repair because full rebuild is reindexing an already-populated canonical database"
+        );
     }
     let mut performed_scan = false;
 
@@ -1924,8 +1970,10 @@ pub fn run_index(
         }
 
         let canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
-        let should_salvage_historical =
-            opts.full || storage_rebuilt || canonical_sessions_before_salvage == 0;
+        let should_salvage_historical = should_salvage_historical_databases(
+            storage_rebuilt,
+            canonical_sessions_before_salvage,
+        );
         let historical_salvage: HistoricalSalvageOutcome = if should_salvage_historical {
             let mut outcome = HistoricalSalvageOutcome::default();
             if canonical_sessions_before_salvage == 0 {
@@ -1940,6 +1988,11 @@ pub fn run_index(
             outcome.accumulate(storage.salvage_historical_databases(&opts.db_path)?);
             outcome
         } else {
+            tracing::info!(
+                db_path = %opts.db_path.display(),
+                conversations = canonical_sessions_before_salvage,
+                "skipping historical salvage because canonical database is already populated"
+            );
             HistoricalSalvageOutcome::default()
         };
         if historical_salvage.messages_imported > 0 {
@@ -1950,14 +2003,16 @@ pub fn run_index(
                 "historical cass bundles merged into canonical database before scan"
             );
         }
-        if opts.full || historical_salvage.conversations_imported > 0 {
-            repair_daily_stats_if_drifted(&storage, &opts.db_path)?;
-        }
-
         let rebuild_from_canonical_only = opts.full
             && initial_canonical_sessions_before_salvage > 0
             && !storage_rebuilt
-            && !opened_fresh_for_full;
+            && !opened_fresh_for_full
+            && historical_salvage.conversations_imported == 0;
+
+        if historical_salvage.conversations_imported > 0 || (opts.full && !rebuild_from_canonical_only) {
+            repair_daily_stats_if_drifted(&storage, &opts.db_path)?;
+        }
+
         if rebuild_from_canonical_only {
             tracing::info!(
                 db_path = %opts.db_path.display(),
@@ -2807,9 +2862,32 @@ pub(crate) fn rebuild_tantivy_from_db(
     let mut offset = rebuild_state.committed_offset;
     let page_size = LEXICAL_REBUILD_PAGE_SIZE;
     let commit_interval_conversations = lexical_rebuild_commit_interval_conversations();
+    let commit_interval_messages = lexical_rebuild_commit_interval_messages();
+    let commit_interval_message_bytes = lexical_rebuild_commit_interval_message_bytes();
     let mut indexed_docs = rebuild_state.indexed_docs;
     let mut processed_conversations = rebuild_state.processed_conversations;
     let mut conversations_since_commit = 0usize;
+    let mut messages_since_commit = 0usize;
+    let mut message_bytes_since_commit = 0usize;
+    let commit_rebuild_progress = |
+        offset: i64,
+        processed_conversations: usize,
+        indexed_docs: usize,
+        rebuild_state: &mut LexicalRebuildState,
+        t_index: &mut TantivyIndex,
+    | -> Result<()> {
+        rebuild_state.record_pending_commit(
+            offset,
+            processed_conversations,
+            indexed_docs,
+            index_meta_fingerprint(&index_path)?,
+        );
+        persist_lexical_rebuild_state(&index_path, rebuild_state)?;
+        t_index.commit()?;
+        rebuild_state.finalize_commit(index_meta_fingerprint(&index_path)?);
+        persist_lexical_rebuild_state(&index_path, rebuild_state)?;
+        Ok(())
+    };
 
     loop {
         let batch = storage.list_conversations_for_lexical_rebuild(page_size, offset)?;
@@ -2817,12 +2895,22 @@ pub(crate) fn rebuild_tantivy_from_db(
             break;
         }
 
-        let batch_len = batch.len();
+        let batch_conversation_ids: Vec<i64> = batch.iter().filter_map(|conv| conv.id).collect();
+        let mut batch_messages =
+            storage.fetch_messages_for_lexical_rebuild_batch(&batch_conversation_ids)?;
+
         for conv in batch {
+            offset = offset.saturating_add(1);
+            processed_conversations = processed_conversations.saturating_add(1);
+            conversations_since_commit = conversations_since_commit.saturating_add(1);
+
             let Some(conv_id) = conv.id else {
+                if let Some(p) = &progress {
+                    p.current.fetch_add(1, Ordering::Relaxed);
+                }
                 continue;
             };
-            let messages = storage.fetch_messages_for_lexical_rebuild(conv_id)?;
+            let messages = batch_messages.remove(&conv_id).unwrap_or_default();
 
             let mut metadata = conv.metadata_json.clone();
             let (kind, host_label) =
@@ -2837,9 +2925,14 @@ pub(crate) fn rebuild_tantivy_from_db(
             let host = conv.origin_host.as_deref().or(host_label.as_deref());
             ensure_cass_origin(&mut metadata, &conv.source_id, kind, host);
 
+            let mut conversation_message_count = 0usize;
+            let mut conversation_message_bytes = 0usize;
             let normalized_messages: Vec<NormalizedMessage> = messages
                 .into_iter()
                 .map(|msg| {
+                    conversation_message_count = conversation_message_count.saturating_add(1);
+                    conversation_message_bytes =
+                        conversation_message_bytes.saturating_add(msg.content.len());
                     let role = match msg.role {
                         MessageRole::User => "user".to_string(),
                         MessageRole::Agent => "assistant".to_string(),
@@ -2874,42 +2967,68 @@ pub(crate) fn rebuild_tantivy_from_db(
 
             indexed_docs += normalized.messages.len();
             t_index.add_messages(&normalized, &normalized.messages)?;
+            messages_since_commit =
+                messages_since_commit.saturating_add(conversation_message_count);
+            message_bytes_since_commit =
+                message_bytes_since_commit.saturating_add(conversation_message_bytes);
 
             if let Some(p) = &progress {
                 p.current.fetch_add(1, Ordering::Relaxed);
             }
+
+            if should_commit_lexical_rebuild(
+                conversations_since_commit,
+                messages_since_commit,
+                message_bytes_since_commit,
+                commit_interval_conversations,
+                commit_interval_messages,
+                commit_interval_message_bytes,
+            ) {
+                commit_rebuild_progress(
+                    offset,
+                    processed_conversations,
+                    indexed_docs,
+                    &mut rebuild_state,
+                    &mut t_index,
+                )?;
+                conversations_since_commit = 0;
+                messages_since_commit = 0;
+                message_bytes_since_commit = 0;
+            }
         }
-
-        offset += i64::try_from(batch_len).unwrap_or(page_size);
-        processed_conversations = processed_conversations.saturating_add(batch_len);
-        conversations_since_commit = conversations_since_commit.saturating_add(batch_len);
-
-        if conversations_since_commit >= commit_interval_conversations {
-            rebuild_state.record_pending_commit(
+        if should_commit_lexical_rebuild(
+            conversations_since_commit,
+            messages_since_commit,
+            message_bytes_since_commit,
+            commit_interval_conversations,
+            commit_interval_messages,
+            commit_interval_message_bytes,
+        ) {
+            commit_rebuild_progress(
                 offset,
                 processed_conversations,
                 indexed_docs,
-                index_meta_fingerprint(&index_path)?,
-            );
-            persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
-            t_index.commit()?;
-            rebuild_state.finalize_commit(index_meta_fingerprint(&index_path)?);
-            persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
+                &mut rebuild_state,
+                &mut t_index,
+            )?;
             conversations_since_commit = 0;
+            messages_since_commit = 0;
+            message_bytes_since_commit = 0;
         }
     }
 
-    if conversations_since_commit > 0 || rebuild_state.pending.is_some() {
-        rebuild_state.record_pending_commit(
+    if conversations_since_commit > 0
+        || messages_since_commit > 0
+        || message_bytes_since_commit > 0
+        || rebuild_state.pending.is_some()
+    {
+        commit_rebuild_progress(
             offset,
             processed_conversations,
             indexed_docs,
-            index_meta_fingerprint(&index_path)?,
-        );
-        persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
-        t_index.commit()?;
-        rebuild_state.finalize_commit(index_meta_fingerprint(&index_path)?);
-        persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
+            &mut rebuild_state,
+            &mut t_index,
+        )?;
     }
 
     storage.close().with_context(|| {
@@ -5762,6 +5881,19 @@ mod tests {
     }
 
     #[test]
+    fn historical_salvage_decision_skips_populated_canonical_db() {
+        assert!(!should_salvage_historical_databases(false, 1));
+        assert!(!should_salvage_historical_databases(false, 43_678));
+    }
+
+    #[test]
+    fn historical_salvage_decision_keeps_empty_or_rebuilt_storage() {
+        assert!(should_salvage_historical_databases(false, 0));
+        assert!(should_salvage_historical_databases(true, 0));
+        assert!(should_salvage_historical_databases(true, 43_678));
+    }
+
+    #[test]
     fn reopen_fresh_storage_for_full_rebuild_preserves_backup_and_starts_empty() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
@@ -6965,6 +7097,46 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn should_commit_lexical_rebuild_when_message_count_threshold_is_hit() {
+        assert!(should_commit_lexical_rebuild(
+            10,
+            5_000,
+            1_024,
+            1_000,
+            5_000,
+            16 * 1024 * 1024
+        ));
+        assert!(!should_commit_lexical_rebuild(
+            10,
+            4_999,
+            1_024,
+            1_000,
+            5_000,
+            16 * 1024 * 1024
+        ));
+    }
+
+    #[test]
+    fn should_commit_lexical_rebuild_when_message_byte_threshold_is_hit() {
+        assert!(should_commit_lexical_rebuild(
+            10,
+            100,
+            16 * 1024 * 1024,
+            1_000,
+            5_000,
+            16 * 1024 * 1024
+        ));
+        assert!(!should_commit_lexical_rebuild(
+            10,
+            100,
+            (16 * 1024 * 1024) - 1,
+            1_000,
+            5_000,
+            16 * 1024 * 1024
+        ));
     }
 
     #[test]

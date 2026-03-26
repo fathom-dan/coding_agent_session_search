@@ -3480,6 +3480,71 @@ impl FrankenStorage {
             })
     }
 
+    /// Fetch messages for multiple conversations during lexical rebuilds.
+    ///
+    /// This preserves the lightweight lexical-rebuild projection while avoiding
+    /// one round-trip per conversation when rebuilding large canonical indexes.
+    pub fn fetch_messages_for_lexical_rebuild_batch(
+        &self,
+        conversation_ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<Message>>> {
+        if conversation_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut sql = String::from(
+            "SELECT conversation_id, id, idx, role, author, created_at, content \
+             FROM messages WHERE conversation_id IN (",
+        );
+        let mut params: Vec<ParamValue> = Vec::with_capacity(conversation_ids.len());
+        for (idx, conversation_id) in conversation_ids.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("?{}", idx + 1));
+            params.push(ParamValue::from(*conversation_id));
+        }
+        sql.push_str(") ORDER BY conversation_id ASC, idx ASC");
+
+        let rows: Vec<(i64, Message)> = self
+            .conn
+            .query_map_collect(&sql, &params, |row| {
+                let role: String = row.get_typed(3)?;
+                Ok((
+                    row.get_typed(0)?,
+                    Message {
+                        id: Some(row.get_typed(1)?),
+                        idx: row.get_typed(2)?,
+                        role: match role.as_str() {
+                            "user" => MessageRole::User,
+                            "agent" | "assistant" => MessageRole::Agent,
+                            "tool" => MessageRole::Tool,
+                            "system" => MessageRole::System,
+                            other => MessageRole::Other(other.to_string()),
+                        },
+                        author: row.get_typed(4)?,
+                        created_at: row.get_typed(5)?,
+                        content: row.get_typed(6)?,
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                ))
+            })
+            .with_context(|| {
+                format!(
+                    "fetching lexical rebuild messages for {} conversations",
+                    conversation_ids.len()
+                )
+            })?;
+
+        let mut grouped: HashMap<i64, Vec<Message>> =
+            HashMap::with_capacity(conversation_ids.len());
+        for (conversation_id, message) in rows {
+            grouped.entry(conversation_id).or_default().push(message);
+        }
+        Ok(grouped)
+    }
+
     /// Get a source by ID.
     pub fn get_source(&self, id: &str) -> Result<Option<Source>> {
         let result = self.conn.query_row_map(
@@ -6674,20 +6739,20 @@ impl FrankenStorage {
         let mut raw_entries_flushed = 0_usize;
         let mut expanded_entries_flushed = 0_usize;
         let message_scan_sql = if use_message_metrics {
-            "SELECT m.conversation_id, m.idx, mm.content_chars
+            "SELECT m.idx, mm.content_chars
              FROM messages m
              JOIN message_metrics mm ON mm.message_id = m.id
-             WHERE m.conversation_id BETWEEN ?1 AND ?2
-               AND (m.conversation_id > ?3 OR (m.conversation_id = ?3 AND m.idx > ?4))
+             WHERE m.conversation_id = ?1
+               AND m.idx > ?2
              ORDER BY m.conversation_id, m.idx
-             LIMIT ?5"
+             LIMIT ?3"
         } else {
-            "SELECT m.conversation_id, m.idx, COALESCE(LENGTH(CAST(m.content AS BLOB)), 0)
+            "SELECT m.idx, COALESCE(LENGTH(CAST(m.content AS BLOB)), 0)
              FROM messages m
-             WHERE m.conversation_id BETWEEN ?1 AND ?2
-               AND (m.conversation_id > ?3 OR (m.conversation_id = ?3 AND m.idx > ?4))
+             WHERE m.conversation_id = ?1
+               AND m.idx > ?2
              ORDER BY m.conversation_id, m.idx
-             LIMIT ?5"
+             LIMIT ?3"
         };
 
         loop {
@@ -6757,95 +6822,68 @@ impl FrankenStorage {
                 continue;
             }
 
-            let first_conversation_id = conversation_batch_meta
-                .first()
-                .map(|row| row.0)
-                .unwrap_or(0);
-            let last_conversation_id_in_batch =
-                conversation_batch_meta.last().map(|row| row.0).unwrap_or(0);
-            let mut conversation_meta: HashMap<i64, (i64, String, String)> =
-                HashMap::with_capacity(conversation_batch_meta.len());
             for (conversation_id, day_id, agent_slug, source_id) in conversation_batch_meta {
-                conversation_meta.insert(conversation_id, (day_id, agent_slug, source_id));
-            }
-
-            let mut cursor_conversation_id = first_conversation_id;
-            let mut cursor_message_idx = -1_i64;
-            loop {
-                let message_rows = match self.conn.query_with_params(
-                    message_scan_sql,
-                    &params_from_iter([
-                        ParamValue::from(first_conversation_id),
-                        ParamValue::from(last_conversation_id_in_batch),
-                        ParamValue::from(cursor_conversation_id),
-                        ParamValue::from(cursor_message_idx),
-                        ParamValue::from(message_batch_size as i64),
-                    ]),
-                ) {
-                    Ok(rows) => rows,
-                    Err(err) if is_out_of_memory_error(&err) && message_batch_size > 1 => {
-                        let previous_batch_size = message_batch_size;
-                        message_batch_size = (message_batch_size / 2).max(1);
-                        tracing::warn!(
-                            previous_batch_size,
-                            message_batch_size,
-                            first_conversation_id,
-                            last_conversation_id_in_batch,
-                            cursor_conversation_id,
-                            cursor_message_idx,
-                            "daily_stats message scan ran out of memory; retrying with smaller batch"
-                        );
-                        continue;
-                    }
-                    Err(err) => return Err(err.into()),
-                };
-                if message_rows.is_empty() {
-                    break;
-                }
-
-                let mut aggregate = StatsAggregator::new();
-                for row in &message_rows {
-                    let conversation_id: i64 = row.get_typed(0)?;
-                    let message_idx: i64 = row.get_typed(1)?;
-                    let content_len: i64 = row.get_typed(2)?;
-                    cursor_conversation_id = conversation_id;
-                    cursor_message_idx = message_idx;
-                    let (day_id, agent_slug, source_id) =
-                        conversation_meta.get(&conversation_id).ok_or_else(|| {
-                            anyhow!(
-                                "daily_stats message scan returned conversation {} outside active batch {}..={}",
+                let mut cursor_message_idx = -1_i64;
+                loop {
+                    let message_rows = match self.conn.query_with_params(
+                        message_scan_sql,
+                        &params_from_iter([
+                            ParamValue::from(conversation_id),
+                            ParamValue::from(cursor_message_idx),
+                            ParamValue::from(message_batch_size as i64),
+                        ]),
+                    ) {
+                        Ok(rows) => rows,
+                        Err(err) if is_out_of_memory_error(&err) && message_batch_size > 1 => {
+                            let previous_batch_size = message_batch_size;
+                            message_batch_size = (message_batch_size / 2).max(1);
+                            tracing::warn!(
+                                previous_batch_size,
+                                message_batch_size,
                                 conversation_id,
-                                first_conversation_id,
-                                last_conversation_id_in_batch
-                            )
-                        })?;
-                    aggregate.record_delta(agent_slug, source_id, *day_id, 0, 1, content_len);
-                    messages_processed += 1;
-                }
+                                cursor_message_idx,
+                                "daily_stats message scan ran out of memory; retrying with smaller batch"
+                            );
+                            continue;
+                        }
+                        Err(err) => return Err(err.into()),
+                    };
+                    if message_rows.is_empty() {
+                        break;
+                    }
 
-                message_batch_count += 1;
-                raw_entries_flushed += aggregate.raw_entry_count();
-                let entries = aggregate.expand();
-                expanded_entries_flushed += entries.len();
-                if !entries.is_empty() {
-                    franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
-                }
-                if message_batch_count % 50 == 0 {
-                    tracing::info!(
-                        target: "cass::perf::daily_stats",
-                        messages_processed,
-                        batches = message_batch_count,
-                        batch_size = message_batch_size,
-                        source = if use_message_metrics {
-                            "message_metrics"
-                        } else {
-                            "messages"
-                        },
-                        cursor_conversation_id,
-                        cursor_message_idx,
-                        last_conversation_id_in_batch,
-                        "daily_stats rebuild message scan progress"
-                    );
+                    let mut aggregate = StatsAggregator::new();
+                    for row in &message_rows {
+                        let message_idx: i64 = row.get_typed(0)?;
+                        let content_len: i64 = row.get_typed(1)?;
+                        cursor_message_idx = message_idx;
+                        aggregate.record_delta(&agent_slug, &source_id, day_id, 0, 1, content_len);
+                        messages_processed += 1;
+                    }
+
+                    message_batch_count += 1;
+                    raw_entries_flushed += aggregate.raw_entry_count();
+                    let entries = aggregate.expand();
+                    expanded_entries_flushed += entries.len();
+                    if !entries.is_empty() {
+                        franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
+                    }
+                    if message_batch_count % 50 == 0 {
+                        tracing::info!(
+                            target: "cass::perf::daily_stats",
+                            messages_processed,
+                            batches = message_batch_count,
+                            batch_size = message_batch_size,
+                            source = if use_message_metrics {
+                                "message_metrics"
+                            } else {
+                                "messages"
+                            },
+                            conversation_id,
+                            cursor_message_idx,
+                            "daily_stats rebuild message scan progress"
+                        );
+                    }
                 }
             }
         }
@@ -11557,6 +11595,108 @@ mod tests {
         assert_eq!(lexical[0].content, "indexed text");
         assert_eq!(lexical[0].author.as_deref(), Some("assistant"));
         assert!(lexical[0].extra_json.is_null());
+    }
+
+    #[test]
+    fn fetch_messages_for_lexical_rebuild_batch_groups_and_orders_messages() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let first = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("lexical-batch-1".into()),
+            title: Some("Lexical batch 1".into()),
+            source_path: PathBuf::from("/tmp/lexical-batch-1.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: Some(42),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(1_700_000_000_010),
+                    content: "first-a".into(),
+                    extra_json: serde_json::json!({"opaque": true}),
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Agent,
+                    author: Some("assistant".into()),
+                    created_at: Some(1_700_000_000_020),
+                    content: "first-b".into(),
+                    extra_json: serde_json::json!({"opaque": true}),
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let second = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("lexical-batch-2".into()),
+            title: Some("Lexical batch 2".into()),
+            source_path: PathBuf::from("/tmp/lexical-batch-2.jsonl"),
+            started_at: Some(1_700_000_000_200),
+            ended_at: Some(1_700_000_000_300),
+            approx_tokens: Some(84),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::Tool,
+                author: Some("tool".into()),
+                created_at: Some(1_700_000_000_210),
+                content: "second-a".into(),
+                extra_json: serde_json::json!({"opaque": true}),
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let first_id = storage
+            .insert_conversation_tree(agent_id, None, &first)
+            .unwrap()
+            .conversation_id;
+        let second_id = storage
+            .insert_conversation_tree(agent_id, None, &second)
+            .unwrap()
+            .conversation_id;
+
+        let lexical = storage
+            .fetch_messages_for_lexical_rebuild_batch(&[second_id, first_id])
+            .unwrap();
+
+        let first_messages = lexical.get(&first_id).expect("first conversation");
+        assert_eq!(first_messages.len(), 2);
+        assert_eq!(first_messages[0].content, "first-a");
+        assert_eq!(first_messages[1].content, "first-b");
+        assert!(first_messages.iter().all(|message| message.extra_json.is_null()));
+
+        let second_messages = lexical.get(&second_id).expect("second conversation");
+        assert_eq!(second_messages.len(), 1);
+        assert_eq!(second_messages[0].content, "second-a");
+        assert!(second_messages[0].extra_json.is_null());
     }
 
     #[test]
