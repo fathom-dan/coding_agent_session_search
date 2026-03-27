@@ -278,7 +278,8 @@ if [ -z "$CHECKSUM" ]; then
   [ -z "$CHECKSUM_URL" ] && CHECKSUM_URL="$(sibling_url "$URL" "${TAR}.sha256")"
   CHECKSUM_FILE="$TMP/checksum.sha256"
   SUMS_URL="$(sibling_url "$URL" "SHA256SUMS.txt")"
-  for TRY_URL in "$CHECKSUM_URL" "$SUMS_URL"; do
+  SUMS_URL_ALT="$(sibling_url "$URL" "SHA256SUMS")"
+  for TRY_URL in "$CHECKSUM_URL" "$SUMS_URL" "$SUMS_URL_ALT"; do
     [ -n "$TRY_URL" ] || continue
     info "Fetching checksum from ${TRY_URL}"
     if ! curl -fsSL "$TRY_URL" -o "$CHECKSUM_FILE"; then
@@ -286,7 +287,7 @@ if [ -z "$CHECKSUM" ]; then
       continue
     fi
 
-    if [ "$TRY_URL" = "$SUMS_URL" ]; then
+    if [ "$TRY_URL" = "$SUMS_URL" ] || [ "$TRY_URL" = "$SUMS_URL_ALT" ]; then
       CHECKSUM=$(awk -v tb="$TAR" '$2 == tb {print $1; exit}' "$CHECKSUM_FILE")
     else
       # Per-file checksum assets are expected to contain only the requested hash line.
