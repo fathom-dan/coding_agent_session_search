@@ -1428,16 +1428,6 @@ pub(crate) fn discover_historical_database_bundles(
     bundles
 }
 
-pub(crate) fn best_historical_bundle_message_watermark(
-    bundles: &[HistoricalDatabaseBundle],
-) -> Option<i64> {
-    bundles
-        .iter()
-        .filter(|bundle| bundle.supports_direct_readonly)
-        .map(|bundle| bundle.probe.max_message_id)
-        .find(|watermark| *watermark > 0)
-}
-
 fn probe_historical_bundle(
     root_path: &Path,
     supports_direct_readonly: bool,
@@ -3880,7 +3870,9 @@ impl FrankenStorage {
     pub fn fetch_messages(&self, conversation_id: i64) -> Result<Vec<Message>> {
         self.conn
             .query_map_collect(
-                "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+                "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin \
+                 FROM messages INDEXED BY idx_messages_conv_idx \
+                 WHERE conversation_id = ?1 ORDER BY idx",
                 fparams![conversation_id],
                 |row| {
                     let role: String = row.get_typed(2)?;
@@ -3913,7 +3905,9 @@ impl FrankenStorage {
     pub fn fetch_messages_for_lexical_rebuild(&self, conversation_id: i64) -> Result<Vec<Message>> {
         self.conn
             .query_map_collect(
-                "SELECT id, idx, role, author, created_at, content FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+                "SELECT id, idx, role, author, created_at, content \
+                 FROM messages INDEXED BY idx_messages_conv_idx \
+                 WHERE conversation_id = ?1 ORDER BY idx",
                 fparams![conversation_id],
                 |row| {
                     let role: String = row.get_typed(2)?;
@@ -3936,9 +3930,7 @@ impl FrankenStorage {
                 },
             )
             .with_context(|| {
-                format!(
-                    "fetching messages for lexical rebuild of conversation {conversation_id}"
-                )
+                format!("fetching messages for lexical rebuild of conversation {conversation_id}")
             })
     }
 
@@ -3956,7 +3948,8 @@ impl FrankenStorage {
 
         let mut sql = String::from(
             "SELECT conversation_id, id, idx, role, author, created_at, content \
-             FROM messages WHERE conversation_id IN (",
+             FROM messages INDEXED BY idx_messages_conv_idx \
+             WHERE conversation_id IN (",
         );
         let mut params: Vec<ParamValue> = Vec::with_capacity(conversation_ids.len());
         for (idx, conversation_id) in conversation_ids.iter().enumerate() {
@@ -8637,6 +8630,91 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.exists());
         assert!(second.exists());
+    }
+
+    #[test]
+    fn lexical_rebuild_messages_query_forces_conversation_idx_index() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("conv-1".into()),
+            title: Some("Lexical rebuild".into()),
+            source_path: PathBuf::from("/tmp/conv-1.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(1_700_000_000_010),
+                    content: "first".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Agent,
+                    author: Some("assistant".into()),
+                    created_at: Some(1_700_000_000_020),
+                    content: "second".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+        let conversation_id = storage
+            .conn
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                fparams!["conv-1"],
+                |row| row.get_typed::<i64>(0),
+            )
+            .unwrap();
+
+        let plan_details: Vec<String> = storage
+            .conn
+            .query_map_collect(
+                "EXPLAIN QUERY PLAN \
+                 SELECT id, idx, role, author, created_at, content \
+                 FROM messages INDEXED BY idx_messages_conv_idx \
+                 WHERE conversation_id = ?1 ORDER BY idx",
+                fparams![conversation_id],
+                |row| row.get_typed(3),
+            )
+            .unwrap();
+
+        assert!(
+            plan_details
+                .iter()
+                .any(|detail| detail.contains("idx_messages_conv_idx")),
+            "expected EXPLAIN QUERY PLAN to honor the explicit messages(conversation_id, idx) index hint, got {plan_details:?}"
+        );
     }
 
     #[test]
