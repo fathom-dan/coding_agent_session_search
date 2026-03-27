@@ -4977,7 +4977,24 @@ impl FrankenStorage {
                     &mut _fts_inserted_total,
                 )?;
 
-                if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
+                let incoming_started = conv.started_at.or_else(|| {
+                    conv.messages.iter().filter_map(|m| m.created_at).min()
+                });
+                let incoming_ended = conv.ended_at.or_else(|| {
+                    conv.messages.iter().filter_map(|m| m.created_at).max()
+                });
+
+                if let Some(first_ts) = incoming_started {
+                    tx.execute_compat(
+                        "UPDATE conversations SET started_at = CASE
+                            WHEN started_at IS NULL THEN ?1
+                            ELSE MIN(started_at, ?1)
+                         END WHERE id = ?2",
+                        fparams![first_ts, existing_id],
+                    )?;
+                }
+
+                if let Some(last_ts) = incoming_ended {
                     tx.execute_compat(
                         "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
                         fparams![last_ts, existing_id],
@@ -5115,7 +5132,24 @@ impl FrankenStorage {
             &mut _fts_inserted_total,
         )?;
 
-        if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
+        let incoming_started = conv.started_at.or_else(|| {
+            conv.messages.iter().filter_map(|m| m.created_at).min()
+        });
+        let incoming_ended = conv.ended_at.or_else(|| {
+            conv.messages.iter().filter_map(|m| m.created_at).max()
+        });
+
+        if let Some(first_ts) = incoming_started {
+            tx.execute_compat(
+                "UPDATE conversations SET started_at = CASE
+                    WHEN started_at IS NULL THEN ?1
+                    ELSE MIN(started_at, ?1)
+                 END WHERE id = ?2",
+                fparams![first_ts, conversation_id],
+            )?;
+        }
+
+        if let Some(last_ts) = incoming_ended {
             tx.execute_compat(
                 "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
                 fparams![last_ts, conversation_id],
@@ -5633,7 +5667,24 @@ impl FrankenStorage {
                     existing_replay_fingerprints.insert(incoming_replay);
                 }
 
-                if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
+                let incoming_started = conv.started_at.or_else(|| {
+                    conv.messages.iter().filter_map(|m| m.created_at).min()
+                });
+                let incoming_ended = conv.ended_at.or_else(|| {
+                    conv.messages.iter().filter_map(|m| m.created_at).max()
+                });
+
+                if let Some(first_ts) = incoming_started {
+                    tx.execute_compat(
+                        "UPDATE conversations SET started_at = CASE
+                            WHEN started_at IS NULL THEN ?1
+                            ELSE MIN(started_at, ?1)
+                         END WHERE id = ?2",
+                        fparams![first_ts, existing_id],
+                    )?;
+                }
+
+                if let Some(last_ts) = incoming_ended {
                     tx.execute_compat(
                         "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
                         fparams![last_ts, existing_id],
@@ -5759,9 +5810,24 @@ impl FrankenStorage {
                             existing_replay_fingerprints.insert(incoming_replay);
                         }
 
-                        if let Some(last_ts) =
+                        let incoming_started = conv.started_at.or_else(|| {
+                            conv.messages.iter().filter_map(|m| m.created_at).min()
+                        });
+                        let incoming_ended = conv.ended_at.or_else(|| {
                             conv.messages.iter().filter_map(|m| m.created_at).max()
-                        {
+                        });
+
+                        if let Some(first_ts) = incoming_started {
+                            tx.execute_compat(
+                                "UPDATE conversations SET started_at = CASE
+                                    WHEN started_at IS NULL THEN ?1
+                                    ELSE MIN(started_at, ?1)
+                                 END WHERE id = ?2",
+                                fparams![first_ts, existing_id],
+                            )?;
+                        }
+
+                        if let Some(last_ts) = incoming_ended {
                             tx.execute_compat(
                                 "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
                                 fparams![last_ts, existing_id],

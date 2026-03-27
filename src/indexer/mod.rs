@@ -22,9 +22,10 @@ use crate::connectors::{
     Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
     claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
     codex::CodexConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
-    cursor::CursorConnector, factory::FactoryConnector, gemini::GeminiConnector,
-    kimi::KimiConnector, openclaw::OpenClawConnector, opencode::OpenCodeConnector,
-    pi_agent::PiAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
+    crush::CrushConnector, cursor::CursorConnector, factory::FactoryConnector,
+    gemini::GeminiConnector, kimi::KimiConnector, openclaw::OpenClawConnector,
+    opencode::OpenCodeConnector, pi_agent::PiAgentConnector, qwen::QwenConnector,
+    vibe::VibeConnector,
 };
 use crate::connectors::{NormalizedConversation, NormalizedMessage};
 use crate::search::tantivy::{TantivyIndex, index_dir, schema_hash_matches};
@@ -3222,8 +3223,32 @@ fn ingest_batch(
 
 /// Get all available connector factories.
 ///
-/// Delegates to `franken_agent_detection::get_connector_factories()`.
-pub use crate::connectors::get_connector_factories;
+/// This registry must use cass's local connector wrappers, not the raw
+/// upstream factory export, so production indexing picks up cass-specific
+/// augmentations like Cursor `agent-transcripts` support.
+pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector + Send>)> {
+    vec![
+        ("codex", || Box::new(CodexConnector::new())),
+        ("cline", || Box::new(ClineConnector::new())),
+        ("gemini", || Box::new(GeminiConnector::new())),
+        ("claude", || Box::new(ClaudeCodeConnector::new())),
+        ("clawdbot", || Box::new(ClawdbotConnector::new())),
+        ("vibe", || Box::new(VibeConnector::new())),
+        ("amp", || Box::new(AmpConnector::new())),
+        ("opencode", || Box::new(OpenCodeConnector::new())),
+        ("aider", || Box::new(AiderConnector::new())),
+        ("cursor", || Box::new(CursorConnector::new())),
+        ("chatgpt", || Box::new(ChatGptConnector::new())),
+        ("pi_agent", || Box::new(PiAgentConnector::new())),
+        ("factory", || Box::new(FactoryConnector::new())),
+        ("openclaw", || Box::new(OpenClawConnector::new())),
+        ("copilot", || Box::new(CopilotConnector::new())),
+        ("kimi", || Box::new(KimiConnector::new())),
+        ("copilot_cli", || Box::new(CopilotCliConnector::new())),
+        ("qwen", || Box::new(QwenConnector::new())),
+        ("crush", || Box::new(CrushConnector::new())),
+    ]
+}
 
 /// Detect all active roots for watching/scanning.
 ///
