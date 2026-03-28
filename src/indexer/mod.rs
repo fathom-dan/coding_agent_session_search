@@ -3568,7 +3568,12 @@ fn reindex_paths(
             p.phase.store(1, Ordering::Relaxed);
         }
 
-        let since_ts = if force_full {
+        let explicit_watch_once = opts
+            .watch_once_paths
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty());
+
+        let since_ts = if force_full || explicit_watch_once {
             None
         } else {
             let guard = state
@@ -3619,11 +3624,7 @@ fn reindex_paths(
         }
 
         let conv_count = convs.len();
-        if opts
-            .watch_once_paths
-            .as_ref()
-            .is_some_and(|paths| !paths.is_empty())
-        {
+        if explicit_watch_once {
             tracing::warn!(
                 ?kind,
                 scan_root = %root.path.display(),
@@ -6973,6 +6974,73 @@ mod tests {
         drop(t_index);
         storage.into_inner().unwrap().close().unwrap();
         drop(state);
+
+        if let Some(prev) = prev {
+            unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
+        } else {
+            unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reindex_paths_watch_once_ignores_file_mtime_since_ts() {
+        let tmp = TempDir::new().unwrap();
+        let xdg = tmp.path().join("xdg_watch_once_old_messages");
+        std::fs::create_dir_all(&xdg).unwrap();
+        let prev = dotenvy::var("XDG_DATA_HOME").ok();
+        unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
+
+        let data_dir = xdg.join("amp");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let amp_file = amp_dir.join("thread-old.json");
+
+        // Intentionally ancient timestamp relative to the current file mtime.
+        std::fs::write(
+            &amp_file,
+            r#"{"id":"old","messages":[{"role":"user","text":"p","createdAt":1000}]}"#,
+        )
+        .unwrap();
+
+        let opts = super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: Some(vec![amp_file.clone()]),
+            db_path: data_dir.join("db.sqlite"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_dir(&opts.data_dir).unwrap()).unwrap();
+        let mut initial = HashMap::new();
+        initial.insert(ConnectorKind::Amp, i64::MAX / 4);
+        let state = Mutex::new(initial);
+        let storage = Mutex::new(storage);
+        let t_index = Mutex::new(t_index);
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![amp_file],
+            &[(ConnectorKind::Amp, ScanRoot::local(amp_dir))],
+            &state,
+            &storage,
+            &t_index,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            indexed, 1,
+            "explicit watch_once imports should ignore file mtime watermarks"
+        );
 
         if let Some(prev) = prev {
             unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
