@@ -35,6 +35,12 @@ These scripts are for:
 - Reconciles both missing sessions and already-known sessions that have grown more messages on disk
 - Uses `state_5.sqlite` only as metadata fallback for workspace/title/timestamps when the rollout file is incomplete
 
+`run_watch_once_batches.py`
+
+- Drives native `cass index --watch-once` over large raw session trees in resumable batches
+- Keeps all parsing/insertion logic inside `cass`; the Python only chunks paths and records progress
+- Shrinks the batch size automatically if a whole-root style pass hits an out-of-memory error
+
 ## Typical usage
 
 Inventory the main `cass` data directory:
@@ -67,6 +73,16 @@ python3 scripts/historical_recovery/import_codex_rollouts.py \
   --canonical-db /home/ubuntu/.local/share/coding-agent-search/repair-lab/agent_search.canonical_dumpclone_1774564525.db \
   --sessions-root /home/ubuntu/.codex/sessions \
   --state-db /home/ubuntu/.codex/state_5.sqlite
+```
+
+Reconcile a large Gemini raw-session tree through native `cass` in resumable batches:
+
+```bash
+python3 scripts/historical_recovery/run_watch_once_batches.py \
+  --data-dir /home/ubuntu/.local/share/coding-agent-search/repair-lab/reconcile_from_native_full_20260328 \
+  --root /home/ubuntu/.gemini/tmp \
+  --pattern '**/session-*.json' \
+  --batch-size 32
 ```
 
 Save the filtered SQL stream too:
