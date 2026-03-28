@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -532,6 +533,7 @@ fn acquire_index_run_lock(data_dir: &Path, db_path: &Path) -> Result<IndexRunLoc
     let lock_path = data_dir.join("index-run.lock");
     let mut file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
@@ -576,7 +578,7 @@ fn lexical_rebuild_commit_interval_conversations() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(1_000)
+        .unwrap_or(2_000)
 }
 
 fn lexical_rebuild_commit_interval_messages() -> usize {
@@ -584,7 +586,7 @@ fn lexical_rebuild_commit_interval_messages() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(5_000)
+        .unwrap_or(25_000)
 }
 
 fn lexical_rebuild_commit_interval_message_bytes() -> usize {
@@ -592,7 +594,7 @@ fn lexical_rebuild_commit_interval_message_bytes() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(16 * 1024 * 1024)
+        .unwrap_or(64 * 1024 * 1024)
 }
 
 fn should_commit_lexical_rebuild(
@@ -759,6 +761,20 @@ fn should_salvage_historical_databases(
         return false;
     }
     storage_rebuilt || canonical_sessions_before_salvage == 0 || has_pending_historical_bundles
+}
+
+fn should_run_targeted_watch_once_only(
+    has_watch_once_paths: bool,
+    watch_enabled: bool,
+    full_rebuild: bool,
+    needs_rebuild: bool,
+    canonical_sessions_before_salvage: usize,
+) -> bool {
+    has_watch_once_paths
+        && !watch_enabled
+        && !full_rebuild
+        && !needs_rebuild
+        && canonical_sessions_before_salvage > 0
 }
 
 fn count_meta_entries_like(storage: &FrankenStorage, pattern: &str) -> Result<i64> {
@@ -1225,14 +1241,15 @@ fn is_streaming_consumer_disconnected(error: &anyhow::Error) -> bool {
 struct StreamingProducerConfig {
     flow_limiter: Arc<StreamingByteLimiter>,
     data_dir: PathBuf,
-    remote_roots: Vec<ScanRoot>,
+    additional_scan_roots: Vec<ScanRoot>,
     since_ts: Option<i64>,
     progress: Option<Arc<IndexingProgress>>,
 }
 
 /// Spawn a producer thread that scans a connector and sends batches through the channel.
 ///
-/// Each connector runs in its own thread, scanning local and remote roots.
+/// Each connector runs in its own thread, scanning the built-in local roots plus
+/// any explicitly configured additional roots.
 /// Conversations are sent through the channel as they're discovered, providing
 /// backpressure when the consumer (indexer) falls behind.
 fn spawn_connector_producer(
@@ -1305,8 +1322,9 @@ fn spawn_connector_producer(
             }
         }
 
-        // Scan remote sources
-        for root in &config.remote_roots {
+        // Scan explicitly configured additional roots. These may be true remote
+        // mirrors or machine-local backup directories wired through sources.toml.
+        for root in &config.additional_scan_roots {
             let ctx = crate::connectors::ScanContext::with_roots(
                 root.path.clone(),
                 vec![root.clone()],
@@ -1608,7 +1626,7 @@ fn run_streaming_index(
     opts: &IndexOptions,
     since_ts: Option<i64>,
     needs_rebuild: bool,
-    remote_roots: Vec<ScanRoot>,
+    additional_scan_roots: Vec<ScanRoot>,
 ) -> Result<()> {
     run_streaming_index_with_connector_factories(
         storage,
@@ -1616,7 +1634,7 @@ fn run_streaming_index(
         opts,
         since_ts,
         needs_rebuild,
-        remote_roots,
+        additional_scan_roots,
         get_connector_factories(),
     )
 }
@@ -1629,7 +1647,7 @@ fn run_streaming_index_with_connector_factories(
     opts: &IndexOptions,
     since_ts: Option<i64>,
     needs_rebuild: bool,
-    remote_roots: Vec<ScanRoot>,
+    additional_scan_roots: Vec<ScanRoot>,
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
 ) -> Result<()> {
     let buffered_connectors: Vec<&'static str> = connector_factories
@@ -1664,7 +1682,7 @@ fn run_streaming_index_with_connector_factories(
     let producer_config = StreamingProducerConfig {
         flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
         data_dir: opts.data_dir.clone(),
-        remote_roots: remote_roots.clone(),
+        additional_scan_roots: additional_scan_roots.clone(),
         since_ts,
         progress: opts.progress.clone(),
     };
@@ -1755,7 +1773,7 @@ fn run_batch_index(
     opts: &IndexOptions,
     since_ts: Option<i64>,
     needs_rebuild: bool,
-    remote_roots: Vec<ScanRoot>,
+    additional_scan_roots: Vec<ScanRoot>,
 ) -> Result<()> {
     let connector_factories = get_connector_factories();
 
@@ -1818,8 +1836,8 @@ fn run_batch_index(
                     }
                 }
 
-                if !remote_roots.is_empty() {
-                    for root in &remote_roots {
+                if !additional_scan_roots.is_empty() {
+                    for root in &additional_scan_roots {
                         let ctx = crate::connectors::ScanContext::with_roots(
                             root.path.clone(),
                             vec![root.clone()],
@@ -2016,9 +2034,9 @@ pub fn run_index(
     sync_sources_config_to_db(&storage);
 
     let scan_roots = build_scan_roots(&storage, &opts.data_dir);
-    let remote_roots: Vec<ScanRoot> = scan_roots
+    let additional_scan_roots: Vec<ScanRoot> = scan_roots
         .iter()
-        .filter(|r| r.origin.is_remote())
+        .filter(|root| !(root.origin.source_id == LOCAL_SOURCE_ID && root.path == opts.data_dir))
         .cloned()
         .collect();
 
@@ -2054,12 +2072,22 @@ pub fn run_index(
             && canonical_sessions_before_salvage > 0
             && !storage_rebuilt
             && !opened_fresh_for_full;
-        let should_salvage_historical = should_salvage_historical_databases(
-            storage_rebuilt,
+        let targeted_watch_once_only = should_run_targeted_watch_once_only(
+            opts.watch_once_paths
+                .as_ref()
+                .is_some_and(|paths| !paths.is_empty()),
+            opts.watch,
+            opts.full,
+            needs_rebuild,
             canonical_sessions_before_salvage,
-            has_pending_historical_bundles,
-            canonical_only_full_rebuild,
         );
+        let should_salvage_historical = !targeted_watch_once_only
+            && should_salvage_historical_databases(
+                storage_rebuilt,
+                canonical_sessions_before_salvage,
+                has_pending_historical_bundles,
+                canonical_only_full_rebuild,
+            );
         tracing::warn!(
             db_path = %opts.db_path.display(),
             storage_rebuilt,
@@ -2067,10 +2095,17 @@ pub fn run_index(
             canonical_sessions_before_salvage,
             has_pending_historical_bundles,
             canonical_only_full_rebuild,
+            targeted_watch_once_only,
             should_salvage_historical,
             "historical salvage decision"
         );
-        let historical_salvage: HistoricalSalvageOutcome = if should_salvage_historical {
+        let historical_salvage: HistoricalSalvageOutcome = if targeted_watch_once_only {
+            tracing::info!(
+                db_path = %opts.db_path.display(),
+                "skipping historical salvage because targeted watch-once paths were supplied"
+            );
+            HistoricalSalvageOutcome::default()
+        } else if should_salvage_historical {
             let mut outcome = HistoricalSalvageOutcome::default();
             if canonical_sessions_before_salvage == 0 {
                 let (reopened_storage, seed_outcome) =
@@ -2136,61 +2171,68 @@ pub fn run_index(
             )?;
             t_index = TantivyIndex::open_or_create(&index_path)?;
         } else {
-            // Get last scan timestamp for incremental indexing.
-            // If full rebuild or force_rebuild, scan everything (since_ts = None).
-            // Otherwise, only scan files modified since last successful scan.
-            let since_ts = if opts.full || needs_rebuild {
-                None
-            } else {
-                storage
-                    .get_last_scan_ts()
-                    .unwrap_or(None)
-                    .map(|ts| ts.saturating_sub(1))
-            };
-
-            if since_ts.is_some() {
-                tracing::info!(since_ts = ?since_ts, "incremental_scan: using last_scan_ts");
-            } else {
-                tracing::info!("full_scan: no last_scan_ts or rebuild requested");
-            }
-
-            // Choose between streaming indexing (Opt 8.2) and batch indexing
-            if streaming_index_enabled() {
-                tracing::info!("using streaming indexing (Opt 8.2)");
-                run_streaming_index(
-                    &storage,
-                    &mut t_index,
-                    &opts,
-                    since_ts,
-                    needs_rebuild,
-                    remote_roots.clone(),
-                )?;
-            } else {
+            if targeted_watch_once_only {
                 tracing::info!(
-                    "using batch indexing (streaming disabled via CASS_STREAMING_INDEX=0)"
+                    db_path = %opts.db_path.display(),
+                    "skipping broad incremental scan because targeted watch-once paths were supplied"
                 );
-                run_batch_index(
-                    &storage,
-                    &mut t_index,
-                    &opts,
-                    since_ts,
-                    needs_rebuild,
-                    remote_roots.clone(),
-                )?;
-            }
-            performed_scan = true;
+            } else {
+                // Get last scan timestamp for incremental indexing.
+                // If full rebuild or force_rebuild, scan everything (since_ts = None).
+                // Otherwise, only scan files modified since last successful scan.
+                let since_ts = if opts.full || needs_rebuild {
+                    None
+                } else {
+                    storage
+                        .get_last_scan_ts()
+                        .unwrap_or(None)
+                        .map(|ts| ts.saturating_sub(1))
+                };
 
-            t_index.commit()?;
+                if since_ts.is_some() {
+                    tracing::info!(since_ts = ?since_ts, "incremental_scan: using last_scan_ts");
+                } else {
+                    tracing::info!("full_scan: no last_scan_ts or rebuild requested");
+                }
 
-            if opts.full || historical_salvage.messages_imported > 0 {
-                drop(t_index);
-                rebuild_tantivy_from_db(
-                    &opts.db_path,
-                    &opts.data_dir,
-                    count_total_conversations_exact(&storage)?,
-                    opts.progress.clone(),
-                )?;
-                t_index = TantivyIndex::open_or_create(&index_path)?;
+                // Choose between streaming indexing (Opt 8.2) and batch indexing
+                if streaming_index_enabled() {
+                    tracing::info!("using streaming indexing (Opt 8.2)");
+                    run_streaming_index(
+                        &storage,
+                        &mut t_index,
+                        &opts,
+                        since_ts,
+                        needs_rebuild,
+                        additional_scan_roots.clone(),
+                    )?;
+                } else {
+                    tracing::info!(
+                        "using batch indexing (streaming disabled via CASS_STREAMING_INDEX=0)"
+                    );
+                    run_batch_index(
+                        &storage,
+                        &mut t_index,
+                        &opts,
+                        since_ts,
+                        needs_rebuild,
+                        additional_scan_roots.clone(),
+                    )?;
+                }
+                performed_scan = true;
+
+                t_index.commit()?;
+
+                if opts.full || historical_salvage.messages_imported > 0 {
+                    drop(t_index);
+                    rebuild_tantivy_from_db(
+                        &opts.db_path,
+                        &opts.data_dir,
+                        count_total_conversations_exact(&storage)?,
+                        opts.progress.clone(),
+                    )?;
+                    t_index = TantivyIndex::open_or_create(&index_path)?;
+                }
             }
         }
 
@@ -2345,62 +2387,11 @@ pub fn run_index(
     })?;
     tracing::info!(now_ms, "updated last_indexed_at for status display");
 
-    let mut storage = Some(storage);
-
     if opts.full {
-        // Close the live frankensqlite handle before rusqlite mutates the FTS
-        // virtual-table schema. Keeping both handles open across the rebuild can
-        // leave stale schema state in memory and corrupt the shadow-table rootpages.
-        close_storage_after_index(
-            storage
-                .take()
-                .expect("storage handle should exist before FTS repair"),
-            &opts.db_path,
-            "pre-FTS compatibility repair",
-        )?;
-        let repair = crate::storage::sqlite::ensure_fts_consistency_via_rusqlite(&opts.db_path)
-            .with_context(|| {
-                format!(
-                    "repairing stock-compatible FTS table after full index run for {}",
-                    opts.db_path.display()
-                )
-            })?;
-        match repair {
-            crate::storage::sqlite::FtsConsistencyRepair::AlreadyHealthy { rows } => {
-                tracing::info!(
-                    db_path = %opts.db_path.display(),
-                    rows,
-                    "stock-compatible FTS table already matched canonical messages after full index run"
-                );
-            }
-            crate::storage::sqlite::FtsConsistencyRepair::IncrementalCatchUp {
-                inserted_rows,
-                total_rows,
-            } => {
-                tracing::info!(
-                    db_path = %opts.db_path.display(),
-                    inserted_rows,
-                    total_rows,
-                    "incrementally repaired missing stock-compatible FTS rows after full index run"
-                );
-            }
-            crate::storage::sqlite::FtsConsistencyRepair::Rebuilt { inserted_rows } => {
-                tracing::info!(
-                    db_path = %opts.db_path.display(),
-                    inserted_rows,
-                    "fully rebuilt stock-compatible FTS table after full index run"
-                );
-            }
-        }
-
-        if opts.watch || opts.watch_once_paths.is_some() {
-            storage = Some(FrankenStorage::open(&opts.db_path).with_context(|| {
-                format!(
-                    "reopening canonical db after FTS compatibility repair: {}",
-                    opts.db_path.display()
-                )
-            })?);
-        }
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            "skipping legacy stock-SQLite FTS compatibility rebuild after full index run; lexical search now relies on the frankensqlite-owned canonical DB plus Tantivy index"
+        );
     }
 
     reset_progress_to_idle(opts.progress.as_ref());
@@ -2408,12 +2399,8 @@ pub fn run_index(
     if opts.watch || opts.watch_once_paths.is_some() {
         let opts_clone = opts.clone();
         let state = Mutex::new(load_watch_state(&opts.data_dir));
-        let storage = Arc::new(Mutex::new(
-            storage
-                .take()
-                .expect("watch mode requires a live storage handle"),
-        ));
-        let storage_for_watch = Arc::clone(&storage);
+        let storage = Rc::new(Mutex::new(storage));
+        let storage_for_watch = Rc::clone(&storage);
         let t_index = Mutex::new(t_index);
 
         // Semantic embedding cooldown state for watch mode.
@@ -2444,7 +2431,7 @@ pub fn run_index(
 
         // Detect roots once for the watcher setup
         // Includes both local detected roots and all remote mirror roots
-        let watch_roots = build_watch_roots(remote_roots.clone());
+        let watch_roots = build_watch_roots(additional_scan_roots.clone());
 
         // Clone detector for the callback
         let detector_clone = stale_detector.clone();
@@ -2564,11 +2551,7 @@ pub fn run_index(
         return Ok(());
     }
 
-    if let Some(storage) = storage {
-        close_storage_after_index(storage, &opts.db_path, "index run")
-    } else {
-        Ok(())
-    }
+    close_storage_after_index(storage, &opts.db_path, "index run")
 }
 
 fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &str) -> Result<()> {
@@ -2581,11 +2564,11 @@ fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &
 }
 
 fn release_watch_storage_after_index(
-    storage: Arc<Mutex<FrankenStorage>>,
+    storage: Rc<Mutex<FrankenStorage>>,
     db_path: &Path,
     context: &str,
 ) -> Result<()> {
-    let storage = Arc::try_unwrap(storage).map_err(|_| {
+    let storage = Rc::try_unwrap(storage).map_err(|_| {
         anyhow::anyhow!(
             "watch indexing retained extra canonical db handles while closing {}",
             db_path.display()
@@ -3259,7 +3242,7 @@ pub use crate::connectors::get_connector_factories;
 /// Includes:
 /// 1. Local roots detected by connectors
 /// 2. Remote mirror roots (assigned to ALL connectors since we don't know the mapping)
-fn build_watch_roots(remote_roots: Vec<ScanRoot>) -> Vec<(ConnectorKind, ScanRoot)> {
+fn build_watch_roots(additional_scan_roots: Vec<ScanRoot>) -> Vec<(ConnectorKind, ScanRoot)> {
     let factories = get_connector_factories();
     let mut roots = Vec::new();
     let mut all_kinds = Vec::new();
@@ -3277,10 +3260,10 @@ fn build_watch_roots(remote_roots: Vec<ScanRoot>) -> Vec<(ConnectorKind, ScanRoo
         }
     }
 
-    // Add remote roots for ALL connectors
-    for remote_root in remote_roots {
+    // Add explicitly configured roots for ALL connectors.
+    for configured_root in additional_scan_roots {
         for kind in &all_kinds {
-            roots.push((*kind, remote_root.clone()));
+            roots.push((*kind, configured_root.clone()));
         }
     }
 
@@ -3557,7 +3540,13 @@ fn reindex_paths(
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
 
-    let triggers = classify_paths(paths, roots);
+    let triggers = classify_paths(
+        paths,
+        roots,
+        opts.watch_once_paths
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty()),
+    );
     if triggers.is_empty() {
         return Ok(0);
     }
@@ -3630,7 +3619,21 @@ fn reindex_paths(
         }
 
         let conv_count = convs.len();
-        tracing::info!(?kind, conversations = conv_count, since_ts, "watch_scan");
+        if opts
+            .watch_once_paths
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty())
+        {
+            tracing::warn!(
+                ?kind,
+                scan_root = %root.path.display(),
+                conversations = conv_count,
+                since_ts,
+                "watch_once_scan"
+            );
+        } else {
+            tracing::info!(?kind, conversations = conv_count, since_ts, "watch_scan");
+        }
 
         // INGEST PHASE: Acquire locks briefly
         {
@@ -3894,6 +3897,7 @@ fn finalize_watch_reindex_result(
 fn classify_paths(
     paths: Vec<PathBuf>,
     roots: &[(ConnectorKind, ScanRoot)],
+    prefer_explicit_paths: bool,
 ) -> Vec<(ConnectorKind, ScanRoot, Option<i64>, Option<i64>)> {
     // Key -> (Root, MinTS, MaxTS)
     let mut batch_map: BatchClassificationMap = HashMap::new();
@@ -3908,8 +3912,15 @@ fn classify_paths(
             // Find ALL matching roots
             for (kind, root) in roots {
                 if p.starts_with(&root.path) {
-                    let key = (*kind, root.path.clone());
-                    let entry = batch_map.entry(key).or_insert((root.clone(), None, None));
+                    let scan_path = if prefer_explicit_paths {
+                        p.clone()
+                    } else {
+                        root.path.clone()
+                    };
+                    let mut scan_root = root.clone();
+                    scan_root.path = scan_path.clone();
+                    let key = (*kind, scan_path);
+                    let entry = batch_map.entry(key).or_insert((scan_root, None, None));
 
                     // Update MinTS (for scan window start)
                     entry.1 = match (entry.1, ts) {
@@ -3964,7 +3975,7 @@ fn sync_sources_config_to_db(storage: &FrankenStorage) {
         }
     };
 
-    for source in config.remote_sources() {
+    for source in &config.sources {
         let platform = source.platform.map(|p| match p {
             Platform::Macos => "macos".to_string(),
             Platform::Linux => "linux".to_string(),
@@ -3997,6 +4008,20 @@ fn sync_sources_config_to_db(storage: &FrankenStorage) {
     }
 }
 
+fn expand_local_scan_root_path(path: &str) -> PathBuf {
+    if let Some(stripped) = path.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(stripped);
+    }
+    if path == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return home;
+    }
+    PathBuf::from(path)
+}
+
 /// Build a list of scan roots for multi-root indexing.
 ///
 /// This function collects both:
@@ -4015,20 +4040,19 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
 
     if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_err()
         && let Ok(config) = SourcesConfig::load()
+        && !config.sources.is_empty()
     {
-        let remotes: Vec<_> = config.remote_sources().collect();
-        if !remotes.is_empty() {
-            for source in remotes {
-                let origin = Origin {
-                    source_id: source.name.clone(),
-                    kind: source.source_type,
-                    host: source.host.clone(),
-                };
-                let platform = source.platform;
-                let workspace_rewrites = source.path_mappings.clone();
+        for source in &config.sources {
+            let origin = Origin {
+                source_id: source.name.clone(),
+                kind: source.source_type,
+                host: source.host.clone(),
+            };
+            let platform = source.platform;
+            let workspace_rewrites = source.path_mappings.clone();
 
-                for path in &source.paths {
-                    // Generate safe dirname from the path as configured
+            for path in &source.paths {
+                if source.is_remote() {
                     let expanded_path = if path.starts_with("~/") {
                         path.to_string()
                     } else if path.starts_with('~') {
@@ -4040,7 +4064,6 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
                     let mirror_base = data_dir.join("remotes").join(&source.name).join("mirror");
                     let mirror_path = mirror_base.join(&safe_name);
 
-                    // Try the direct path first
                     if mirror_path.exists() {
                         let mut scan_root = ScanRoot::remote(mirror_path, origin.clone(), platform);
                         scan_root.workspace_rewrites = workspace_rewrites.clone();
@@ -4048,9 +4071,6 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
                         continue;
                     }
 
-                    // Fallback: sync may have expanded ~ differently (issue #45)
-                    // Look for any directory in mirror that ends with the path suffix
-                    // e.g., "~/.claude/projects" -> find "*_.claude_projects"
                     if path.starts_with("~/") {
                         let suffix = path.trim_start_matches("~/");
                         let safe_suffix = path_to_safe_dirname(suffix);
@@ -4058,8 +4078,6 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
                             for entry in entries.flatten() {
                                 let name = entry.file_name();
                                 let name_str = name.to_string_lossy();
-                                // Match directories ending with the expected suffix
-                                // e.g., "home_user_.claude_projects" ends with ".claude_projects"
                                 if name_str.ends_with(&safe_suffix) && entry.path().is_dir() {
                                     let mut scan_root =
                                         ScanRoot::remote(entry.path(), origin.clone(), platform);
@@ -4070,10 +4088,18 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
                             }
                         }
                     }
+                } else {
+                    let local_path = expand_local_scan_root_path(path);
+                    if !local_path.exists() {
+                        continue;
+                    }
+                    let mut scan_root = ScanRoot::remote(local_path, origin.clone(), platform);
+                    scan_root.workspace_rewrites = workspace_rewrites.clone();
+                    roots.push(scan_root);
                 }
             }
-            return roots;
         }
+        return roots;
     }
 
     // Fallback: remote mirror roots from registered sources
@@ -4132,31 +4158,47 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
                     let Some(path) = path_val.as_str() else {
                         continue;
                     };
-                    let expanded_path = if path.starts_with("~/") {
-                        path.to_string()
-                    } else if path.starts_with('~') {
-                        path.replacen('~', "~/", 1)
-                    } else {
-                        path.to_string()
-                    };
-                    let safe_name = path_to_safe_dirname(&expanded_path);
-                    let mirror_path = data_dir
-                        .join("remotes")
-                        .join(&source.id)
-                        .join("mirror")
-                        .join(&safe_name);
-                    if !mirror_path.exists() {
-                        continue;
-                    }
+                    if source.kind.is_remote() {
+                        let expanded_path = if path.starts_with("~/") {
+                            path.to_string()
+                        } else if path.starts_with('~') {
+                            path.replacen('~', "~/", 1)
+                        } else {
+                            path.to_string()
+                        };
+                        let safe_name = path_to_safe_dirname(&expanded_path);
+                        let mirror_path = data_dir
+                            .join("remotes")
+                            .join(&source.id)
+                            .join("mirror")
+                            .join(&safe_name);
+                        if !mirror_path.exists() {
+                            continue;
+                        }
 
-                    let origin = Origin {
-                        source_id: source.id.clone(),
-                        kind: source.kind,
-                        host: source.host_label.clone(),
-                    };
-                    let mut scan_root = ScanRoot::remote(mirror_path, origin, platform);
-                    scan_root.workspace_rewrites = workspace_rewrites.clone();
-                    roots.push(scan_root);
+                        let origin = Origin {
+                            source_id: source.id.clone(),
+                            kind: source.kind,
+                            host: source.host_label.clone(),
+                        };
+                        let mut scan_root = ScanRoot::remote(mirror_path, origin, platform);
+                        scan_root.workspace_rewrites = workspace_rewrites.clone();
+                        roots.push(scan_root);
+                    } else {
+                        let local_path = expand_local_scan_root_path(path);
+                        if !local_path.exists() {
+                            continue;
+                        }
+
+                        let origin = Origin {
+                            source_id: source.id.clone(),
+                            kind: source.kind,
+                            host: source.host_label.clone(),
+                        };
+                        let mut scan_root = ScanRoot::remote(local_path, origin, platform);
+                        scan_root.workspace_rewrites = workspace_rewrites.clone();
+                        roots.push(scan_root);
+                    }
                 }
                 continue;
             }
@@ -4309,6 +4351,14 @@ pub mod persist {
             .and_then(|v| v.parse::<i64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(4096)
+    }
+
+    fn serial_batch_chunk_size() -> usize {
+        dotenvy::var("CASS_INDEXER_SERIAL_CHUNK_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(128)
     }
 
     fn index_writer_busy_timeout_ms() -> u64 {
@@ -4754,23 +4804,32 @@ pub mod persist {
         let refs: Vec<(i64, Option<i64>, &Conversation)> =
             prepared.iter().map(|(a, w, c)| (*a, *w, c)).collect();
 
-        // Execute batched insert (single transaction)
-        let outcomes = storage.insert_conversations_batched(&refs)?;
+        let chunk_size = serial_batch_chunk_size().min(refs.len().max(1));
+        let mut outcomes = Vec::with_capacity(refs.len());
 
-        // Add newly inserted messages to Tantivy index
-        for (conv, outcome) in convs.iter().zip(outcomes.iter()) {
-            if force_tantivy_reindex {
-                // Rebuild path: the Tantivy index is known-empty, so index all messages.
-                t_index.add_messages(conv, &conv.messages)?;
-            } else if !outcome.inserted_indices.is_empty() {
-                let new_msgs: Vec<_> = conv
-                    .messages
-                    .iter()
-                    .filter(|m| outcome.inserted_indices.contains(&m.idx))
-                    .cloned()
-                    .collect();
-                t_index.add_messages(conv, &new_msgs)?;
+        for start in (0..refs.len()).step_by(chunk_size) {
+            let end = (start + chunk_size).min(refs.len());
+            let chunk_refs = &refs[start..end];
+            let chunk_convs = &convs[start..end];
+
+            let chunk_outcomes = storage.insert_conversations_batched(chunk_refs)?;
+
+            for (conv, outcome) in chunk_convs.iter().zip(chunk_outcomes.iter()) {
+                if force_tantivy_reindex {
+                    // Rebuild path: the Tantivy index is known-empty, so index all messages.
+                    t_index.add_messages(conv, &conv.messages)?;
+                } else if !outcome.inserted_indices.is_empty() {
+                    let new_msgs: Vec<_> = conv
+                        .messages
+                        .iter()
+                        .filter(|m| outcome.inserted_indices.contains(&m.idx))
+                        .cloned()
+                        .collect();
+                    t_index.add_messages(conv, &new_msgs)?;
+                }
             }
+
+            outcomes.extend(chunk_outcomes);
         }
 
         Ok(())
@@ -5674,7 +5733,7 @@ mod tests {
             StreamingProducerConfig {
                 flow_limiter: flow_limiter.clone(),
                 data_dir,
-                remote_roots: vec![ScanRoot::remote(
+                additional_scan_roots: vec![ScanRoot::remote(
                     remote_root_path.clone(),
                     Origin::remote("fixture-host"),
                     Some(crate::sources::config::Platform::Linux),
@@ -5786,7 +5845,7 @@ mod tests {
             StreamingProducerConfig {
                 flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
                 data_dir,
-                remote_roots: vec![ScanRoot::remote(
+                additional_scan_roots: vec![ScanRoot::remote(
                     PathBuf::from("/remote/fixture/claude"),
                     Origin::remote("fixture-host"),
                     Some(crate::sources::config::Platform::Linux),
@@ -6090,6 +6149,28 @@ mod tests {
     fn historical_salvage_decision_skips_pending_bundles_during_canonical_only_full_rebuild() {
         assert!(!should_salvage_historical_databases(
             false, 43_678, true, true
+        ));
+    }
+
+    #[test]
+    fn targeted_watch_once_only_requires_populated_incremental_run() {
+        assert!(should_run_targeted_watch_once_only(
+            true, false, false, false, 43_678
+        ));
+        assert!(!should_run_targeted_watch_once_only(
+            true, false, false, false, 0
+        ));
+        assert!(!should_run_targeted_watch_once_only(
+            true, true, false, false, 43_678
+        ));
+        assert!(!should_run_targeted_watch_once_only(
+            true, false, true, false, 43_678
+        ));
+        assert!(!should_run_targeted_watch_once_only(
+            true, false, false, true, 43_678
+        ));
+        assert!(!should_run_targeted_watch_once_only(
+            false, false, false, false, 43_678
         ));
     }
 
@@ -6420,7 +6501,7 @@ mod tests {
         ];
 
         let paths = vec![codex.clone(), claude.clone(), aider, cursor, chatgpt];
-        let classified = classify_paths(paths, &roots);
+        let classified = classify_paths(paths, &roots, false);
 
         let kinds: std::collections::HashSet<_> =
             classified.iter().map(|(k, _, _, _)| *k).collect();
@@ -6433,6 +6514,23 @@ mod tests {
         for (_, _, mtime, _) in classified {
             assert!(mtime.is_some(), "mtime should be captured");
         }
+    }
+
+    #[test]
+    fn classify_paths_prefers_explicit_watch_once_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        let session = project_root.join("subagents").join("session.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, b"{}").unwrap();
+
+        let roots = vec![(ConnectorKind::Claude, ScanRoot::local(project_root.clone()))];
+
+        let classified = classify_paths(vec![session.clone()], &roots, true);
+
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::Claude);
+        assert_eq!(classified[0].1.path, session);
     }
 
     #[test]
@@ -7063,6 +7161,50 @@ mod tests {
         // Should only have local root (remote skipped because mirror doesn't exist)
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].origin.source_id, "local");
+    }
+
+    #[test]
+    #[serial]
+    fn build_scan_roots_includes_configured_local_source_paths() {
+        let _guard = ignore_sources_config();
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let backup_root = tmp.path().join("backup-root");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&backup_root).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        storage
+            .upsert_source(&crate::sources::provenance::Source {
+                id: "backup-local".to_string(),
+                kind: SourceKind::Local,
+                host_label: None,
+                machine_id: None,
+                platform: Some("linux".to_string()),
+                config_json: Some(serde_json::json!({
+                    "paths": [backup_root.to_string_lossy().to_string()],
+                    "path_mappings": [],
+                    "sync_schedule": {
+                        "enabled": false
+                    }
+                })),
+                created_at: None,
+                updated_at: None,
+            })
+            .unwrap();
+
+        let roots = build_scan_roots(&storage, &data_dir);
+
+        assert_eq!(roots.len(), 2);
+        let backup_scan_root = roots
+            .iter()
+            .find(|root| root.origin.source_id == "backup-local")
+            .expect("configured local backup root should be included");
+        assert_eq!(backup_scan_root.path, backup_root);
+        assert!(!backup_scan_root.origin.is_remote());
+        assert_eq!(backup_scan_root.platform, Some(Platform::Linux));
     }
 
     #[test]

@@ -8994,52 +8994,27 @@ fn wait_with_progress<T>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DoctorFtsTableState {
     QueryableViaFrankensqlite,
-    QueryableViaRusqlite,
-    Missing {
-        frankensqlite_error: String,
-        rusqlite_error: String,
-    },
+    Missing { frankensqlite_error: String },
 }
 
 fn probe_doctor_fts_table(
     conn: &crate::storage::sqlite::SendFrankenConnection,
-    db_path: &std::path::Path,
 ) -> DoctorFtsTableState {
     match conn.query("SELECT rowid FROM fts_messages LIMIT 1;") {
         Ok(_) => DoctorFtsTableState::QueryableViaFrankensqlite,
-        Err(frankensqlite_error) => {
-            match rusqlite::Connection::open_with_flags(
-                db_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .and_then(|conn| {
-                conn.busy_timeout(std::time::Duration::from_secs(5))?;
-                conn.prepare("SELECT rowid FROM fts_messages LIMIT 1")
-                    .and_then(|mut stmt| stmt.exists([]))
-                    .map(|_| ())
-            }) {
-                Ok(()) => DoctorFtsTableState::QueryableViaRusqlite,
-                Err(rusqlite_error) => DoctorFtsTableState::Missing {
-                    frankensqlite_error: frankensqlite_error.to_string(),
-                    rusqlite_error: rusqlite_error.to_string(),
-                },
-            }
-        }
+        Err(frankensqlite_error) => DoctorFtsTableState::Missing {
+            frankensqlite_error: frankensqlite_error.to_string(),
+        },
     }
-}
-
-fn recreate_fts_table_via_rusqlite(
-    db_path: &std::path::Path,
-) -> std::result::Result<usize, String> {
-    crate::storage::sqlite::rebuild_fts_via_rusqlite(db_path).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod doctor_fts_tests {
     use super::*;
 
-    fn create_search_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    fn create_search_schema(
+        conn: &frankensqlite::Connection,
+    ) -> Result<(), frankensqlite::FrankenError> {
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
              CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
@@ -9063,12 +9038,12 @@ mod doctor_fts_tests {
     }
 
     #[test]
-    fn doctor_fts_probe_accepts_legacy_sqlite_fts_table() -> Result<(), Box<dyn std::error::Error>>
+    fn doctor_fts_probe_accepts_frankensqlite_fts_table() -> Result<(), Box<dyn std::error::Error>>
     {
         let temp_dir = tempfile::TempDir::new()?;
         let db_path = temp_dir.path().join("legacy-fts.db");
 
-        let conn = rusqlite::Connection::open(&db_path)?;
+        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
         create_search_schema(&conn)?;
         conn.execute_batch(
             "CREATE VIRTUAL TABLE fts_messages USING fts5(
@@ -9080,108 +9055,38 @@ mod doctor_fts_tests {
                 created_at UNINDEXED,
                 message_id UNINDEXED,
                 tokenize='porter'
-             );",
+             );
+             INSERT INTO agents(id, slug) VALUES(1, 'codex');
+             INSERT INTO workspaces(id, path) VALUES(1, '/ws');
+             INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+             VALUES(1, 1, 1, 'local', NULL, 'retro', '/tmp/retro.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, content, created_at)
+             VALUES(7, 1, 0, 'retro investigation', 42);
+             INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
+             VALUES(7, 'retro investigation', 'retro', 'codex', '/ws', '/tmp/retro.jsonl', 42, '7');",
         )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", [])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')", [])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, 1, 'local', NULL, 'retro', '/tmp/retro.jsonl')",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
-             VALUES(7, 1, 0, 'retro investigation', 42)",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                7_i64,
-                "retro investigation",
-                "retro",
-                "codex",
-                "/ws",
-                "/tmp/retro.jsonl",
-                42_i64,
-                "7"
-            ],
-        )?;
-        drop(conn);
-
-        let franken = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
-        let state = probe_doctor_fts_table(
-            &crate::storage::sqlite::SendFrankenConnection::new(franken),
-            &db_path,
-        );
+        let state =
+            probe_doctor_fts_table(&crate::storage::sqlite::SendFrankenConnection::new(conn));
         assert!(
-            matches!(
-                state,
-                DoctorFtsTableState::QueryableViaFrankensqlite
-                    | DoctorFtsTableState::QueryableViaRusqlite
-            ),
-            "legacy sqlite FTS table should be accepted by doctor: {state:?}"
+            matches!(state, DoctorFtsTableState::QueryableViaFrankensqlite),
+            "frankensqlite FTS table should be accepted by doctor: {state:?}"
         );
 
         Ok(())
     }
 
     #[test]
-    fn recreate_fts_table_via_rusqlite_rebuilds_missing_index()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn doctor_fts_probe_reports_missing_fts_table() -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempfile::TempDir::new()?;
         let db_path = temp_dir.path().join("missing-fts.db");
 
-        let conn = rusqlite::Connection::open(&db_path)?;
+        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
         create_search_schema(&conn)?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", [])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')", [])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, 1, 'local', NULL, 'retro', '/tmp/retro.jsonl')",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
-             VALUES(7, 1, 0, 'retro investigation', 42)",
-            [],
-        )?;
-        drop(conn);
-
-        let inserted = recreate_fts_table_via_rusqlite(&db_path).map_err(std::io::Error::other)?;
-        assert_eq!(inserted, 1, "repair should repopulate one FTS row");
-
-        let conn = rusqlite::Connection::open(&db_path)?;
-        let match_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'retro'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(match_count, 1, "recreated FTS table should be searchable");
-        let sql: String = conn.query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='fts_messages'",
-            [],
-            |row| row.get(0),
-        )?;
+        let state =
+            probe_doctor_fts_table(&crate::storage::sqlite::SendFrankenConnection::new(conn));
         assert!(
-            sql.contains("content=''"),
-            "repair should recreate the contentless FTS schema"
-        );
-        drop(conn);
-
-        let franken = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
-        let state = probe_doctor_fts_table(
-            &crate::storage::sqlite::SendFrankenConnection::new(franken),
-            &db_path,
-        );
-        assert!(
-            matches!(
-                state,
-                DoctorFtsTableState::QueryableViaFrankensqlite
-                    | DoctorFtsTableState::QueryableViaRusqlite
-            ),
-            "repair should leave the FTS table queryable: {state:?}"
+            matches!(state, DoctorFtsTableState::Missing { .. }),
+            "missing FTS table should be reported as missing: {state:?}"
         );
 
         Ok(())
@@ -9271,6 +9176,7 @@ mod cli_read_db_tests {
         let lock_path = temp.path().join("index-run.lock");
         let mut lock_file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .read(true)
             .write(true)
             .open(&lock_path)
@@ -9306,6 +9212,7 @@ mod cli_read_db_tests {
         let lock_path = temp.path().join("index-run.lock");
         let mut lock_file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .read(true)
             .write(true)
             .open(&lock_path)
@@ -9534,8 +9441,14 @@ fn run_doctor(
                 if let (Some(conv_count), Some(msg_count)) = (conv_count, msg_count) {
                     db_conversations = Some(conv_count.max(0) as usize);
                     db_messages = Some(msg_count.max(0) as usize);
-                    match crate::storage::sqlite::probe_database_health_via_rusqlite(&db_path) {
-                        Ok(health) if health.quick_check_ok => {
+                    let quick_check_status: Option<String> = conn
+                        .query_row_map("PRAGMA quick_check(1)", &[], |r: &frankensqlite::Row| {
+                            r.get_typed(0)
+                        })
+                        .ok();
+
+                    match quick_check_status {
+                        Some(status) if status.trim().eq_ignore_ascii_case("ok") => {
                             db_ok = true;
                             add_check!(
                                 "database",
@@ -9552,7 +9465,7 @@ fn run_doctor(
                             // it here: on migrated databases with legacy rootpage=0
                             // FTS schema entries, CREATE VIRTUAL TABLE IF NOT EXISTS
                             // can persist duplicate sqlite_master rows.
-                            match probe_doctor_fts_table(&conn, &db_path) {
+                            match probe_doctor_fts_table(&conn) {
                                 DoctorFtsTableState::QueryableViaFrankensqlite => {
                                     add_check!(
                                         "fts_table",
@@ -9561,98 +9474,39 @@ fn run_doctor(
                                         false
                                     );
                                 }
-                                DoctorFtsTableState::QueryableViaRusqlite => {
+                                DoctorFtsTableState::Missing {
+                                    frankensqlite_error,
+                                } => {
                                     add_check!(
                                         "fts_table",
                                         "pass",
-                                        "FTS search table (fts_messages) is queryable via the rusqlite fallback backend",
+                                        format!(
+                                            "Database-resident FTS table is absent or not queryable via frankensqlite ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
+                                        ),
                                         false
                                     );
                                 }
-                                DoctorFtsTableState::Missing {
-                                    frankensqlite_error,
-                                    rusqlite_error,
-                                } => {
-                                    if fix {
-                                        match recreate_fts_table_via_rusqlite(&db_path) {
-                                            Ok(message_count) => {
-                                                match probe_doctor_fts_table(&conn, &db_path) {
-                                                    DoctorFtsTableState::QueryableViaFrankensqlite
-                                                    | DoctorFtsTableState::QueryableViaRusqlite => {
-                                                        checks.push(Check {
-                                                            name: "fts_table".to_string(),
-                                                            status: "pass".to_string(),
-                                                            message: format!(
-                                                                "Recreated FTS search table (fts_messages) and indexed {message_count} message(s) via rusqlite"
-                                                            ),
-                                                            fix_available: true,
-                                                            fix_applied: true,
-                                                        });
-                                                        auto_fix_actions.push(
-                                                            "Recreated missing FTS search table via rusqlite"
-                                                                .to_string(),
-                                                        );
-                                                        auto_fix_applied = true;
-                                                    }
-                                                    DoctorFtsTableState::Missing {
-                                                        frankensqlite_error,
-                                                        rusqlite_error,
-                                                    } => {
-                                                        checks.push(Check {
-                                                            name: "fts_table".to_string(),
-                                                            status: "fail".to_string(),
-                                                            message: format!(
-                                                                "Recreated FTS search table (fts_messages) via rusqlite, but it is still not queryable (frankensqlite: {frankensqlite_error}; rusqlite: {rusqlite_error})"
-                                                            ),
-                                                            fix_available: true,
-                                                            fix_applied: false,
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                            Err(repair_error) => {
-                                                checks.push(Check {
-                                                    name: "fts_table".to_string(),
-                                                    status: "fail".to_string(),
-                                                    message: format!(
-                                                        "FTS search table (fts_messages) is missing on both doctor backends and recreation failed: {repair_error}"
-                                                    ),
-                                                    fix_available: true,
-                                                    fix_applied: false,
-                                                });
-                                            }
-                                        }
-                                    } else {
-                                        checks.push(Check {
-                                            name: "fts_table".to_string(),
-                                            status: "fail".to_string(),
-                                            message: format!(
-                                                "FTS search table (fts_messages) is missing on both doctor backends (frankensqlite: {frankensqlite_error}; rusqlite: {rusqlite_error}) - run with --fix to recreate the derived FTS table"
-                                            ),
-                                            fix_available: true,
-                                            fix_applied: false,
-                                        });
-                                    }
-                                }
                             }
                         }
-                        Ok(_health) => {
+                        Some(status) => {
                             add_check!(
                                 "database",
                                 "fail",
                                 format!(
-                                    "Database failed SQLite quick_check ({} conversations, {} messages)",
-                                    conv_count, msg_count
+                                    "Database failed frankensqlite quick_check: {} ({} conversations, {} messages)",
+                                    status.trim(),
+                                    conv_count,
+                                    msg_count
                                 ),
                                 true
                             );
                             needs_rebuild = true;
                         }
-                        Err(err) => {
+                        None => {
                             add_check!(
                                 "database",
                                 "fail",
-                                format!("Database health probe failed: {}", err),
+                                "Database health probe failed via frankensqlite",
                                 true
                             );
                             needs_rebuild = true;

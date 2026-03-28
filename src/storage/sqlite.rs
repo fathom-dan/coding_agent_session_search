@@ -583,6 +583,7 @@ fn drop_fts_schema_via_rusqlite(conn: &rusqlite::Connection, db_path: &Path) -> 
         .with_context(|| format!("dropping existing FTS schema in {}", db_path.display()))
 }
 
+#[cfg(test)]
 pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Result<()> {
     let mut conn = rusqlite::Connection::open(db_path).with_context(|| {
         format!(
@@ -653,6 +654,7 @@ pub(crate) fn rebuild_fts_via_rusqlite(db_path: &Path) -> Result<usize> {
     Ok(inserted)
 }
 
+#[cfg(test)]
 fn rusqlite_fts_schema_rows(conn: &rusqlite::Connection) -> Result<i64> {
     conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
@@ -662,12 +664,14 @@ fn rusqlite_fts_schema_rows(conn: &rusqlite::Connection) -> Result<i64> {
     .context("counting sqlite_master rows for fts_messages")
 }
 
+#[cfg(test)]
 fn rusqlite_fts_limit_probe(conn: &rusqlite::Connection) -> bool {
     conn.prepare("SELECT rowid FROM fts_messages LIMIT 1")
         .and_then(|mut stmt| stmt.exists([]))
         .is_ok()
 }
 
+#[cfg(test)]
 pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsConsistencyRepair> {
     let conn = rusqlite::Connection::open(db_path).with_context(|| {
         format!(
@@ -753,91 +757,6 @@ pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsC
     drop(conn);
     let inserted_rows = rebuild_fts_via_rusqlite(db_path)?;
     Ok(FtsConsistencyRepair::Rebuilt { inserted_rows })
-}
-
-fn fast_forward_schema_v13_fts_via_rusqlite(db_path: &Path) -> Result<bool> {
-    if !db_path.exists() {
-        return Ok(false);
-    }
-
-    let schema_version = {
-        let conn = rusqlite::Connection::open(db_path).with_context(|| {
-            format!(
-                "opening rusqlite db at {} for schema-13 preflight",
-                db_path.display()
-            )
-        })?;
-        conn.execute_batch("PRAGMA busy_timeout = 30000;")
-            .with_context(|| {
-                format!(
-                    "configuring rusqlite busy timeout for schema-13 preflight at {}",
-                    db_path.display()
-                )
-            })?;
-        read_meta_schema_version(&conn)?
-    };
-
-    if schema_version != Some(13) {
-        return Ok(false);
-    }
-
-    let inserted = rebuild_fts_via_rusqlite(db_path)?;
-    let conn = rusqlite::Connection::open(db_path).with_context(|| {
-        format!(
-            "reopening rusqlite db at {} after schema-13 FTS preflight",
-            db_path.display()
-        )
-    })?;
-    conn.execute_batch("PRAGMA busy_timeout = 30000;")
-        .with_context(|| {
-            format!(
-                "configuring busy timeout after schema-13 FTS preflight at {}",
-                db_path.display()
-            )
-        })?;
-    conn.execute(
-        "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
-        rusqlite::params![CURRENT_SCHEMA_VERSION.to_string()],
-    )
-    .with_context(|| {
-        format!(
-            "marking schema_version={} after rusqlite FTS preflight in {}",
-            CURRENT_SCHEMA_VERSION,
-            db_path.display()
-        )
-    })?;
-
-    let migration_table_exists: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_schema_migrations'",
-            [],
-            |row| row.get(0),
-        )
-        .with_context(|| {
-            format!(
-                "checking for _schema_migrations after rusqlite FTS preflight in {}",
-                db_path.display()
-            )
-        })?;
-    if migration_table_exists > 0 {
-        conn.execute(
-            "INSERT OR IGNORE INTO _schema_migrations(version, name) VALUES(?1, 'fts_contentless')",
-            rusqlite::params![CURRENT_SCHEMA_VERSION],
-        )
-        .with_context(|| {
-            format!(
-                "recording fts_contentless migration after rusqlite FTS preflight in {}",
-                db_path.display()
-            )
-        })?;
-    }
-
-    tracing::info!(
-        db_path = %db_path.display(),
-        inserted_fts_rows = inserted,
-        "fast-forwarded schema-13 FTS migration via rusqlite before frankensqlite open"
-    );
-    Ok(true)
 }
 
 /// Create a uniquely named backup of the database file.
@@ -1043,6 +962,8 @@ struct HistoricalBundleProbe {
     max_message_id: i64,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SqliteDatabaseHealthProbe {
     pub schema_version: Option<i64>,
@@ -1053,6 +974,7 @@ pub(crate) struct SqliteDatabaseHealthProbe {
     pub max_message_id: i64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FtsConsistencyRepair {
     AlreadyHealthy {
@@ -1735,6 +1657,8 @@ fn read_meta_schema_version(conn: &rusqlite::Connection) -> Result<Option<i64>> 
     Ok(version)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn probe_database_health_via_rusqlite(
     db_path: &Path,
 ) -> Result<SqliteDatabaseHealthProbe> {
@@ -2567,13 +2491,9 @@ impl FrankenStorage {
     /// Migrations run before PRAGMAs to avoid page lock contention in
     /// frankensqlite's WAL mode on file-based databases.
     pub fn open(path: &Path) -> Result<Self> {
-        let db_existed = path.exists();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating db directory {}", parent.display()))?;
-        }
-        if db_existed {
-            fast_forward_schema_v13_fts_via_rusqlite(path)?;
         }
 
         let path_str = path.to_string_lossy().to_string();
@@ -2582,20 +2502,6 @@ impl FrankenStorage {
         let storage = Self { conn };
         storage.run_migrations()?;
         storage.repair_missing_current_schema_objects()?;
-        if !db_existed {
-            storage.close().with_context(|| {
-                format!(
-                    "closing freshly migrated frankensqlite db before FTS bootstrap: {}",
-                    path.display()
-                )
-            })?;
-            materialize_fresh_fts_schema_via_rusqlite(path)?;
-            let conn = FrankenConnection::open(&path_str)
-                .with_context(|| format!("reopening frankensqlite db at {}", path.display()))?;
-            let storage = Self { conn };
-            storage.apply_config()?;
-            return Ok(storage);
-        }
         storage.apply_config()?;
         Ok(storage)
     }
@@ -4324,33 +4230,32 @@ impl FrankenStorage {
                     });
                 }
 
-                if let Some(entry) = entries.first() {
-                    if let Some((left, right)) = Self::split_historical_batch_entry_messages(entry)
-                    {
-                        tracing::warn!(
-                            source_row_id = entry.source_row_id,
-                            message_count = entry.conversation.messages.len(),
-                            error = %err,
-                            "historical salvage conversation failed; retrying in smaller message slices"
-                        );
-                        let left_totals = Self::import_historical_batch_with_retry(
-                            std::slice::from_ref(&left),
-                            insert_batch,
-                        )?;
-                        let right_totals = Self::import_historical_batch_with_retry(
-                            std::slice::from_ref(&right),
-                            insert_batch,
-                        )?;
-                        return Ok(HistoricalBatchImportTotals {
-                            inserted_source_rows: usize::from(
-                                left_totals.inserted_source_rows > 0
-                                    || right_totals.inserted_source_rows > 0,
-                            ),
-                            inserted_messages: left_totals
-                                .inserted_messages
-                                .saturating_add(right_totals.inserted_messages),
-                        });
-                    }
+                if let Some(entry) = entries.first()
+                    && let Some((left, right)) = Self::split_historical_batch_entry_messages(entry)
+                {
+                    tracing::warn!(
+                        source_row_id = entry.source_row_id,
+                        message_count = entry.conversation.messages.len(),
+                        error = %err,
+                        "historical salvage conversation failed; retrying in smaller message slices"
+                    );
+                    let left_totals = Self::import_historical_batch_with_retry(
+                        std::slice::from_ref(&left),
+                        insert_batch,
+                    )?;
+                    let right_totals = Self::import_historical_batch_with_retry(
+                        std::slice::from_ref(&right),
+                        insert_batch,
+                    )?;
+                    return Ok(HistoricalBatchImportTotals {
+                        inserted_source_rows: usize::from(
+                            left_totals.inserted_source_rows > 0
+                                || right_totals.inserted_source_rows > 0,
+                        ),
+                        inserted_messages: left_totals
+                            .inserted_messages
+                            .saturating_add(right_totals.inserted_messages),
+                    });
                 }
 
                 Err(err)
@@ -4873,17 +4778,15 @@ impl FrankenStorage {
                 let mut fts_pending_chars = 0usize;
                 let mut _fts_inserted_total = 0usize;
                 let mut new_chars: i64 = 0;
+                let mut idx_collision_count = 0usize;
+                let mut first_collision_idx: Option<i64> = None;
 
                 for msg in &conv.messages {
                     if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
                         let incoming_fingerprint = message_merge_fingerprint(msg);
                         if existing_fingerprint != &incoming_fingerprint {
-                            tracing::warn!(
-                                conversation_id = existing_id,
-                                idx = msg.idx,
-                                source_path = %conv.source_path.display(),
-                                "message idx collision encountered while merging recovered conversation; retaining canonical message variant"
-                            );
+                            idx_collision_count = idx_collision_count.saturating_add(1);
+                            first_collision_idx.get_or_insert(msg.idx);
                         }
                         continue;
                     }
@@ -4915,6 +4818,16 @@ impl FrankenStorage {
                     new_chars += msg.content.len() as i64;
                     existing_messages.insert(msg.idx, message_merge_fingerprint(msg));
                     existing_replay_fingerprints.insert(incoming_replay);
+                }
+
+                if idx_collision_count > 0 {
+                    tracing::warn!(
+                        conversation_id = existing_id,
+                        collision_count = idx_collision_count,
+                        first_idx = first_collision_idx,
+                        source_path = %conv.source_path.display(),
+                        "message idx collisions encountered while merging recovered conversation; retaining canonical message variants"
+                    );
                 }
 
                 flush_pending_fts_entries(
@@ -5012,16 +4925,14 @@ impl FrankenStorage {
         let mut fts_pending_chars = 0usize;
         let mut _fts_inserted_total = 0usize;
         let mut new_chars: i64 = 0;
+        let mut idx_collision_count = 0usize;
+        let mut first_collision_idx: Option<i64> = None;
         for msg in &conv.messages {
             if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
                 let incoming_fingerprint = message_merge_fingerprint(msg);
                 if existing_fingerprint != &incoming_fingerprint {
-                    tracing::warn!(
-                        conversation_id,
-                        idx = msg.idx,
-                        source_path = %conv.source_path.display(),
-                        "message idx collision encountered while appending to an existing conversation; retaining canonical message variant"
-                    );
+                    idx_collision_count = idx_collision_count.saturating_add(1);
+                    first_collision_idx.get_or_insert(msg.idx);
                 }
                 continue;
             }
@@ -5053,6 +4964,16 @@ impl FrankenStorage {
             new_chars += msg.content.len() as i64;
             existing_messages.insert(msg.idx, message_merge_fingerprint(msg));
             existing_replay_fingerprints.insert(incoming_replay);
+        }
+
+        if idx_collision_count > 0 {
+            tracing::warn!(
+                conversation_id,
+                collision_count = idx_collision_count,
+                first_idx = first_collision_idx,
+                source_path = %conv.source_path.display(),
+                "message idx collisions encountered while appending to an existing conversation; retaining canonical message variants"
+            );
         }
 
         flush_pending_fts_entries(
@@ -5534,17 +5455,15 @@ impl FrankenStorage {
                     pending_message_replay_fingerprints.insert(existing_id, fingerprints.clone());
                     fingerprints
                 };
+                let mut idx_collision_count = 0usize;
+                let mut first_collision_idx: Option<i64> = None;
 
                 for msg in &conv.messages {
                     if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
                         let incoming_fingerprint = message_merge_fingerprint(msg);
                         if existing_fingerprint != &incoming_fingerprint {
-                            tracing::warn!(
-                                conversation_id = existing_id,
-                                idx = msg.idx,
-                                source_path = %conv.source_path.display(),
-                                "message idx collision encountered during batched conversation merge; retaining canonical message variant"
-                            );
+                            idx_collision_count = idx_collision_count.saturating_add(1);
+                            first_collision_idx.get_or_insert(msg.idx);
                         }
                         continue;
                     }
@@ -5578,6 +5497,16 @@ impl FrankenStorage {
                     inserted_messages.push((msg_id, msg));
                     existing_messages.insert(msg.idx, message_merge_fingerprint(msg));
                     existing_replay_fingerprints.insert(incoming_replay);
+                }
+
+                if idx_collision_count > 0 {
+                    tracing::warn!(
+                        conversation_id = existing_id,
+                        collision_count = idx_collision_count,
+                        first_idx = first_collision_idx,
+                        source_path = %conv.source_path.display(),
+                        "message idx collisions encountered during batched conversation merge; retaining canonical message variants"
+                    );
                 }
 
                 if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
@@ -5660,17 +5589,15 @@ impl FrankenStorage {
                                 .insert(existing_id, fingerprints.clone());
                             fingerprints
                         };
+                        let mut idx_collision_count = 0usize;
+                        let mut first_collision_idx: Option<i64> = None;
 
                         for msg in &conv.messages {
                             if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
                                 let incoming_fingerprint = message_merge_fingerprint(msg);
                                 if existing_fingerprint != &incoming_fingerprint {
-                                    tracing::warn!(
-                                        conversation_id = existing_id,
-                                        idx = msg.idx,
-                                        source_path = %conv.source_path.display(),
-                                        "message idx collision encountered after duplicate conversation recovery; retaining canonical message variant"
-                                    );
+                                    idx_collision_count = idx_collision_count.saturating_add(1);
+                                    first_collision_idx.get_or_insert(msg.idx);
                                 }
                                 continue;
                             }
@@ -5704,6 +5631,16 @@ impl FrankenStorage {
                             inserted_messages.push((msg_id, msg));
                             existing_messages.insert(msg.idx, message_merge_fingerprint(msg));
                             existing_replay_fingerprints.insert(incoming_replay);
+                        }
+
+                        if idx_collision_count > 0 {
+                            tracing::warn!(
+                                conversation_id = existing_id,
+                                collision_count = idx_collision_count,
+                                first_idx = first_collision_idx,
+                                source_path = %conv.source_path.display(),
+                                "message idx collisions encountered after duplicate conversation recovery; retaining canonical message variants"
+                            );
                         }
 
                         if let Some(last_ts) =
@@ -6382,6 +6319,18 @@ fn franken_batch_insert_fts(tx: &FrankenTransaction<'_>, entries: &[FtsEntry]) -
         return Ok(0);
     }
 
+    let fts_table_present = tx
+        .query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            fparams![],
+            |row| row.get_typed::<i64>(0),
+        )
+        .map(|count| count > 0)
+        .unwrap_or(false);
+    if !fts_table_present {
+        return Ok(0);
+    }
+
     let mut inserted = 0;
 
     for chunk in entries.chunks(FTS5_BATCH_SIZE) {
@@ -6427,7 +6376,7 @@ fn franken_batch_insert_fts(tx: &FrankenTransaction<'_>, entries: &[FtsEntry]) -
                 tracing::warn!(
                     error = %err,
                     chunk_docs = chunk.len(),
-                    "frankensqlite FTS batch insert failed; deferring repair to final rusqlite FTS rebuild"
+                    "frankensqlite FTS batch insert failed; skipping db-resident FTS maintenance because Tantivy is authoritative"
                 );
                 return Ok(inserted);
             }
@@ -6563,31 +6512,32 @@ fn franken_insert_token_usage_batched_in_tx(
     let mut total_inserted = 0;
 
     for e in entries {
-        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(24);
-        params_vec.push(ParamValue::from(e.message_id));
-        params_vec.push(ParamValue::from(e.conversation_id));
-        params_vec.push(ParamValue::from(e.agent_id));
-        params_vec.push(ParamValue::from(e.workspace_id));
-        params_vec.push(ParamValue::from(e.source_id.clone()));
-        params_vec.push(ParamValue::from(e.timestamp_ms));
-        params_vec.push(ParamValue::from(e.day_id));
-        params_vec.push(ParamValue::from(e.model_name.clone()));
-        params_vec.push(ParamValue::from(e.model_family.clone()));
-        params_vec.push(ParamValue::from(e.model_tier.clone()));
-        params_vec.push(ParamValue::from(e.service_tier.clone()));
-        params_vec.push(ParamValue::from(e.provider.clone()));
-        params_vec.push(ParamValue::from(e.input_tokens));
-        params_vec.push(ParamValue::from(e.output_tokens));
-        params_vec.push(ParamValue::from(e.cache_read_tokens));
-        params_vec.push(ParamValue::from(e.cache_creation_tokens));
-        params_vec.push(ParamValue::from(e.thinking_tokens));
-        params_vec.push(ParamValue::from(e.total_tokens));
-        params_vec.push(ParamValue::from(e.estimated_cost_usd));
-        params_vec.push(ParamValue::from(e.role.clone()));
-        params_vec.push(ParamValue::from(e.content_chars));
-        params_vec.push(ParamValue::from(e.has_tool_calls as i64));
-        params_vec.push(ParamValue::from(e.tool_call_count as i64));
-        params_vec.push(ParamValue::from(e.data_source.clone()));
+        let params_vec: Vec<ParamValue> = vec![
+            ParamValue::from(e.message_id),
+            ParamValue::from(e.conversation_id),
+            ParamValue::from(e.agent_id),
+            ParamValue::from(e.workspace_id),
+            ParamValue::from(e.source_id.clone()),
+            ParamValue::from(e.timestamp_ms),
+            ParamValue::from(e.day_id),
+            ParamValue::from(e.model_name.clone()),
+            ParamValue::from(e.model_family.clone()),
+            ParamValue::from(e.model_tier.clone()),
+            ParamValue::from(e.service_tier.clone()),
+            ParamValue::from(e.provider.clone()),
+            ParamValue::from(e.input_tokens),
+            ParamValue::from(e.output_tokens),
+            ParamValue::from(e.cache_read_tokens),
+            ParamValue::from(e.cache_creation_tokens),
+            ParamValue::from(e.thinking_tokens),
+            ParamValue::from(e.total_tokens),
+            ParamValue::from(e.estimated_cost_usd),
+            ParamValue::from(e.role.clone()),
+            ParamValue::from(e.content_chars),
+            ParamValue::from(e.has_tool_calls as i64),
+            ParamValue::from(e.tool_call_count as i64),
+            ParamValue::from(e.data_source.clone()),
+        ];
 
         let values = param_slice_to_values(&params_vec);
         total_inserted += tx.execute_with_params(
@@ -6689,31 +6639,32 @@ fn franken_insert_message_metrics_batched_in_tx(
     let mut total_inserted = 0;
 
     for e in entries {
-        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(24);
-        params_vec.push(ParamValue::from(e.message_id));
-        params_vec.push(ParamValue::from(e.created_at_ms));
-        params_vec.push(ParamValue::from(e.hour_id));
-        params_vec.push(ParamValue::from(e.day_id));
-        params_vec.push(ParamValue::from(e.agent_slug.clone()));
-        params_vec.push(ParamValue::from(e.workspace_id));
-        params_vec.push(ParamValue::from(e.source_id.clone()));
-        params_vec.push(ParamValue::from(e.role.clone()));
-        params_vec.push(ParamValue::from(e.content_chars));
-        params_vec.push(ParamValue::from(e.content_tokens_est));
-        params_vec.push(ParamValue::from(e.model_name.clone()));
-        params_vec.push(ParamValue::from(e.model_family.clone()));
-        params_vec.push(ParamValue::from(e.model_tier.clone()));
-        params_vec.push(ParamValue::from(e.provider.clone()));
-        params_vec.push(ParamValue::from(e.api_input_tokens));
-        params_vec.push(ParamValue::from(e.api_output_tokens));
-        params_vec.push(ParamValue::from(e.api_cache_read_tokens));
-        params_vec.push(ParamValue::from(e.api_cache_creation_tokens));
-        params_vec.push(ParamValue::from(e.api_thinking_tokens));
-        params_vec.push(ParamValue::from(e.api_service_tier.clone()));
-        params_vec.push(ParamValue::from(e.api_data_source.clone()));
-        params_vec.push(ParamValue::from(e.tool_call_count));
-        params_vec.push(ParamValue::from(e.has_tool_calls as i64));
-        params_vec.push(ParamValue::from(e.has_plan as i64));
+        let params_vec: Vec<ParamValue> = vec![
+            ParamValue::from(e.message_id),
+            ParamValue::from(e.created_at_ms),
+            ParamValue::from(e.hour_id),
+            ParamValue::from(e.day_id),
+            ParamValue::from(e.agent_slug.clone()),
+            ParamValue::from(e.workspace_id),
+            ParamValue::from(e.source_id.clone()),
+            ParamValue::from(e.role.clone()),
+            ParamValue::from(e.content_chars),
+            ParamValue::from(e.content_tokens_est),
+            ParamValue::from(e.model_name.clone()),
+            ParamValue::from(e.model_family.clone()),
+            ParamValue::from(e.model_tier.clone()),
+            ParamValue::from(e.provider.clone()),
+            ParamValue::from(e.api_input_tokens),
+            ParamValue::from(e.api_output_tokens),
+            ParamValue::from(e.api_cache_read_tokens),
+            ParamValue::from(e.api_cache_creation_tokens),
+            ParamValue::from(e.api_thinking_tokens),
+            ParamValue::from(e.api_service_tier.clone()),
+            ParamValue::from(e.api_data_source.clone()),
+            ParamValue::from(e.tool_call_count),
+            ParamValue::from(e.has_tool_calls as i64),
+            ParamValue::from(e.has_plan as i64),
+        ];
 
         let values = param_slice_to_values(&params_vec);
         total_inserted += tx.execute_with_params(
@@ -7265,7 +7216,7 @@ impl FrankenStorage {
             if !entries.is_empty() {
                 franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
             }
-            if conversation_batch_count % 25 == 0 {
+            if conversation_batch_count.is_multiple_of(25) {
                 tracing::info!(
                     target: "cass::perf::daily_stats",
                     conversations_processed,
@@ -7325,7 +7276,7 @@ impl FrankenStorage {
                     if !entries.is_empty() {
                         franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
                     }
-                    if message_batch_count % 50 == 0 {
+                    if message_batch_count.is_multiple_of(50) {
                         tracing::info!(
                             target: "cass::perf::daily_stats",
                             messages_processed,
@@ -11434,7 +11385,7 @@ mod tests {
         seed_historical_db(
             &dir.path()
                 .join("backups/agent_search.db.20260322T020200.bak"),
-            &[overlapping_a.clone()],
+            std::slice::from_ref(&overlapping_a),
         );
         seed_historical_db(
             &dir.path().join("agent_search.corrupt.20260324_212907"),
@@ -11451,7 +11402,7 @@ mod tests {
 
         let shared_id = conversations
             .iter()
-            .find(|conv| conv.source_path == PathBuf::from("/tmp/shared-history.jsonl"))
+            .find(|conv| conv.source_path == std::path::Path::new("/tmp/shared-history.jsonl"))
             .and_then(|conv| conv.id)
             .unwrap();
         let shared_indices: Vec<i64> = storage

@@ -2462,7 +2462,8 @@ impl SearchClient {
             // If empty, we *can* try SQLite just in case index is lagging.
         }
 
-        // Fallback: SQLite FTS (slower, but strictly consistent with DB)
+        // Fallback: DB-resident FTS is currently disabled in frankensqlite-only
+        // mode. The primary lexical path is the Tantivy index above.
         // Skip SQLite fallback when the query contains leading/internal wildcards that
         // FTS5 cannot parse (e.g., "*handler" or "f*o").
         // We ALLOW trailing wildcards ("foo*") as FTS5 supports prefix matching.
@@ -2477,7 +2478,7 @@ impl SearchClient {
 
         if let Some(db_path) = &self.sqlite_path {
             tracing::info!(
-                backend = "sqlite-fts5-rusqlite",
+                backend = "sqlite-fts5-disabled",
                 query = sanitized,
                 limit = fallback_fetch_limit,
                 offset = 0,
@@ -4052,246 +4053,20 @@ impl SearchClient {
         Ok(hits)
     }
 
-    fn rusqlite_fts_uses_message_id_column(conn: &rusqlite::Connection) -> bool {
-        conn.prepare("PRAGMA table_info(fts_messages)")
-            .and_then(|mut stmt| {
-                stmt.query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<Result<Vec<String>, _>>()
-            })
-            .map(|columns| columns.iter().any(|name| name == "message_id"))
-            .unwrap_or(false)
-    }
-
-    /// FTS5 fallback search using a **rusqlite** connection.
-    ///
-    /// frankensqlite's FTS5 extension uses an in-memory inverted index that
-    /// cannot read pre-existing on-disk FTS5 shadow tables. Stock SQLite (via
-    /// rusqlite with `bundled`) natively supports on-disk FTS5, so we open a
-    /// separate read-only rusqlite connection for the MATCH query.
-    ///
-    /// Mirrors `browse_by_date_sqlite` query/filter logic while using
-    /// `bm25(fts_messages)` for ranking and canonical message/conversation
-    /// tables for payload fields. The JOIN predicate is schema-adaptive so the
-    /// fallback works with both legacy `message_id` FTS tables and the newer
-    /// contentless `rowid = messages.id` layout.
+    /// DB-resident FTS fallback is disabled until cass has a fully
+    /// frankensqlite-native implementation. The primary lexical engine is the
+    /// Tantivy index built during `cass index --full`.
     fn search_sqlite_fts5(
         &self,
-        db_path: &Path,
+        _db_path: &Path,
         raw_query: &str,
-        filters: SearchFilters,
-        limit: usize,
-        offset: usize,
-        field_mask: FieldMask,
+        _filters: SearchFilters,
+        _limit: usize,
+        _offset: usize,
+        _field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
-        let fts_query = match transpile_to_fts5(raw_query) {
-            Some(q) if !q.trim().is_empty() => q,
-            _ => return Ok(Vec::new()),
-        };
-
-        let conn = rusqlite::Connection::open_with_flags(
-            db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        // Live databases can be briefly busy during writer handoffs. A short
-        // timeout avoids turning transient lock contention into a false
-        // "search is broken" failure for the fallback path.
-        conn.busy_timeout(Duration::from_millis(250))?;
-
-        // Gracefully bail if the fts_messages table doesn't exist.
-        let has_fts: bool = conn
-            .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fts_messages'")
-            .and_then(|mut stmt| stmt.exists([]))
-            .unwrap_or(false);
-        if !has_fts {
-            return Ok(Vec::new());
-        }
-
-        let query_match_type = dominant_match_type(raw_query);
-        let message_join = if Self::rusqlite_fts_uses_message_id_column(&conn) {
-            "CAST(fts_messages.message_id AS INTEGER) = m.id"
-        } else {
-            "fts_messages.rowid = m.id"
-        };
-
-        // Contentless FTS5 cannot project stored columns directly, and we want
-        // consistent results for legacy schemas too, so payload fields always
-        // come from the canonical tables.
-        let content_expr = if field_mask.needs_content() {
-            "m.content"
-        } else if field_mask.wants_snippet() {
-            "substr(m.content, 1, 512)"
-        } else {
-            "''"
-        };
-        let title_expr = if field_mask.wants_title() {
-            "c.title"
-        } else {
-            "''"
-        };
-
-        let mut sql = format!(
-            "SELECT {title_expr}, {content_expr}, a.slug,
-                    COALESCE(w.path, ''), c.source_path,
-                    m.created_at, m.idx, c.source_id, c.origin_host,
-                    COALESCE(s.kind, 'local'), bm25(fts_messages)
-             FROM fts_messages
-             JOIN messages m ON {message_join}
-             JOIN conversations c ON m.conversation_id = c.id
-             JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id
-             LEFT JOIN sources s ON c.source_id = s.id
-             WHERE fts_messages MATCH ?1"
-        );
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(fts_query.clone())];
-        let mut param_idx: usize = 1;
-
-        if !filters.agents.is_empty() {
-            let placeholders: Vec<String> = filters
-                .agents
-                .iter()
-                .map(|a| {
-                    param_idx += 1;
-                    param_values.push(Box::new(a.clone()));
-                    format!("?{param_idx}")
-                })
-                .collect();
-            sql.push_str(&format!(" AND a.slug IN ({})", placeholders.join(",")));
-        }
-
-        if !filters.workspaces.is_empty() {
-            let placeholders: Vec<String> = filters
-                .workspaces
-                .iter()
-                .map(|w| {
-                    param_idx += 1;
-                    param_values.push(Box::new(w.clone()));
-                    format!("?{param_idx}")
-                })
-                .collect();
-            sql.push_str(&format!(
-                " AND COALESCE(w.path, '') IN ({})",
-                placeholders.join(",")
-            ));
-        }
-
-        if let Some(created_from) = filters.created_from {
-            param_idx += 1;
-            sql.push_str(&format!(" AND m.created_at >= ?{param_idx}"));
-            param_values.push(Box::new(created_from));
-        }
-        if let Some(created_to) = filters.created_to {
-            param_idx += 1;
-            sql.push_str(&format!(" AND m.created_at <= ?{param_idx}"));
-            param_values.push(Box::new(created_to));
-        }
-
-        match &filters.source_filter {
-            SourceFilter::All => {}
-            SourceFilter::Local => {
-                sql.push_str(" AND COALESCE(c.source_id, 'local') = 'local'");
-            }
-            SourceFilter::Remote => {
-                sql.push_str(" AND COALESCE(c.source_id, 'local') != 'local'");
-            }
-            SourceFilter::SourceId(id) => {
-                param_idx += 1;
-                sql.push_str(&format!(
-                    " AND COALESCE(c.source_id, 'local') = ?{param_idx}"
-                ));
-                param_values.push(Box::new(id.clone()));
-            }
-        }
-
-        param_idx += 1;
-        sql.push_str(&format!(
-            " ORDER BY bm25(fts_messages), m.id LIMIT ?{param_idx}"
-        ));
-        param_values.push(Box::new(limit as i64));
-        param_idx += 1;
-        sql.push_str(&format!(" OFFSET ?{param_idx}"));
-        param_values.push(Box::new(offset as i64));
-
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, Option<i64>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, f64>(10)?,
-            ))
-        })?;
-
-        let mut hits = Vec::new();
-        for row_result in rows {
-            let (
-                title_opt,
-                raw_content,
-                agent,
-                workspace,
-                source_path,
-                created_at,
-                idx,
-                source_id_opt,
-                origin_host,
-                origin_kind_opt,
-                bm25_score,
-            ) = row_result?;
-
-            let title = title_opt.unwrap_or_default();
-            let source_id = source_id_opt.unwrap_or_else(default_source_id);
-            let origin_kind = origin_kind_opt.unwrap_or_else(default_origin_kind);
-
-            let line_number = idx
-                .and_then(|i| usize::try_from(i).ok())
-                .map(|i| i.saturating_add(1));
-            let snippet = if field_mask.wants_snippet() {
-                snippet_from_content(&raw_content)
-            } else {
-                String::new()
-            };
-            let content = if field_mask.needs_content() {
-                raw_content
-            } else {
-                String::new()
-            };
-            let hash_basis = if content.is_empty() {
-                snippet.as_str()
-            } else {
-                content.as_str()
-            };
-            let content_hash = stable_hit_hash(hash_basis, &source_path, line_number, created_at);
-
-            hits.push(SearchHit {
-                title,
-                snippet,
-                content,
-                content_hash,
-                score: (-bm25_score) as f32,
-                source_path,
-                agent,
-                workspace,
-                workspace_original: None,
-                created_at,
-                line_number,
-                match_type: query_match_type,
-                source_id,
-                origin_kind,
-                origin_host,
-            });
-        }
-
-        Ok(hits)
+        let _ = transpile_to_fts5(raw_query);
+        Ok(Vec::new())
     }
 
     /// Browse messages ordered by date, without any text query.
