@@ -14,7 +14,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use frankensqlite::{
+    Connection as FrankenConnection,
+    compat::{ConnectionExt, ParamValue, RowExt},
+};
 use fs2::FileExt;
 use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher, recommended_watcher};
@@ -1490,8 +1493,14 @@ fn run_streaming_consumer(
                 }
 
                 // Ingest the batch
-                let ingest_result =
-                    ingest_batch(storage, t_index, &conversations, progress, needs_rebuild);
+                let ingest_result = ingest_batch(
+                    storage,
+                    t_index,
+                    &conversations,
+                    progress,
+                    needs_rebuild,
+                    true,
+                );
                 flow_limiter.release(byte_reservation);
                 ingest_result?;
 
@@ -1912,7 +1921,14 @@ fn run_batch_index(
     }
 
     for (name, convs, _discovered) in pending_batches {
-        ingest_batch(storage, t_index, &convs, &opts.progress, needs_rebuild)?;
+        ingest_batch(
+            storage,
+            t_index,
+            &convs,
+            &opts.progress,
+            needs_rebuild,
+            !opts.watch,
+        )?;
         tracing::info!(
             connector = name,
             conversations = convs.len(),
@@ -1933,10 +1949,12 @@ pub fn run_index(
 
     let (storage, storage_rebuilt, opened_fresh_for_full) =
         open_storage_for_index(&opts.db_path, opts.full)?;
+    let defer_checkpoints = !opts.watch;
     let mut storage = storage;
     let mut storage_rebuilt = storage_rebuilt;
     let mut opened_fresh_for_full = opened_fresh_for_full;
     persist::apply_index_writer_busy_timeout(&storage);
+    persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
     let index_path = index_dir(&opts.data_dir)?;
     let mut initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
     if opts.full
@@ -1956,6 +1974,7 @@ pub fn run_index(
         storage_rebuilt = true;
         opened_fresh_for_full = true;
         persist::apply_index_writer_busy_timeout(&storage);
+        persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
         initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
     }
     let canonical_only_full_rebuild = opts.full
@@ -2058,6 +2077,7 @@ pub fn run_index(
         if opts.full && !opened_fresh_for_full && initial_canonical_sessions_before_salvage == 0 {
             storage = reopen_fresh_storage_for_full_rebuild(storage, &opts.db_path)?;
             persist::apply_index_writer_busy_timeout(&storage);
+            persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
             t_index.delete_all()?;
             t_index.commit()?;
         } else if opts.full {
@@ -2112,6 +2132,7 @@ pub fn run_index(
                     maybe_seed_empty_canonical_from_historical_bundle(storage, &opts.db_path)?;
                 storage = reopened_storage;
                 persist::apply_index_writer_busy_timeout(&storage);
+                persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
                 if let Some(seed_outcome) = seed_outcome {
                     outcome.accumulate(seed_outcome);
                     has_pending_historical_bundles =
@@ -2687,6 +2708,25 @@ fn open_storage_for_index(
     db_path: &Path,
     allow_full_recovery: bool,
 ) -> Result<(FrankenStorage, bool, bool)> {
+    if db_path.exists() {
+        match current_schema_fast_probe(db_path) {
+            Ok(true) => match FrankenStorage::open(db_path) {
+                Ok(storage) => return Ok((storage, false, false)),
+                Err(err) => tracing::warn!(
+                    db_path = %db_path.display(),
+                    error = ?err,
+                    "fast current-schema storage open failed; falling back to compatibility recovery"
+                ),
+            },
+            Ok(false) => {}
+            Err(err) => tracing::warn!(
+                db_path = %db_path.display(),
+                error = ?err,
+                "fast current-schema probe failed; falling back to compatibility recovery"
+            ),
+        }
+    }
+
     match FrankenStorage::open_or_rebuild(db_path) {
         Ok(storage) => Ok((storage, false, false)),
         Err(MigrationError::RebuildRequired {
@@ -2733,9 +2773,32 @@ fn open_storage_for_index(
             Ok((storage, true, true))
         }
         Err(err) => Err(anyhow::anyhow!(
-            "failed to open frankensqlite storage: {err}"
+            "failed to open frankensqlite storage: {err:#}"
         )),
     }
+}
+
+fn current_schema_fast_probe(db_path: &Path) -> Result<bool> {
+    let mut conn = FrankenConnection::open(db_path.to_string_lossy().to_string())
+        .with_context(|| format!("opening frankensqlite db at {}", db_path.display()))?;
+
+    let version = conn
+        .query("SELECT value FROM meta WHERE key = 'schema_version';")
+        .ok()
+        .and_then(|rows| rows.first().cloned())
+        .and_then(|row| row.get_typed::<String>(0).ok())
+        .and_then(|raw| raw.parse::<i64>().ok());
+
+    if let Err(close_err) = conn.close_in_place() {
+        tracing::warn!(
+            error = %close_err,
+            db_path = %db_path.display(),
+            "current_schema_fast_probe: close_in_place failed; falling back to best-effort close"
+        );
+        conn.close_best_effort_in_place();
+    }
+
+    Ok(version == Some(crate::storage::sqlite::CURRENT_SCHEMA_VERSION))
 }
 
 fn reopen_fresh_storage_for_full_rebuild(
@@ -3220,10 +3283,17 @@ fn ingest_batch(
     convs: &[NormalizedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     force_tantivy_reindex: bool,
+    defer_checkpoints: bool,
 ) -> Result<()> {
     // Use batched insert for better SQLite performance (single transaction)
     // This also handles daily_stats updates incrementally via InsertOutcome deltas.
-    persist::persist_conversations_batched(storage, t_index, convs, force_tantivy_reindex)?;
+    persist::persist_conversations_batched(
+        storage,
+        t_index,
+        convs,
+        force_tantivy_reindex,
+        defer_checkpoints,
+    )?;
 
     // Update progress counter for all conversations at once
     if let Some(p) = progress {
@@ -3645,7 +3715,14 @@ fn reindex_paths(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
 
-            ingest_batch(&storage, &mut t_index, &convs, &opts.progress, false)?;
+            ingest_batch(
+                &storage,
+                &mut t_index,
+                &convs,
+                &opts.progress,
+                false,
+                !opts.watch,
+            )?;
 
             // Commit to Tantivy immediately to ensure index consistency before advancing watch state.
             t_index.commit()?;
@@ -4370,7 +4447,21 @@ pub mod persist {
             .unwrap_or(60_000)
     }
 
-    fn apply_begin_concurrent_writer_tuning(storage: &FrankenStorage) {
+    fn index_writer_wal_autocheckpoint_pages(defer_checkpoints: bool) -> i64 {
+        dotenvy::var("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v >= 0)
+            .unwrap_or(if defer_checkpoints { 0 } else { 1000 })
+    }
+
+    fn defer_lexical_updates_enabled() -> bool {
+        dotenvy::var("CASS_DEFER_LEXICAL_UPDATES")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(false)
+    }
+
+    fn apply_begin_concurrent_writer_tuning(storage: &FrankenStorage, defer_checkpoints: bool) {
         let cache_kib = begin_concurrent_writer_cache_kib();
         let pragma = format!("PRAGMA cache_size = -{cache_kib};");
         if let Err(err) = storage.raw().execute(&pragma) {
@@ -4380,6 +4471,7 @@ pub mod persist {
                 "failed_to_apply_begin_concurrent_writer_cache_size"
             );
         }
+        apply_index_writer_checkpoint_policy(storage, defer_checkpoints);
     }
 
     pub(super) fn apply_index_writer_busy_timeout(storage: &FrankenStorage) {
@@ -4390,6 +4482,21 @@ pub mod persist {
                 busy_timeout_ms,
                 error = %err,
                 "failed_to_apply_index_writer_busy_timeout"
+            );
+        }
+    }
+
+    pub(super) fn apply_index_writer_checkpoint_policy(
+        storage: &FrankenStorage,
+        defer_checkpoints: bool,
+    ) {
+        let wal_autocheckpoint_pages = index_writer_wal_autocheckpoint_pages(defer_checkpoints);
+        let pragma = format!("PRAGMA wal_autocheckpoint = {wal_autocheckpoint_pages};");
+        if let Err(err) = storage.raw().execute(&pragma) {
+            tracing::debug!(
+                wal_autocheckpoint_pages,
+                error = %err,
+                "failed_to_apply_index_writer_checkpoint_policy"
             );
         }
     }
@@ -4471,6 +4578,7 @@ pub mod persist {
         t_index: &mut TantivyIndex,
         convs: &[NormalizedConversation],
         force_tantivy_reindex: bool,
+        defer_checkpoints: bool,
     ) -> Result<()> {
         let max_retries = begin_concurrent_retry_limit();
         let chunk_size = begin_concurrent_chunk_size().min(convs.len().max(1));
@@ -4485,7 +4593,7 @@ pub mod persist {
                         db_path.display()
                     )
                 })?;
-                apply_begin_concurrent_writer_tuning(&franken);
+                apply_begin_concurrent_writer_tuning(&franken, defer_checkpoints);
                 let result: Result<Vec<(usize, InsertOutcome)>> = (|| {
                     let mut outcomes = Vec::with_capacity(chunk.len());
                     let mut agent_cache: HashMap<String, i64> = HashMap::new();
@@ -4565,9 +4673,13 @@ pub mod persist {
         }
         ordered.sort_by_key(|(idx, _)| *idx);
 
+        let defer_lexical_updates = defer_lexical_updates_enabled();
+
         for (idx, outcome) in ordered {
             let conv = &convs[idx];
-            if force_tantivy_reindex {
+            if defer_lexical_updates {
+                continue;
+            } else if force_tantivy_reindex {
                 t_index.add_messages(conv, &conv.messages)?;
             } else if !outcome.inserted_indices.is_empty() {
                 let new_msgs: Vec<_> = conv
@@ -4699,7 +4811,7 @@ pub mod persist {
         } = storage.insert_conversation_tree(agent_id, workspace_id, &internal_conv)?;
 
         // Only add newly inserted messages to the Tantivy index (incremental)
-        if !inserted_indices.is_empty() {
+        if !defer_lexical_updates_enabled() && !inserted_indices.is_empty() {
             let new_msgs: Vec<_> = conv
                 .messages
                 .iter()
@@ -4721,6 +4833,7 @@ pub mod persist {
         t_index: &mut TantivyIndex,
         convs: &[NormalizedConversation],
         force_tantivy_reindex: bool,
+        defer_checkpoints: bool,
     ) -> Result<()> {
         if convs.is_empty() {
             return Ok(());
@@ -4743,6 +4856,7 @@ pub mod persist {
                 t_index,
                 convs,
                 force_tantivy_reindex,
+                defer_checkpoints,
             );
         }
 
@@ -4807,6 +4921,7 @@ pub mod persist {
 
         let chunk_size = serial_batch_chunk_size().min(refs.len().max(1));
         let mut outcomes = Vec::with_capacity(refs.len());
+        let defer_lexical_updates = defer_lexical_updates_enabled();
 
         for start in (0..refs.len()).step_by(chunk_size) {
             let end = (start + chunk_size).min(refs.len());
@@ -4815,18 +4930,20 @@ pub mod persist {
 
             let chunk_outcomes = storage.insert_conversations_batched(chunk_refs)?;
 
-            for (conv, outcome) in chunk_convs.iter().zip(chunk_outcomes.iter()) {
-                if force_tantivy_reindex {
-                    // Rebuild path: the Tantivy index is known-empty, so index all messages.
-                    t_index.add_messages(conv, &conv.messages)?;
-                } else if !outcome.inserted_indices.is_empty() {
-                    let new_msgs: Vec<_> = conv
-                        .messages
-                        .iter()
-                        .filter(|m| outcome.inserted_indices.contains(&m.idx))
-                        .cloned()
-                        .collect();
-                    t_index.add_messages(conv, &new_msgs)?;
+            if !defer_lexical_updates {
+                for (conv, outcome) in chunk_convs.iter().zip(chunk_outcomes.iter()) {
+                    if force_tantivy_reindex {
+                        // Rebuild path: the Tantivy index is known-empty, so index all messages.
+                        t_index.add_messages(conv, &conv.messages)?;
+                    } else if !outcome.inserted_indices.is_empty() {
+                        let new_msgs: Vec<_> = conv
+                            .messages
+                            .iter()
+                            .filter(|m| outcome.inserted_indices.contains(&m.idx))
+                            .cloned()
+                            .collect();
+                        t_index.add_messages(conv, &new_msgs)?;
+                    }
                 }
             }
 
@@ -4849,6 +4966,7 @@ pub mod persist {
     #[cfg(test)]
     mod persist_internal_tests {
         use super::*;
+        use fsqlite_types::value::SqliteValue;
         use serial_test::serial;
 
         struct EnvGuard {
@@ -4912,6 +5030,19 @@ pub mod persist {
         }
 
         #[test]
+        fn wal_autocheckpoint_defaults_follow_bulk_import_mode() {
+            let _guard = set_env("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES", "-1");
+            assert_eq!(index_writer_wal_autocheckpoint_pages(true), 0);
+            assert_eq!(index_writer_wal_autocheckpoint_pages(false), 1000);
+        }
+
+        #[test]
+        fn defer_lexical_updates_flag_parsing() {
+            let _guard = set_env("CASS_DEFER_LEXICAL_UPDATES", "1");
+            assert!(defer_lexical_updates_enabled());
+        }
+
+        #[test]
         fn retryable_franken_errors_are_detected() {
             let retryable = anyhow::Error::new(FrankenError::BusySnapshot {
                 conflicting_pages: "1,2".to_string(),
@@ -4927,6 +5058,23 @@ pub mod persist {
             let fs = FrankenStorage::open(path).expect("open frankensqlite db");
             fs.run_migrations().expect("run migrations");
             fs
+        }
+
+        #[test]
+        fn apply_index_writer_checkpoint_policy_round_trips_pragma() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("checkpoint-policy.db");
+            let storage = create_franken_db(&db_path);
+
+            apply_index_writer_checkpoint_policy(&storage, true);
+            let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
+
+            apply_index_writer_checkpoint_policy(&storage, false);
+            let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1000));
         }
 
         #[test]
@@ -4975,8 +5123,14 @@ pub mod persist {
             // Set chunk size < conversation count to exercise multiple parallel writers
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "3");
 
-            persist_conversations_batched_begin_concurrent(&db_path, &mut t_index, &convs, true)
-                .expect("begin-concurrent persist should succeed");
+            persist_conversations_batched_begin_concurrent(
+                &db_path,
+                &mut t_index,
+                &convs,
+                true,
+                false,
+            )
+            .expect("begin-concurrent persist should succeed");
 
             // Verify using FrankenStorage reader
             let reader = FrankenStorage::open(&db_path).unwrap();
@@ -5040,8 +5194,14 @@ pub mod persist {
                 }],
             }];
 
-            persist_conversations_batched_begin_concurrent(&db_path, &mut t_index, &convs, true)
-                .expect("single conversation begin-concurrent persist should succeed");
+            persist_conversations_batched_begin_concurrent(
+                &db_path,
+                &mut t_index,
+                &convs,
+                true,
+                false,
+            )
+            .expect("single conversation begin-concurrent persist should succeed");
 
             let reader = FrankenStorage::open(&db_path).unwrap();
             let count: i64 = reader
@@ -5149,7 +5309,7 @@ pub mod persist {
                 },
             ];
 
-            persist_conversations_batched(&storage, &mut t_index, &convs, false)
+            persist_conversations_batched(&storage, &mut t_index, &convs, false, false)
                 .expect("duplicate-key batch should fall back to serial path");
 
             let reader = FrankenStorage::open(&db_path).unwrap();
@@ -5928,6 +6088,42 @@ mod tests {
             backup_count >= 1,
             "expected backup artifact for rebuilt schema"
         );
+    }
+
+    #[test]
+    fn current_schema_fast_probe_accepts_current_schema() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("current-schema.db");
+
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(
+            storage.schema_version().unwrap(),
+            crate::storage::sqlite::CURRENT_SCHEMA_VERSION
+        );
+        drop(storage);
+
+        assert!(current_schema_fast_probe(&db_path).unwrap());
+    }
+
+    #[test]
+    fn current_schema_fast_probe_rejects_future_schema_marker() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("future-marker.db");
+
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
+                &[ParamValue::from(format!(
+                    "{}",
+                    crate::storage::sqlite::CURRENT_SCHEMA_VERSION + 1
+                ))],
+            )
+            .unwrap();
+        drop(storage);
+
+        assert!(!current_schema_fast_probe(&db_path).unwrap());
     }
 
     #[test]
