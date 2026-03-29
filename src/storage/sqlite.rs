@@ -4751,6 +4751,8 @@ impl FrankenStorage {
         workspace_id: Option<i64>,
         conv: &Conversation,
     ) -> Result<InsertOutcome> {
+        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
+        let defer_analytics_updates = defer_analytics_updates_enabled();
         let conversation_key = conversation_merge_key(agent_id, conv);
         let mut tx = self.conn.transaction()?;
         let existing =
@@ -4802,17 +4804,19 @@ impl FrankenStorage {
                     }
                     let msg_id = franken_insert_message(&tx, existing_id, msg)?;
                     franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
-                    fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                    fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                    if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                        || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                    {
-                        flush_pending_fts_entries(
-                            &tx,
-                            &mut fts_entries,
-                            &mut fts_pending_chars,
-                            &mut _fts_inserted_total,
-                        )?;
+                    if !defer_lexical_updates {
+                        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                        fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
+                        if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                            || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                        {
+                            flush_pending_fts_entries(
+                                &tx,
+                                &mut fts_entries,
+                                &mut fts_pending_chars,
+                                &mut _fts_inserted_total,
+                            )?;
+                        }
                     }
                     inserted_indices.push(msg.idx);
                     new_chars += msg.content.len() as i64;
@@ -4830,12 +4834,14 @@ impl FrankenStorage {
                     );
                 }
 
-                flush_pending_fts_entries(
-                    &tx,
-                    &mut fts_entries,
-                    &mut fts_pending_chars,
-                    &mut _fts_inserted_total,
-                )?;
+                if !defer_lexical_updates {
+                    flush_pending_fts_entries(
+                        &tx,
+                        &mut fts_entries,
+                        &mut fts_pending_chars,
+                        &mut _fts_inserted_total,
+                    )?;
+                }
 
                 if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
                     tx.execute_compat(
@@ -4844,7 +4850,7 @@ impl FrankenStorage {
                     )?;
                 }
 
-                if !inserted_indices.is_empty() {
+                if !defer_analytics_updates && !inserted_indices.is_empty() {
                     franken_update_daily_stats_in_tx(
                         &tx,
                         &conv.agent_slug,
@@ -4870,36 +4876,42 @@ impl FrankenStorage {
         for msg in &conv.messages {
             let msg_id = franken_insert_message(&tx, conv_id, msg)?;
             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
-            fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-            fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-            if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-            {
-                flush_pending_fts_entries(
-                    &tx,
-                    &mut fts_entries,
-                    &mut fts_pending_chars,
-                    &mut _fts_inserted_total,
-                )?;
+            if !defer_lexical_updates {
+                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
+                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                {
+                    flush_pending_fts_entries(
+                        &tx,
+                        &mut fts_entries,
+                        &mut fts_pending_chars,
+                        &mut _fts_inserted_total,
+                    )?;
+                }
             }
             total_chars += msg.content.len() as i64;
         }
-        flush_pending_fts_entries(
-            &tx,
-            &mut fts_entries,
-            &mut fts_pending_chars,
-            &mut _fts_inserted_total,
-        )?;
+        if !defer_lexical_updates {
+            flush_pending_fts_entries(
+                &tx,
+                &mut fts_entries,
+                &mut fts_pending_chars,
+                &mut _fts_inserted_total,
+            )?;
+        }
 
-        franken_update_daily_stats_in_tx(
-            &tx,
-            &conv.agent_slug,
-            &conv.source_id,
-            conversation_effective_started_at(conv),
-            1,
-            conv.messages.len() as i64,
-            total_chars,
-        )?;
+        if !defer_analytics_updates {
+            franken_update_daily_stats_in_tx(
+                &tx,
+                &conv.agent_slug,
+                &conv.source_id,
+                conversation_effective_started_at(conv),
+                1,
+                conv.messages.len() as i64,
+                total_chars,
+            )?;
+        }
 
         tx.commit()?;
         Ok(InsertOutcome {
@@ -4915,6 +4927,8 @@ impl FrankenStorage {
         conversation_id: i64,
         conv: &Conversation,
     ) -> Result<InsertOutcome> {
+        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
+        let defer_analytics_updates = defer_analytics_updates_enabled();
         let mut existing_messages =
             franken_existing_message_fingerprints_by_idx(tx, conversation_id)?;
         let mut existing_replay_fingerprints =
@@ -4948,17 +4962,19 @@ impl FrankenStorage {
             }
             let msg_id = franken_insert_message(tx, conversation_id, msg)?;
             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
-            fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-            fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-            if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-            {
-                flush_pending_fts_entries(
-                    tx,
-                    &mut fts_entries,
-                    &mut fts_pending_chars,
-                    &mut _fts_inserted_total,
-                )?;
+            if !defer_lexical_updates {
+                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
+                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                {
+                    flush_pending_fts_entries(
+                        tx,
+                        &mut fts_entries,
+                        &mut fts_pending_chars,
+                        &mut _fts_inserted_total,
+                    )?;
+                }
             }
             inserted_indices.push(msg.idx);
             new_chars += msg.content.len() as i64;
@@ -4976,12 +4992,14 @@ impl FrankenStorage {
             );
         }
 
-        flush_pending_fts_entries(
-            tx,
-            &mut fts_entries,
-            &mut fts_pending_chars,
-            &mut _fts_inserted_total,
-        )?;
+        if !defer_lexical_updates {
+            flush_pending_fts_entries(
+                tx,
+                &mut fts_entries,
+                &mut fts_pending_chars,
+                &mut _fts_inserted_total,
+            )?;
+        }
 
         if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
             tx.execute_compat(
@@ -4990,7 +5008,7 @@ impl FrankenStorage {
             )?;
         }
 
-        if !inserted_indices.is_empty() {
+        if !defer_analytics_updates && !inserted_indices.is_empty() {
             let message_count = inserted_indices.len() as i64;
             franken_update_daily_stats_in_tx(
                 tx,
@@ -5387,6 +5405,9 @@ impl FrankenStorage {
             return Ok(Vec::new());
         }
 
+        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
+        let defer_analytics_updates = defer_analytics_updates_enabled();
+
         let pricing_table = PricingTable::franken_load(&self.conn).unwrap_or_else(|e| {
             tracing::warn!(target: "cass::analytics::pricing", error = %e, "failed to load pricing table");
             PricingTable { entries: Vec::new() }
@@ -5479,18 +5500,20 @@ impl FrankenStorage {
                     }
                     let msg_id = franken_insert_message(&tx, existing_id, msg)?;
                     franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
-                    fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                    fts_count_total += 1;
-                    fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                    if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                        || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                    {
-                        flush_pending_fts_entries(
-                            &tx,
-                            &mut fts_entries,
-                            &mut fts_pending_chars,
-                            &mut fts_inserted_total,
-                        )?;
+                    if !defer_lexical_updates {
+                        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                        fts_count_total += 1;
+                        fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
+                        if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                            || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                        {
+                            flush_pending_fts_entries(
+                                &tx,
+                                &mut fts_entries,
+                                &mut fts_pending_chars,
+                                &mut fts_inserted_total,
+                            )?;
+                        }
                     }
                     total_chars += msg.content.len() as i64;
                     inserted_indices.push(msg.idx);
@@ -5544,18 +5567,21 @@ impl FrankenStorage {
                             }
                             let msg_id = franken_insert_message(&tx, new_conv_id, msg)?;
                             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
-                            fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                            fts_count_total += 1;
-                            fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                            if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                                || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                            {
-                                flush_pending_fts_entries(
-                                    &tx,
-                                    &mut fts_entries,
-                                    &mut fts_pending_chars,
-                                    &mut fts_inserted_total,
-                                )?;
+                            if !defer_lexical_updates {
+                                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                                fts_count_total += 1;
+                                fts_pending_chars =
+                                    fts_pending_chars.saturating_add(msg.content.len());
+                                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                                {
+                                    flush_pending_fts_entries(
+                                        &tx,
+                                        &mut fts_entries,
+                                        &mut fts_pending_chars,
+                                        &mut fts_inserted_total,
+                                    )?;
+                                }
                             }
                             total_chars += msg.content.len() as i64;
                             inserted_indices.push(msg.idx);
@@ -5613,18 +5639,21 @@ impl FrankenStorage {
                             }
                             let msg_id = franken_insert_message(&tx, existing_id, msg)?;
                             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
-                            fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                            fts_count_total += 1;
-                            fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                            if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                                || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                            {
-                                flush_pending_fts_entries(
-                                    &tx,
-                                    &mut fts_entries,
-                                    &mut fts_pending_chars,
-                                    &mut fts_inserted_total,
-                                )?;
+                            if !defer_lexical_updates {
+                                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                                fts_count_total += 1;
+                                fts_pending_chars =
+                                    fts_pending_chars.saturating_add(msg.content.len());
+                                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                                {
+                                    flush_pending_fts_entries(
+                                        &tx,
+                                        &mut fts_entries,
+                                        &mut fts_pending_chars,
+                                        &mut fts_inserted_total,
+                                    )?;
+                                }
                             }
                             total_chars += msg.content.len() as i64;
                             inserted_indices.push(msg.idx);
@@ -5661,180 +5690,184 @@ impl FrankenStorage {
                 }
             };
 
-            let delta = StatsDelta {
-                session_count_delta,
-                message_count_delta: inserted_messages.len() as i64,
-                total_chars_delta: total_chars,
-            };
-
-            let effective_started_at = conversation_effective_started_at(conv);
-            let day_id = effective_started_at
-                .map(FrankenStorage::day_id_from_millis)
-                .unwrap_or(0);
-            stats.record_delta(
-                &conv.agent_slug,
-                &conv.source_id,
-                day_id,
-                delta.session_count_delta,
-                delta.message_count_delta,
-                delta.total_chars_delta,
-            );
-
-            // Extract token usage from newly inserted messages
-            let conv_day_id = day_id;
-            let mut session_model_family = String::from("unknown");
-            let mut has_any_tokens = false;
-
-            for &(message_id, msg) in &inserted_messages {
-                let role_s = role_str(&msg.role);
-                let usage = if historical_raw_json(&msg.extra_json).is_some() {
-                    crate::connectors::extract_tokens_for_agent(
-                        &conv.agent_slug,
-                        &serde_json::Value::Null,
-                        &msg.content,
-                        &role_s,
-                    )
-                } else {
-                    crate::connectors::extract_tokens_for_agent(
-                        &conv.agent_slug,
-                        &msg.extra_json,
-                        &msg.content,
-                        &role_s,
-                    )
+            if !defer_analytics_updates {
+                let delta = StatsDelta {
+                    session_count_delta,
+                    message_count_delta: inserted_messages.len() as i64,
+                    total_chars_delta: total_chars,
                 };
 
-                let msg_ts = msg.created_at.or(effective_started_at).unwrap_or(0);
-                let msg_day_id = if msg_ts > 0 {
-                    FrankenStorage::day_id_from_millis(msg_ts)
-                } else {
-                    conv_day_id
-                };
-
-                let model_info = usage
-                    .model_name
-                    .as_deref()
-                    .map(crate::connectors::normalize_model);
-
-                let model_family = model_info
-                    .as_ref()
-                    .map(|i| i.family.clone())
-                    .unwrap_or_else(|| "unknown".into());
-                let model_tier = model_info
-                    .as_ref()
-                    .map(|i| i.tier.clone())
-                    .unwrap_or_else(|| "unknown".into());
-                let provider = usage
-                    .provider
-                    .clone()
-                    .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
-                    .unwrap_or_else(|| "unknown".into());
-
-                if model_family != "unknown" {
-                    session_model_family = model_family.clone();
-                }
-
-                let estimated_cost = pricing_table.compute_cost(
-                    usage.model_name.as_deref(),
-                    msg_day_id,
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    usage.cache_read_tokens,
-                    usage.cache_creation_tokens,
-                );
-                if estimated_cost.is_some() {
-                    pricing_diag.record_priced();
-                } else if usage.has_token_data() {
-                    pricing_diag.record_unpriced(usage.model_name.as_deref());
-                }
-
-                token_stats.record(
+                let effective_started_at = conversation_effective_started_at(conv);
+                let day_id = effective_started_at
+                    .map(FrankenStorage::day_id_from_millis)
+                    .unwrap_or(0);
+                stats.record_delta(
                     &conv.agent_slug,
                     &conv.source_id,
-                    msg_day_id,
-                    &model_family,
-                    &role_s,
-                    &usage,
-                    msg.content.len() as i64,
-                    estimated_cost.unwrap_or(0.0),
+                    day_id,
+                    delta.session_count_delta,
+                    delta.message_count_delta,
+                    delta.total_chars_delta,
                 );
 
-                if usage.has_token_data() {
-                    has_any_tokens = true;
+                let conv_day_id = day_id;
+                let mut session_model_family = String::from("unknown");
+                let mut has_any_tokens = false;
+
+                for &(message_id, msg) in &inserted_messages {
+                    let role_s = role_str(&msg.role);
+                    let usage = if historical_raw_json(&msg.extra_json).is_some() {
+                        crate::connectors::extract_tokens_for_agent(
+                            &conv.agent_slug,
+                            &serde_json::Value::Null,
+                            &msg.content,
+                            &role_s,
+                        )
+                    } else {
+                        crate::connectors::extract_tokens_for_agent(
+                            &conv.agent_slug,
+                            &msg.extra_json,
+                            &msg.content,
+                            &role_s,
+                        )
+                    };
+
+                    let msg_ts = msg
+                        .created_at
+                        .or(conversation_effective_started_at(conv))
+                        .unwrap_or(0);
+                    let msg_day_id = if msg_ts > 0 {
+                        FrankenStorage::day_id_from_millis(msg_ts)
+                    } else {
+                        conv_day_id
+                    };
+
+                    let model_info = usage
+                        .model_name
+                        .as_deref()
+                        .map(crate::connectors::normalize_model);
+
+                    let model_family = model_info
+                        .as_ref()
+                        .map(|i| i.family.clone())
+                        .unwrap_or_else(|| "unknown".into());
+                    let model_tier = model_info
+                        .as_ref()
+                        .map(|i| i.tier.clone())
+                        .unwrap_or_else(|| "unknown".into());
+                    let provider = usage
+                        .provider
+                        .clone()
+                        .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
+                        .unwrap_or_else(|| "unknown".into());
+
+                    if model_family != "unknown" {
+                        session_model_family = model_family.clone();
+                    }
+
+                    let estimated_cost = pricing_table.compute_cost(
+                        usage.model_name.as_deref(),
+                        msg_day_id,
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_read_tokens,
+                        usage.cache_creation_tokens,
+                    );
+                    if estimated_cost.is_some() {
+                        pricing_diag.record_priced();
+                    } else if usage.has_token_data() {
+                        pricing_diag.record_unpriced(usage.model_name.as_deref());
+                    }
+
+                    token_stats.record(
+                        &conv.agent_slug,
+                        &conv.source_id,
+                        msg_day_id,
+                        &model_family,
+                        &role_s,
+                        &usage,
+                        msg.content.len() as i64,
+                        estimated_cost.unwrap_or(0.0),
+                    );
+
+                    if usage.has_token_data() {
+                        has_any_tokens = true;
+                    }
+
+                    let content_chars = msg.content.len() as i64;
+                    let content_tokens_est = content_chars / 4;
+                    let msg_hour_id = FrankenStorage::hour_id_from_millis(msg_ts);
+                    let has_plan = has_plan_for_role(&role_s, &msg.content);
+
+                    token_entries.push(TokenUsageEntry {
+                        message_id,
+                        conversation_id: conv_id,
+                        agent_id,
+                        workspace_id,
+                        source_id: conv.source_id.clone(),
+                        timestamp_ms: msg_ts,
+                        day_id: msg_day_id,
+                        model_name: usage.model_name.clone(),
+                        model_family: Some(model_family.clone()),
+                        model_tier: Some(model_tier.clone()),
+                        service_tier: usage.service_tier.clone(),
+                        provider: Some(provider.clone()),
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        cache_read_tokens: usage.cache_read_tokens,
+                        cache_creation_tokens: usage.cache_creation_tokens,
+                        thinking_tokens: usage.thinking_tokens,
+                        total_tokens: usage.total_tokens(),
+                        estimated_cost_usd: estimated_cost,
+                        role: role_s.clone(),
+                        content_chars,
+                        has_tool_calls: usage.has_tool_calls,
+                        tool_call_count: usage.tool_call_count,
+                        data_source: usage.data_source.as_str().to_string(),
+                    });
+
+                    let mm = MessageMetricsEntry {
+                        message_id,
+                        created_at_ms: msg_ts,
+                        hour_id: msg_hour_id,
+                        day_id: msg_day_id,
+                        agent_slug: conv.agent_slug.clone(),
+                        workspace_id: workspace_id.unwrap_or(0),
+                        source_id: conv.source_id.clone(),
+                        role: role_s,
+                        content_chars,
+                        content_tokens_est,
+                        model_name: usage.model_name.clone(),
+                        model_family: model_family.clone(),
+                        model_tier: model_tier.clone(),
+                        provider,
+                        api_input_tokens: usage.input_tokens,
+                        api_output_tokens: usage.output_tokens,
+                        api_cache_read_tokens: usage.cache_read_tokens,
+                        api_cache_creation_tokens: usage.cache_creation_tokens,
+                        api_thinking_tokens: usage.thinking_tokens,
+                        api_service_tier: usage.service_tier.clone(),
+                        api_data_source: usage.data_source.as_str().to_string(),
+                        tool_call_count: usage.tool_call_count as i64,
+                        has_tool_calls: usage.has_tool_calls,
+                        has_plan,
+                    };
+                    rollup_agg.record(&mm);
+                    metrics_entries.push(mm);
                 }
 
-                let content_chars = msg.content.len() as i64;
-                let content_tokens_est = content_chars / 4;
-                let msg_hour_id = FrankenStorage::hour_id_from_millis(msg_ts);
-                let has_plan = has_plan_for_role(&role_s, &msg.content);
+                if session_count_delta > 0 {
+                    token_stats.record_session(
+                        &conv.agent_slug,
+                        &conv.source_id,
+                        conv_day_id,
+                        &session_model_family,
+                    );
+                }
 
-                token_entries.push(TokenUsageEntry {
-                    message_id,
-                    conversation_id: conv_id,
-                    agent_id,
-                    workspace_id,
-                    source_id: conv.source_id.clone(),
-                    timestamp_ms: msg_ts,
-                    day_id: msg_day_id,
-                    model_name: usage.model_name.clone(),
-                    model_family: Some(model_family.clone()),
-                    model_tier: Some(model_tier.clone()),
-                    service_tier: usage.service_tier.clone(),
-                    provider: Some(provider.clone()),
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                    cache_read_tokens: usage.cache_read_tokens,
-                    cache_creation_tokens: usage.cache_creation_tokens,
-                    thinking_tokens: usage.thinking_tokens,
-                    total_tokens: usage.total_tokens(),
-                    estimated_cost_usd: estimated_cost,
-                    role: role_s.clone(),
-                    content_chars,
-                    has_tool_calls: usage.has_tool_calls,
-                    tool_call_count: usage.tool_call_count,
-                    data_source: usage.data_source.as_str().to_string(),
-                });
-
-                let mm = MessageMetricsEntry {
-                    message_id,
-                    created_at_ms: msg_ts,
-                    hour_id: msg_hour_id,
-                    day_id: msg_day_id,
-                    agent_slug: conv.agent_slug.clone(),
-                    workspace_id: workspace_id.unwrap_or(0),
-                    source_id: conv.source_id.clone(),
-                    role: role_s,
-                    content_chars,
-                    content_tokens_est,
-                    model_name: usage.model_name.clone(),
-                    model_family: model_family.clone(),
-                    model_tier: model_tier.clone(),
-                    provider,
-                    api_input_tokens: usage.input_tokens,
-                    api_output_tokens: usage.output_tokens,
-                    api_cache_read_tokens: usage.cache_read_tokens,
-                    api_cache_creation_tokens: usage.cache_creation_tokens,
-                    api_thinking_tokens: usage.thinking_tokens,
-                    api_service_tier: usage.service_tier.clone(),
-                    api_data_source: usage.data_source.as_str().to_string(),
-                    tool_call_count: usage.tool_call_count as i64,
-                    has_tool_calls: usage.has_tool_calls,
-                    has_plan,
-                };
-                rollup_agg.record(&mm);
-                metrics_entries.push(mm);
-            }
-
-            if session_count_delta > 0 {
-                token_stats.record_session(
-                    &conv.agent_slug,
-                    &conv.source_id,
-                    conv_day_id,
-                    &session_model_family,
-                );
-            }
-
-            if has_any_tokens {
-                conv_ids_to_summarize.push(conv_id);
+                if has_any_tokens {
+                    conv_ids_to_summarize.push(conv_id);
+                }
             }
 
             outcomes.push(InsertOutcome {
@@ -5844,13 +5877,15 @@ impl FrankenStorage {
         }
 
         // Batch insert all FTS entries at once
-        flush_pending_fts_entries(
-            &tx,
-            &mut fts_entries,
-            &mut fts_pending_chars,
-            &mut fts_inserted_total,
-        )?;
-        if fts_count_total > 0 {
+        if !defer_lexical_updates {
+            flush_pending_fts_entries(
+                &tx,
+                &mut fts_entries,
+                &mut fts_pending_chars,
+                &mut fts_inserted_total,
+            )?;
+        }
+        if !defer_lexical_updates && fts_count_total > 0 {
             tracing::debug!(
                 target: "cass::perf::fts5",
                 total = fts_count_total,
@@ -5861,7 +5896,7 @@ impl FrankenStorage {
         }
 
         // Batched daily_stats update
-        if !stats.is_empty() {
+        if !defer_analytics_updates && !stats.is_empty() {
             let entries = stats.expand();
             let affected = franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
             tracing::debug!(
@@ -5874,7 +5909,7 @@ impl FrankenStorage {
         }
 
         // Batch insert token_usage rows
-        if !token_entries.is_empty() {
+        if !defer_analytics_updates && !token_entries.is_empty() {
             let token_count = token_entries.len();
             let inserted = franken_insert_token_usage_batched_in_tx(&tx, &token_entries)?;
             tracing::debug!(
@@ -5886,7 +5921,7 @@ impl FrankenStorage {
         }
 
         // Batched token_daily_stats update
-        if !token_stats.is_empty() {
+        if !defer_analytics_updates && !token_stats.is_empty() {
             let entries = token_stats.expand();
             let affected = franken_update_token_daily_stats_batched_in_tx(&tx, &entries)?;
             tracing::debug!(
@@ -5899,7 +5934,7 @@ impl FrankenStorage {
         }
 
         // Batch insert message_metrics rows
-        if !metrics_entries.is_empty() {
+        if !defer_analytics_updates && !metrics_entries.is_empty() {
             let mm_count = metrics_entries.len();
             let inserted = franken_insert_message_metrics_batched_in_tx(&tx, &metrics_entries)?;
             tracing::debug!(
@@ -5911,7 +5946,7 @@ impl FrankenStorage {
         }
 
         // Flush usage_hourly + usage_daily rollups
-        if !rollup_agg.is_empty() {
+        if !defer_analytics_updates && !rollup_agg.is_empty() {
             let (hourly, daily, models_daily) =
                 franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
             tracing::debug!(
@@ -5927,8 +5962,10 @@ impl FrankenStorage {
         }
 
         // Update conversation-level token summaries
-        for conv_id in &conv_ids_to_summarize {
-            franken_update_conversation_token_summaries_in_tx(&tx, *conv_id)?;
+        if !defer_analytics_updates {
+            for conv_id in &conv_ids_to_summarize {
+                franken_update_conversation_token_summaries_in_tx(&tx, *conv_id)?;
+            }
         }
 
         tx.commit()?;
@@ -5949,6 +5986,20 @@ fn franken_last_rowid(tx: &FrankenTransaction<'_>) -> Result<i64> {
         .ok()
         .filter(|&id| id > 0)
         .with_context(|| "last_insert_rowid() returned NULL or 0 after INSERT")
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    dotenvy::var(name)
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(false)
+}
+
+fn defer_storage_lexical_updates_enabled() -> bool {
+    env_flag_enabled("CASS_DEFER_LEXICAL_UPDATES")
+}
+
+fn defer_analytics_updates_enabled() -> bool {
+    env_flag_enabled("CASS_DEFER_ANALYTICS_UPDATES")
 }
 
 enum ConversationInsertStatus {
@@ -6125,6 +6176,7 @@ fn franken_insert_conversation_or_get_existing(
                 agent_id,
                 external_id,
                 existing_id,
+                source_path = %conv.source_path.display(),
                 "conversation insert hit unique constraint; reusing existing row"
             );
             Ok(ConversationInsertStatus::Existing(existing_id))
