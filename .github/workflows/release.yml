@@ -51,7 +51,7 @@ jobs:
           #   artifact_name: cass
           #   asset_name: cass-darwin-amd64
           # macOS Apple Silicon
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact_name: cass
             asset_name: cass-darwin-arm64
@@ -80,6 +80,67 @@ jobs:
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify binary architecture (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BINARY="target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          FILE_OUTPUT="$(file "$BINARY")"
+          echo "Binary file output: ${FILE_OUTPUT}"
+
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              if ! echo "$FILE_OUTPUT" | grep -q "x86-64"; then
+                echo "::error::Expected x86-64 binary but got: ${FILE_OUTPUT}"
+                exit 1
+              fi
+              ;;
+            aarch64-unknown-linux-gnu)
+              if ! echo "$FILE_OUTPUT" | grep -q "aarch64\|ARM aarch64"; then
+                echo "::error::Expected aarch64 binary but got: ${FILE_OUTPUT}"
+                exit 1
+              fi
+              ;;
+            x86_64-apple-darwin)
+              if ! echo "$FILE_OUTPUT" | grep -q "x86_64"; then
+                echo "::error::Expected x86_64 Mach-O binary but got: ${FILE_OUTPUT}"
+                exit 1
+              fi
+              ;;
+            aarch64-apple-darwin)
+              if ! echo "$FILE_OUTPUT" | grep -q "arm64"; then
+                echo "::error::Expected arm64 Mach-O binary but got: ${FILE_OUTPUT}"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::warning::No architecture check defined for target ${{ matrix.target }}"
+              ;;
+          esac
+
+          echo "Architecture verification passed for ${{ matrix.target }}"
+
+      - name: Verify binary architecture (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          # Read PE header to verify machine type
+          $bytes = [System.IO.File]::ReadAllBytes($binary)
+          $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [System.BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          # 0x8664 = AMD64, 0x14c = i386, 0xAA64 = ARM64
+          switch ("${{ matrix.target }}") {
+            "x86_64-pc-windows-msvc" {
+              if ($machine -ne 0x8664) {
+                Write-Error "Expected AMD64 (0x8664) but got 0x$($machine.ToString('X4'))"
+                exit 1
+              }
+            }
+          }
+          Write-Output "Architecture verification passed: machine type 0x$($machine.ToString('X4'))"
 
       - name: Create tarball with checksum (Unix)
         if: runner.os != 'Windows'

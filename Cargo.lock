@@ -958,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "coding-agent-search"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -975,7 +975,7 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "colored",
- "console 0.16.2",
+ "console 0.15.11",
  "crc32fast",
  "criterion",
  "crossbeam-channel",
@@ -1000,9 +1000,9 @@ dependencies = [
  "hkdf",
  "hnsw_rs",
  "image",
- "indicatif 0.18.4",
+ "indicatif 0.17.11",
  "insta",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "lru 0.16.3",
  "memmap2",
  "mime_guess",
@@ -1038,7 +1038,7 @@ dependencies = [
  "strsim",
  "syntect",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 1.0.69",
  "toml",
  "tracing",
  "tracing-appender",

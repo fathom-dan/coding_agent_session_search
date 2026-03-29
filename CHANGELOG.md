@@ -7,7 +7,36 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
-> **Releases vs. tags**: Only [v0.1.64](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.1.64), [v0.2.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0), [v0.2.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.1), [v0.2.2](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.2), [v0.2.3](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.3), and [v0.2.4](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.4) have published GitHub Releases with downloadable binaries. All other version numbers below are git tags only (no release artifacts).
+> **Releases vs. tags**: Only [v0.1.64](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.1.64), [v0.2.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0), [v0.2.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.1), [v0.2.2](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.2), [v0.2.3](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.3), [v0.2.4](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.4), and [v0.2.5](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.5) have published GitHub Releases with downloadable binaries. All other version numbers below are git tags only (no release artifacts).
+
+---
+
+## [v0.2.5](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.5) -- 2026-03-28
+
+**GitHub Release** with downloadable binaries.
+
+Hot-fix release addressing FTS5 regression and release infrastructure issues from v0.2.4.
+
+### Bug fixes
+
+- **FTS5 shadow-table corruption**: Close frankensqlite handle before rusqlite FTS schema mutation to prevent shadow-table corruption ([`fb7f431`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/fb7f4311))
+- **FTS cleanup robustness**: Replace `writable_schema` FTS cleanup with `DROP TABLE` + add duplicate schema regression test ([`437758e`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/437758e9))
+- **Watch-once mtime watermark bypass**: Force `since_ts=None` in watch-once mode so old messages are found regardless of mtime watermarks ([`f66ce17`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/f66ce17e))
+- **Install checksum fallback**: Add `SHA256SUMS` (no `.txt` extension) as checksum fallback for installer verification ([`4aaa07e`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/4aaa07e4))
+- **v0.2.4 Linux x86_64 binary was aarch64** (issue [#140](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/140)): Release workflow now adds a post-build architecture verification step to prevent cross-architecture packaging errors
+
+### Refactoring
+
+- **Unified DB engine**: Remove rusqlite FTS dual-backend; make frankensqlite sole DB engine with targeted watch-once fast path and local source scanning ([`a0aa6f6`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/a0aa6f63))
+
+### Performance
+
+- **Bulk import optimization**: Defer WAL checkpoints and Tantivy updates during bulk imports; add fast schema probe to bypass recovery path ([`8a1c0e0`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8a1c0e04))
+
+### Scripts
+
+- **Resumable watch-once batch driver**: Add resumable watch-once batch driver for large session tree reconciliation ([`ca94cd2`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ca94cd23))
+- **Memory-aware autotuning**: Add memory-aware autotuning and per-root state isolation to watch-once batch driver ([`65c3fad`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/65c3fadc))
 
 ---
 
