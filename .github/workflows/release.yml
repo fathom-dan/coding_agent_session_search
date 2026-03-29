@@ -64,6 +64,12 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          # asupersync is referenced as a path dependency (../asupersync)
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
