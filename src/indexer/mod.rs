@@ -3314,6 +3314,13 @@ fn ingest_batch(
     force_tantivy_reindex: bool,
     defer_checkpoints: bool,
 ) -> Result<()> {
+    // The serial writer path reuses the long-lived storage connection, so the
+    // caller's checkpoint intent must be applied here for each ingest batch.
+    // This lets `cass index --watch` defer WAL auto-checkpoints during the
+    // initial startup import while still restoring the tighter steady-state
+    // policy for later incremental watch reindexes.
+    persist::apply_index_writer_checkpoint_policy(storage, defer_checkpoints);
+
     // Use batched insert for better SQLite performance (single transaction)
     // This also handles daily_stats updates incrementally via InsertOutcome deltas.
     persist::persist_conversations_batched(
@@ -5497,6 +5504,7 @@ mod tests {
     };
     use crate::sources::provenance::SourceKind;
     use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+    use fsqlite_types::value::SqliteValue;
     use serial_test::serial;
     use tempfile::TempDir;
 
@@ -5570,6 +5578,79 @@ mod tests {
             metadata: serde_json::json!({}),
             messages: msgs,
         }
+    }
+
+    fn token_usage_extra(input_tokens: i64, output_tokens: i64) -> serde_json::Value {
+        serde_json::json!({
+            "message": {
+                "model": "claude-opus-4-6",
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_read_input_tokens": input_tokens / 2,
+                    "cache_creation_input_tokens": input_tokens / 4,
+                    "service_tier": "standard"
+                }
+            }
+        })
+    }
+
+    fn large_startup_conv(
+        agent_slug: &str,
+        prefix: &str,
+        conv_idx: usize,
+        message_count: usize,
+        body_bytes: usize,
+        base_ts: i64,
+    ) -> NormalizedConversation {
+        let mut messages = Vec::with_capacity(message_count);
+        for msg_idx in 0..message_count {
+            let is_assistant = msg_idx % 2 == 1;
+            let ts = base_ts
+                .saturating_add((conv_idx as i64).saturating_mul(10_000))
+                .saturating_add(msg_idx as i64);
+            messages.push(NormalizedMessage {
+                idx: msg_idx as i64,
+                role: if is_assistant { "assistant" } else { "user" }.to_string(),
+                author: Some(if is_assistant {
+                    format!("{agent_slug}-model")
+                } else {
+                    "user".to_string()
+                }),
+                created_at: Some(ts),
+                content: format!("{prefix}-{conv_idx}-{msg_idx}-{}", "x".repeat(body_bytes)),
+                extra: if is_assistant {
+                    token_usage_extra(1_000 + msg_idx as i64, 500 + msg_idx as i64)
+                } else {
+                    serde_json::json!({})
+                },
+                snippets: Vec::new(),
+            });
+        }
+
+        NormalizedConversation {
+            agent_slug: agent_slug.to_string(),
+            external_id: Some(format!("{prefix}-{conv_idx}")),
+            title: Some(format!("{agent_slug} startup {conv_idx}")),
+            workspace: Some(PathBuf::from(format!("/workspace/{agent_slug}/{prefix}"))),
+            source_path: PathBuf::from(format!("/logs/{agent_slug}/{prefix}-{conv_idx}.jsonl")),
+            started_at: messages.first().and_then(|msg| msg.created_at),
+            ended_at: messages.last().and_then(|msg| msg.created_at),
+            metadata: serde_json::json!({
+                "agent_slug": agent_slug,
+                "fixture": "large_startup"
+            }),
+            messages,
+        }
+    }
+
+    fn send_done(tx: &Sender<IndexMessage>, connector_name: &'static str, is_discovered: bool) {
+        tx.send(IndexMessage::Done {
+            connector_name,
+            scan_ms: 1,
+            is_discovered,
+        })
+        .expect("done message should send");
     }
 
     struct DetectedRemoteFailureConnector;
@@ -5969,6 +6050,123 @@ mod tests {
         assert_eq!(stats.agents_discovered, vec!["claude".to_string()]);
         assert_eq!(stats.total_conversations, 0);
         assert_eq!(stats.total_messages, 0);
+    }
+
+    #[test]
+    fn streaming_consumer_handles_large_mixed_startup_batches_with_watch_checkpoint_policy() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        persist::apply_index_writer_busy_timeout(&storage);
+        // Start from steady-state watch policy; startup ingest should flip the
+        // connection to deferred checkpoints for the initial import batches.
+        persist::apply_index_writer_checkpoint_policy(&storage, false);
+
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        let progress = Arc::new(IndexingProgress::default());
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
+        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+
+        let amp_convs: Vec<_> = (0..52)
+            .map(|conv_idx| {
+                large_startup_conv("amp", "amp-startup", conv_idx, 40, 4096, 1_700_000_000_000)
+            })
+            .collect();
+        let opencode_convs: Vec<_> = (0..8)
+            .map(|conv_idx| {
+                large_startup_conv(
+                    "opencode",
+                    "opencode-startup",
+                    conv_idx,
+                    24,
+                    4096,
+                    1_700_100_000_000,
+                )
+            })
+            .collect();
+
+        let expected_conversations = (amp_convs.len() + opencode_convs.len()) as i64;
+        let expected_messages = (52 * 40 + 8 * 24) as i64;
+
+        send_conversation_batches(&tx, "amp", amp_convs, true);
+        send_done(&tx, "amp", true);
+        send_conversation_batches(&tx, "opencode", opencode_convs, true);
+        send_done(&tx, "opencode", true);
+        drop(tx);
+
+        let discovered = run_streaming_consumer(
+            rx,
+            2,
+            &storage,
+            &mut index,
+            flow_limiter,
+            &Some(progress.clone()),
+            false,
+        )
+        .expect("large mixed startup ingest should not violate foreign keys");
+
+        assert!(
+            discovered.iter().any(|name| name == "amp"),
+            "amp should remain marked as discovered"
+        );
+        assert!(
+            discovered.iter().any(|name| name == "opencode"),
+            "opencode should remain marked as discovered"
+        );
+
+        let conversation_count: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let message_count: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+            .unwrap();
+        let wal_autocheckpoint: i64 = storage
+            .raw()
+            .query_row_map("PRAGMA wal_autocheckpoint;", &[], |row| row.get_typed(0))
+            .unwrap();
+
+        assert_eq!(conversation_count, expected_conversations);
+        assert_eq!(message_count, expected_messages);
+        assert_eq!(
+            wal_autocheckpoint, 0,
+            "startup watch ingest should defer WAL auto-checkpoints"
+        );
+    }
+
+    #[test]
+    fn ingest_batch_applies_checkpoint_policy_for_serial_writer_path() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("checkpoint-policy.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+
+        persist::apply_index_writer_checkpoint_policy(&storage, false);
+
+        let first = vec![norm_conv(Some("checkpoint-a"), vec![norm_msg(0, 1_000)])];
+        ingest_batch(&storage, &mut index, &first, &None, false, true).unwrap();
+
+        let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
+
+        let second = vec![norm_conv(Some("checkpoint-b"), vec![norm_msg(0, 2_000)])];
+        ingest_batch(&storage, &mut index, &second, &None, false, false).unwrap();
+
+        let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1000));
     }
 
     #[test]
